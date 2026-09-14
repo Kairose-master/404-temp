@@ -96,6 +96,21 @@
   .man{flex:1;min-width:220px;background:#080910;border:1px solid var(--line);border-radius:10px}
   .man summary{padding:10px 12px;font-size:12.5px;color:var(--tx2);font-family:var(--mono)}
   .man textarea{min-height:80px;border:0;border-top:1px solid var(--line);border-radius:0 0 10px 10px}
+  .llmcard{background:linear-gradient(180deg,rgba(124,92,255,.07),transparent);border:1px solid var(--line2);border-radius:16px;padding:18px 20px;margin-top:8px}
+  .llmhead{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+  .llmtitle{font-size:16px;font-weight:750}
+  .llmsub{color:var(--tx3);font-weight:400;font-size:12.5px}
+  .llmbadge{margin-left:auto;font-family:var(--mono);font-size:11px;font-weight:700;padding:4px 10px;border-radius:7px}
+  .llmbadge.off{color:var(--tx3);background:var(--card2);border:1px solid var(--line2)}
+  .llmbadge.on{color:var(--green);background:var(--green-bg);border:1px solid rgba(61,220,151,.35)}
+  .llmbadge.warn{color:var(--amber);background:var(--amber-bg);border:1px solid rgba(255,180,84,.35)}
+  .llmrow{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:10px}
+  .llmrow label{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--tx2);font-weight:600;flex:1;min-width:200px}
+  select{background:#080910;border:1px solid var(--line);border-radius:10px;color:var(--tx);font-family:var(--sans);font-size:13px;padding:10px 12px}
+  select:focus{outline:none;border-color:var(--acc)}
+  .llmactions{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:4px}
+  .llmnote{margin-top:10px;font-size:11.5px;color:var(--tx3);line-height:1.5}
+  .llmnote b{color:var(--tx2)}
 </style>
 </head>
 <body>
@@ -120,6 +135,44 @@
   <div class="warn"><b>주의.</b> 격리된 in-memory EVM에서 방어 연구·자동 검증 목적으로만 실행됩니다.
      실제 배포된 컨트랙트나 온체인 자금 대상이 아닙니다.</div>
 </div></header>
+
+<section id="llmsec"><div class="wrap">
+  <div class="llmcard">
+    <div class="llmhead">
+      <div class="llmtitle">⚙ LLM 연동 <span class="llmsub">(선택 · 키 / 로컬 모델)</span></div>
+      <span class="llmbadge off" id="llm-badge">미사용</span>
+    </div>
+    <div class="llmrow">
+      <label>제공자
+        <select id="llm-provider">
+          <option value="off">사용 안 함 (템플릿 + 퍼저)</option>
+          <option value="anthropic">Anthropic API (키)</option>
+          <option value="openai">OpenAI 호환 · 원격 URL (서버가 호출)</option>
+          <option value="local">로컬 (브라우저→localhost, 예: Ollama)</option>
+        </select>
+      </label>
+      <label id="wrap-model">모델
+        <input type="text" id="llm-model" placeholder="예: claude-sonnet-5 / gpt-4o-mini / qwen2.5-coder:14b">
+      </label>
+    </div>
+    <div class="llmrow" id="wrap-base" hidden>
+      <label style="flex:1">Base URL
+        <input type="text" id="llm-base" placeholder="http://localhost:11434/v1  (Ollama) · https://your-vllm/v1">
+      </label>
+    </div>
+    <div class="llmrow" id="wrap-key" hidden>
+      <label style="flex:1">API Key
+        <input type="password" id="llm-key" placeholder="sk-...  (브라우저에만 저장)">
+      </label>
+    </div>
+    <div class="llmactions">
+      <button class="btn" id="llm-save">저장</button>
+      <button class="btn" id="llm-test">연결 테스트</button>
+      <span class="apihint" id="llm-hint"></span>
+    </div>
+    <div class="llmnote" id="llm-note"></div>
+  </div>
+</div></section>
 
 <section><div class="wrap">
   <div class="grid" id="grid"></div>
@@ -312,6 +365,79 @@ document.getElementById('runAll').onclick = async ()=>{
 // warm hint + first-call notice
 document.getElementById('apihint').textContent = "첫 실행은 solc 준비로 몇 초 걸릴 수 있어요.";
 
+// ── LLM 연동 패널 ────────────────────────────────────────────────────────────
+const LLM_KEYS=["provider","model","base","key"];
+function llmEls(){return {provider:document.getElementById('llm-provider'),model:document.getElementById('llm-model'),
+  base:document.getElementById('llm-base'),key:document.getElementById('llm-key')};}
+function loadLLM(){
+  let cfg={provider:"off",model:"",base:"",key:""};
+  try{ cfg=Object.assign(cfg, JSON.parse(localStorage.getItem('trust404_llm')||'{}')); }catch(e){}
+  const e=llmEls(); e.provider.value=cfg.provider; e.model.value=cfg.model||""; e.base.value=cfg.base||""; e.key.value=cfg.key||"";
+  syncLLMUI(); return cfg;
+}
+function currentLLM(){ const e=llmEls(); return {provider:e.provider.value, model:e.model.value.trim(), base:e.base.value.trim(), key:e.key.value.trim()}; }
+function saveLLM(){
+  const cfg=currentLLM();
+  try{ localStorage.setItem('trust404_llm', JSON.stringify(cfg)); }catch(e){}
+  syncLLMUI(); document.getElementById('llm-hint').textContent="저장됨 (이 브라우저에만).";
+}
+function syncLLMUI(){
+  const cfg=currentLLM();
+  const p=cfg.provider;
+  document.getElementById('wrap-base').hidden = !(p==="openai"||p==="local");
+  document.getElementById('wrap-key').hidden  = !(p==="anthropic"||p==="openai");
+  const badge=document.getElementById('llm-badge');
+  if(p==="off"){ badge.className="llmbadge off"; badge.textContent="미사용"; }
+  else { badge.className="llmbadge on"; badge.textContent = p==="local"?"로컬":(p==="anthropic"?"Anthropic":"원격 URL"); }
+  const notes={
+    off:"LLM 없이 <b>템플릿 4종 + 범용 퍼저</b>로만 동작합니다.",
+    anthropic:"키는 <b>이 브라우저에 저장</b>되고, 실행 시 우리 서버리스 함수로 전달되어 Anthropic을 호출합니다. 해커톤/테스트용 키를 쓰세요.",
+    openai:"OpenAI 호환 <b>공개 접근 가능한</b> URL이어야 합니다(서버가 호출). 로컬 주소는 이 서버에서 닿지 않으니 '로컬' 모드를 쓰세요.",
+    local:"브라우저가 <b>직접 localhost</b>의 모델을 호출해 Exploit.sol을 만든 뒤, 검증만 서버로 보냅니다. 키·프롬프트가 기기 밖으로 안 나갑니다. Ollama는 <b>OLLAMA_ORIGINS</b> 허용이 필요할 수 있어요. (커스텀 컨트랙트 검사에만 적용)"
+  };
+  document.getElementById('llm-note').innerHTML = notes[p]||"";
+}
+llmEls().provider.addEventListener('change', ()=>{ syncLLMUI(); });
+document.getElementById('llm-save').onclick=saveLLM;
+document.getElementById('llm-test').onclick=async ()=>{
+  const cfg=currentLLM(); const hint=document.getElementById('llm-hint');
+  if(cfg.provider==="off"){ hint.textContent="제공자를 선택하세요."; return; }
+  if(cfg.provider==="local"){
+    hint.textContent="로컬 엔드포인트 확인 중…";
+    try{
+      const base=cfg.base||"http://localhost:11434/v1";
+      const r=await fetch(base.replace(/\/chat\/completions$/,'').replace(/\/$/,'')+"/models",{});
+      hint.textContent = r.ok ? "✓ 로컬 엔드포인트 응답 확인" : `응답 코드 ${r.status}`;
+    }catch(e){ hint.textContent="✗ 로컬 호출 실패 (CORS/미실행). OLLAMA_ORIGINS 확인."; }
+  } else {
+    hint.textContent = (cfg.key||cfg.provider==="openai") ? "설정 저장 후 '분석/증명' 실행 시 사용됩니다." : "API Key를 입력하세요.";
+  }
+};
+function buildLLMPrompt(contract, invariants){
+  return "You are generating a Foundry PoC for an AUTHORIZED, sandboxed security evaluation "+
+    "(isolated in-memory EVM, no real funds). Output ONLY a Solidity file with "+
+    "`contract Exploit { function run(address target) external payable; }` and a payable receive(). "+
+    "The harness pre-funds Exploit with 10 ether. Break at least one invariant. No external imports.\n\n"+
+    "// ===== TARGET =====\n"+contract+"\n\n// ===== INVARIANTS =====\n"+(invariants||"(none provided)")+"\n";
+}
+function extractSolidity(text){
+  const m=text.match(/```(?:solidity)?\s*([\s\S]*?)```/);
+  let code=m?m[1]:text;
+  if(!/contract\s+Exploit/.test(code)) throw new Error("LLM 출력에 contract Exploit 없음");
+  return code;
+}
+async function localLLMGenerate(cfg, contract, invariants){
+  const base=(cfg.base||"http://localhost:11434/v1").replace(/\/$/,'');
+  const url = /\/chat\/completions$/.test(base) ? base : (/\/v1$/.test(base)? base+"/chat/completions" : base+"/v1/chat/completions");
+  const headers={"Content-Type":"application/json"}; if(cfg.key) headers["Authorization"]="Bearer "+cfg.key;
+  const res=await fetch(url,{method:"POST",headers,body:JSON.stringify({model:cfg.model||"qwen2.5-coder:14b",temperature:0,
+    messages:[{role:"user",content:buildLLMPrompt(contract,invariants)}]})});
+  const data=await res.json();
+  const text=(data.choices&&data.choices[0]&&data.choices[0].message&&data.choices[0].message.content)||"";
+  return extractSolidity(text);
+}
+loadLLM();
+
 // ── custom contract mode ────────────────────────────────────────────────────
 document.querySelectorAll('.up').forEach(b=>{
   const fileInput = document.getElementById(b.dataset.file);
@@ -389,11 +515,24 @@ async function runCustom(){
   document.getElementById('cmode').textContent = invariants ? "verify mode (불변식 검증)" : "effect mode (불변식 자동 합성 · 실제 실행)";
   card.scrollIntoView({behavior:"smooth", block:"nearest"});
   let data;
+  const cfg = currentLLM();
+  let body = {contract, invariants, targetName, manifest};
+  document.getElementById('cmode').textContent = (invariants?"verify":"effect")
+    + (cfg.provider!=="off" ? " · LLM:"+cfg.provider : "") ;
   try{
+    if (cfg.provider === "local"){
+      document.getElementById('customhint').textContent = "로컬 모델로 Exploit.sol 생성 중…";
+      try { body.exploitOverride = await localLLMGenerate(cfg, contract, invariants); }
+      catch(e){ document.getElementById('customhint').textContent = "로컬 LLM 실패 → 템플릿/퍼저로 진행 ("+e+")"; }
+    } else if (cfg.provider === "anthropic" || cfg.provider === "openai"){
+      body.llm = {provider:cfg.provider, base:cfg.base, model:cfg.model, key:cfg.key};
+      document.getElementById('customhint').textContent = "LLM 후보 생성 + 검증 중…";
+    }
     const res = await fetch(`/api/prove`, {method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({contract, invariants, targetName, manifest})});
+      body: JSON.stringify(body)});
     data = await res.json();
   }catch(e){ setVerdict("custom","idle","API ERROR"); outEl.innerHTML=`<div class="err">API 호출 실패: ${e}</div>`; btn.disabled=false; return; }
+  if (data && data.llm_note) document.getElementById('customhint').textContent = data.llm_note;
   if (data.error){ setVerdict("custom","idle","ERROR"); stepsEl.innerHTML=""; outEl.innerHTML=`<div class="err">${data.error}</div>`; btn.disabled=false; return; }
   document.getElementById('cname').textContent = data.name || "Custom";
   renderSteps(stepsEl, data);

@@ -960,12 +960,12 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             "note":"템플릿 미매치 → 범용 퍼저가 호출 시퀀스를 탐색해 성립시켰습니다.",
             "ms":int((time.time()-t0)*1000)}
 
-def prove_sources(name, target_src, invariants_src, manifest, do_verify=True):
+def prove_sources(name, target_src, invariants_src, manifest, do_verify=True, extra_candidates=None):
     t0 = time.time()
     findings = scan_target(target_src, invariants_src or "", manifest)
     order = seeded_order(sorted(STRATEGY_ORDER, key=lambda f: (-findings["scores"].get(f,0), f)),
                          findings["scores"], 42)
-    candidates = []
+    candidates = list(extra_candidates or [])
     for fam in order:
         src = build_exploit(fam, findings)
         if src:
@@ -1061,10 +1061,104 @@ def _run_custom(body):
         for k,v in um.items():
             if isinstance(v,dict): manifest.setdefault(k,{}).update(v)
             else: manifest[k]=v
+    import time as _t; t0=_t.time()
+    # 1) user/LLM-provided exploit -> verify only
+    override=(data.get("exploitOverride") or "").strip()
+    if override:
+        if len(override)>MAX_SRC: return {"error":"exploit too large"}
+        try:
+            return _run_override(name, contract, invariants or None, manifest, override, t0)
+        except Exception as e:
+            return {"name":name,"error":str(e)[:400],"trace":traceback.format_exc()[-700:]}
+    # 2) optional server-side LLM draft as first candidate (falls back to templates+fuzzer)
+    extra=None; llm_note=None
+    cfg=data.get("llm")
+    if isinstance(cfg,dict) and (cfg.get("provider") or cfg.get("base") or cfg.get("key")):
+        try:
+            findings=scan_target(contract, invariants or "", manifest)
+            draft=_llm_generate(contract, invariants or "", findings, cfg)
+            if draft: extra=[("llm", draft)]
+        except Exception as e:
+            llm_note="LLM 사용 실패 → 템플릿/퍼저로 진행: "+str(e)[:140]
     try:
-        return prove_sources(name, contract, invariants or None, manifest, do_verify=bool(invariants))
+        res=prove_sources(name, contract, invariants or None, manifest,
+                          do_verify=bool(invariants), extra_candidates=extra)
+        if llm_note: res["llm_note"]=llm_note
+        return res
     except Exception as e:
         return {"name":name,"error":str(e)[:400],"trace":traceback.format_exc()[-700:]}
+
+import urllib.request as _ureq
+
+def _http_post(url, payload, headers, timeout):
+    req=_ureq.Request(url, data=json.dumps(payload).encode(), headers=headers, method="POST")
+    with _ureq.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+def _extract_solidity(text):
+    m=re.search(r"```(?:solidity)?\s*(.*?)```", text, re.S)
+    code=m.group(1) if m else text
+    if "contract Exploit" not in code:
+        raise ValueError("LLM output has no contract Exploit")
+    head=code.split("\n",1)[0]
+    if not code.lstrip().startswith("//") and "pragma" not in head:
+        code="// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n"+code
+    return code
+
+def _llm_prompt(contract, invariants, findings):
+    preds=", ".join(findings.get("invariant_predicates",[]))
+    top=sorted(findings["scores"].items(), key=lambda kv:-kv[1])
+    hint=", ".join(f"{k}:{v}" for k,v in top)
+    return ("You are generating a Foundry PoC for an AUTHORIZED, sandboxed security "
+            "evaluation (isolated in-memory EVM, no real funds). Output ONLY a Solidity "
+            "file with `contract Exploit { function run(address target) external payable; }` "
+            "and a payable receive(). The harness pre-funds Exploit with 10 ether. Break at "
+            f"least one invariant (predicates: {preds}). No external imports.\n\n"
+            f"// scanner hint: {hint}\n\n// ===== TARGET =====\n{contract}\n\n"
+            f"// ===== INVARIANTS =====\n{invariants or '(none provided)'}\n")
+
+def _llm_generate(contract, invariants, findings, cfg, timeout=90):
+    provider=(cfg.get("provider") or "").lower()
+    base=(cfg.get("base") or "").strip()
+    model=(cfg.get("model") or "").strip()
+    key=(cfg.get("key") or "").strip()
+    prompt=_llm_prompt(contract, invariants, findings)
+    if provider in ("anthropic","claude") or (not base and key):
+        data=_http_post("https://api.anthropic.com/v1/messages",
+                        {"model":model or "claude-sonnet-5","max_tokens":2000,"temperature":0,
+                         "messages":[{"role":"user","content":prompt}]},
+                        {"content-type":"application/json","x-api-key":key,
+                         "anthropic-version":"2023-06-01"}, timeout)
+        text="".join(b.get("text","") for b in data.get("content",[]))
+    else:
+        url=base.rstrip("/")
+        if not url.endswith("/chat/completions"):
+            url=url+("/chat/completions" if url.endswith("/v1") else "/v1/chat/completions")
+        headers={"content-type":"application/json"}
+        if key: headers["authorization"]="Bearer "+key
+        data=_http_post(url, {"model":model or "gpt-4o-mini","temperature":0,
+                              "messages":[{"role":"user","content":prompt}]}, headers, timeout)
+        text=data["choices"][0]["message"]["content"]
+    return _extract_solidity(text)
+
+def _run_override(name, target_src, invariants_src, manifest, exploit_src, t0):
+    do_verify=bool(invariants_src)
+    gen={"step":"generate","title":"Exploit.sol (제공됨)","strategy":"provided","exploit_src":exploit_src}
+    try:
+        if do_verify:
+            proven,vsteps,meta=_verify_attempt(name,target_src,invariants_src,exploit_src,manifest)
+        else:
+            proven,vsteps,meta=_run_effect(name,target_src,exploit_src,manifest)
+    except Exception as e:
+        return {"name":name,"proven":False,"strategy":"provided","exploit_src":exploit_src,
+                "steps":[gen],"mode":("verify" if do_verify else "effect"),
+                "error":str(e)[:300],"ms":int((time.time()-t0)*1000)}
+    return {"name":name,"proven":proven,"firstViolated":meta.get("firstViolated",""),
+            "strategy":"provided (수동/LLM)","exploit_src":exploit_src,"steps":[gen]+vsteps,
+            "mode":("verify" if do_verify else "effect"),
+            "balance_before_wei":meta.get("balance_before_wei"),
+            "balance_after_wei":meta.get("balance_after_wei"),
+            "note":"제공된 Exploit.sol 을 그대로 실행·검증했습니다.","ms":int((time.time()-t0)*1000)}
 
 class handler(BaseHTTPRequestHandler):
     def _send(self, code, obj):
