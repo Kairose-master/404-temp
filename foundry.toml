@@ -1,0 +1,10 @@
+# TRUST404 Track04 — Foundry project so the generated exploits can be run with
+# `forge test` in any Foundry environment (including Claude Code on the web).
+[profile.default]
+solc_version = "0.8.24"
+evm_version = "cancun"
+src = "src_forge"          # empty placeholder; real sources are pulled via test imports
+test = "test"
+libs = ["lib"]
+remappings = ["forge-std/=lib/forge-std/src/"]
+fs_permissions = [{ access = "read", path = "./" }]
