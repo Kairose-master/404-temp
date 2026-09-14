@@ -80,6 +80,22 @@
   .warn b{color:var(--amber)}
   footer{border-top:1px solid var(--line);padding:26px 0 50px;color:var(--tx3);font-size:12.5px}
   .err{color:var(--red);font-size:12px;font-family:var(--mono)}
+  .custom-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:20px}
+  @media(max-width:800px){.custom-grid{grid-template-columns:1fr}}
+  .fld label{display:flex;align-items:center;gap:10px;font-size:13px;color:var(--tx2);font-weight:600;margin-bottom:7px}
+  .fld .req{color:var(--red)} .fld .opt{color:var(--tx3);font-weight:400;font-size:11.5px}
+  .fld .up,.man summary{cursor:pointer}
+  .up{margin-left:auto;font-family:var(--sans);font-size:11.5px;color:var(--acc2);background:rgba(34,211,238,.08);
+    border:1px solid rgba(34,211,238,.22);padding:4px 10px;border-radius:7px}
+  textarea{width:100%;min-height:180px;background:#080910;border:1px solid var(--line);border-radius:11px;
+    color:#c7cff0;font-family:var(--mono);font-size:12px;line-height:1.55;padding:12px 13px;resize:vertical}
+  textarea:focus,input[type=text]:focus{outline:none;border-color:var(--acc)}
+  .custom-row{display:flex;gap:12px;margin-top:14px;align-items:flex-start;flex-wrap:wrap}
+  input[type=text]{flex:1;min-width:220px;background:#080910;border:1px solid var(--line);border-radius:10px;
+    color:var(--tx);font-family:var(--mono);font-size:12.5px;padding:10px 12px}
+  .man{flex:1;min-width:220px;background:#080910;border:1px solid var(--line);border-radius:10px}
+  .man summary{padding:10px 12px;font-size:12.5px;color:var(--tx2);font-family:var(--mono)}
+  .man textarea{min-height:80px;border:0;border-top:1px solid var(--line);border-radius:0 0 10px 10px}
 </style>
 </head>
 <body>
@@ -107,6 +123,56 @@
 
 <section><div class="wrap">
   <div class="grid" id="grid"></div>
+</div></section>
+
+<section id="customsec"><div class="wrap">
+  <div style="border-top:1px solid var(--line);padding-top:30px">
+    <div class="tag"><span class="dot"></span>CUSTOM · 임의 컨트랙트 검사</div>
+    <h1 style="font-size:clamp(22px,3.4vw,30px)">직접 올린 컨트랙트를 <span class="grad">스캔·생성·증명</span></h1>
+    <p class="lede" style="font-size:15px">컨트랙트 소스를 붙여넣거나 <b>.sol</b> 파일을 올리세요.
+      불변식(Invariants)까지 주면 실제 EVM에서 증명까지, 없으면 스캔 + Exploit.sol 생성만 합니다.</p>
+
+    <div class="custom-grid">
+      <div class="fld">
+        <label>컨트랙트 소스 <span class="req">*</span>
+          <input type="file" id="f-contract" accept=".sol,text/plain" hidden>
+          <button class="up" data-for="c-contract" data-file="f-contract">📎 .sol 업로드</button>
+        </label>
+        <textarea id="c-contract" placeholder="// SPDX-License-Identifier: MIT&#10;pragma solidity 0.8.24;&#10;contract MyVault { ... }"></textarea>
+      </div>
+      <div class="fld">
+        <label>Invariants 소스 <span class="opt">선택 (있으면 증명까지)</span>
+          <input type="file" id="f-inv" accept=".sol,text/plain" hidden>
+          <button class="up" data-for="c-inv" data-file="f-inv">📎 .sol 업로드</button>
+        </label>
+        <textarea id="c-inv" placeholder="// checkAll(address) returns (bool allHold, string firstViolated)&#10;contract Invariants { ... }"></textarea>
+      </div>
+    </div>
+
+    <div class="custom-row">
+      <input type="text" id="c-name" placeholder="타깃 컨트랙트 이름 (비우면 자동 추론)">
+      <details class="man"><summary>manifest (선택) — 생성자 인자 / 시드</summary>
+        <textarea id="c-man" placeholder='{"deploy":{"constructor_args":["0x00000000000000000000000000000000000A11CE"],"value_wei":"10000000000000000000"}}'></textarea>
+      </details>
+    </div>
+
+    <div class="runall">
+      <button class="btn primary" id="runCustom">분석 / 증명 ▶</button>
+      <button class="btn" id="loadSample" style="border:1px solid var(--line2);color:var(--tx);background:transparent">예시 채우기</button>
+      <span class="apihint" id="customhint"></span>
+    </div>
+
+    <div class="card" id="customCard" style="margin-top:18px;display:none">
+      <div class="ch">
+        <div><div class="name" id="cname">Custom</div><div class="cls" id="cmode"></div></div>
+        <span class="verdict idle" id="v-custom">IDLE</span>
+      </div>
+      <div class="cbody">
+        <div class="steps" id="steps-custom"></div>
+        <div id="out-custom"></div>
+      </div>
+    </div>
+  </div>
 </div></section>
 
 <footer><div class="wrap">
@@ -243,6 +309,104 @@ document.getElementById('runAll').onclick = async ()=>{
 
 // warm hint + first-call notice
 document.getElementById('apihint').textContent = "첫 실행은 solc 준비로 몇 초 걸릴 수 있어요.";
+
+// ── custom contract mode ────────────────────────────────────────────────────
+document.querySelectorAll('.up').forEach(b=>{
+  const fileInput = document.getElementById(b.dataset.file);
+  const ta = document.getElementById(b.dataset.for);
+  b.onclick = ()=> fileInput.click();
+  fileInput.onchange = ()=>{
+    const f = fileInput.files[0]; if(!f) return;
+    const r = new FileReader();
+    r.onload = ()=>{ ta.value = r.result; b.textContent = "✓ " + f.name; };
+    r.readAsText(f);
+  };
+});
+
+const SAMPLE_C = `// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+contract MyVault {
+    mapping(address => uint256) public balances;
+    constructor() payable {}
+    function deposit() external payable { balances[msg.sender] += msg.value; }
+    function withdraw() external {
+        uint256 b = balances[msg.sender];
+        require(b > 0, "no balance");
+        (bool ok,) = msg.sender.call{value: b}("");   // external call first
+        require(ok);
+        balances[msg.sender] = 0;                      // state update after -> reentrant
+    }
+    receive() external payable {}
+}`;
+const SAMPLE_I = `// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+contract Invariants {
+    uint256 constant SEED = 10 ether;
+    function solvent(address t) public view returns (bool) { return t.balance >= SEED; }
+    function checkAll(address t) external view returns (bool allHold, string memory firstViolated) {
+        if (!solvent(t)) return (false, "solvent");
+        return (true, "");
+    }
+}`;
+document.getElementById('loadSample').onclick = ()=>{
+  document.getElementById('c-contract').value = SAMPLE_C;
+  document.getElementById('c-inv').value = SAMPLE_I;
+  document.getElementById('customhint').textContent = "예시(재진입)를 채웠습니다. '분석 / 증명'을 눌러보세요.";
+};
+
+function renderSteps(stepsEl, data){
+  const byKey = {}; (data.steps||[]).forEach(s=>byKey[s.step]=s);
+  stepsEl.innerHTML = STEP_DEFS.map((def,i)=>{
+    const s = byKey[def.key];
+    let txt = def.label, cls = "st";
+    if (s){
+      cls += " on done";
+      if (def.key==="scan" && s.strategy) txt = `${def.label} → <b>${s.strategy}</b>`;
+      if (def.key==="scan" && !s.strategy) txt = `${def.label} → <b>패턴 없음</b>`;
+      if (def.key==="deploy_target") txt = `${def.label} → <b>${fmtEth(s.balance_wei)}</b> 시드`;
+      if (def.key==="verify"){ const v=s.checkAll_after; txt = `${def.label} → allHold=<b>${v.allHold}</b>${v.firstViolated?` · <b>${v.firstViolated}</b>`:""}`; }
+    } else {
+      cls += " on done"; txt = `${def.label} → <b>skip</b>`;
+    }
+    return `<div class="${cls}"><span class="ic">${i+1}</span><div class="d">${txt}</div></div>`;
+  }).join('');
+}
+
+async function runCustom(){
+  const contract = document.getElementById('c-contract').value.trim();
+  const invariants = document.getElementById('c-inv').value.trim();
+  const targetName = document.getElementById('c-name').value.trim();
+  const manifest = document.getElementById('c-man').value.trim();
+  const card = document.getElementById('customCard');
+  const stepsEl = document.getElementById('steps-custom');
+  const outEl = document.getElementById('out-custom');
+  const btn = document.getElementById('runCustom');
+  if(!contract){ document.getElementById('customhint').textContent = "컨트랙트 소스를 입력하세요."; return; }
+  card.style.display = "flex"; btn.disabled = true;
+  setVerdict("custom","run","RUNNING…"); stepsEl.innerHTML=""; outEl.innerHTML="";
+  document.getElementById('cmode').textContent = invariants ? "verify mode" : "analyze-only (불변식 없음)";
+  card.scrollIntoView({behavior:"smooth", block:"nearest"});
+  let data;
+  try{
+    const res = await fetch(`/api/prove`, {method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({contract, invariants, targetName, manifest})});
+    data = await res.json();
+  }catch(e){ setVerdict("custom","idle","API ERROR"); outEl.innerHTML=`<div class="err">API 호출 실패: ${e}</div>`; btn.disabled=false; return; }
+  if (data.error){ setVerdict("custom","idle","ERROR"); stepsEl.innerHTML=""; outEl.innerHTML=`<div class="err">${data.error}</div>`; btn.disabled=false; return; }
+  document.getElementById('cname').textContent = data.name || "Custom";
+  renderSteps(stepsEl, data);
+  if (data.proven === true){ setVerdict("custom","proven","PROVEN"); outEl.innerHTML = metricsHtml(data,true) + srcHtml(data); }
+  else if (data.proven === false && data.mode==="verify"){ setVerdict("custom","safe","NOT PROVEN"); outEl.innerHTML = metricsHtml(data,false) + srcHtml(data); }
+  else { // analyze-only or no-candidate
+    setVerdict("custom", data.exploit_src?"run":"safe", data.exploit_src?"GENERATED":"NO PATTERN");
+    outEl.innerHTML = `<div class="metrics">
+      <div class="metric"><div class="k">모드</div><div class="v">${data.exploit_src?"후보 생성 (미검증)":"패턴 미검출"}</div></div>
+      <div class="metric"><div class="k">전략</div><div class="v">${data.strategy||"—"}</div></div>
+      </div><div style="font-size:12px;color:var(--tx3);margin-top:8px">${data.note||""}</div>` + srcHtml(data);
+  }
+  btn.disabled=false;
+}
+document.getElementById('runCustom').onclick = runCustom;
 </script>
 </body>
 </html>

@@ -1,6 +1,7 @@
-# TRUST404 Track04 — live one-button prove endpoint (Vercel Python serverless).
-# 실제 in-memory EVM 에서: 타깃 배포 -> Exploit.sol 생성 -> Exploit 배포/실행 ->
-# checkAll 불변식 재검사. 프론트 버튼이 /api/prove?target=<Name> 로 호출한다.
+# TRUST404 Track04 — live prove endpoint (Vercel Python serverless).
+# GET  /api/prove?target=<Name>   : 내장 공개셋 6개
+# POST /api/prove  {contract, invariants?, manifest?, targetName?} : 임의 컨트랙트
+# 실제 in-memory EVM 에서 배포->Exploit.sol 생성->실행->checkAll 재검사.
 import os, json, time, re, random, warnings, traceback
 warnings.filterwarnings("ignore")
 os.environ.setdefault("SOLCX_BINARY_PATH", "/tmp/solcx-bin")
@@ -10,6 +11,8 @@ from urllib.parse import urlparse, parse_qs
 SOLC = "0.8.24"
 EVM_VERSION = "cancun"
 DEFAULT_EXPLOIT_FUNDING_WEI = 10 * 10**18
+DEFAULT_SEED_WEI = 10 * 10**18
+MAX_SRC = 80000  # per-field source cap for custom uploads
 
 TARGETS = {
  "ReentrantVault": {
@@ -603,48 +606,90 @@ def _coerce_args(args, Web3):
             out.append(a)
     return out
 
-def prove(name):
-    """Run the full pipeline on a fresh in-memory EVM and return step-by-step detail."""
-    import solcx
-    from web3 import Web3
-    from eth_tester import EthereumTester, PyEVMBackend
-    t0 = time.time()
-    data = TARGETS[name]
-    target_src, invariants_src, manifest = data["src"], data["inv"], data["manifest"]
-    steps = []
+def _strip(src):
+    src = re.sub(r"//[^\n]*", "", src)
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    return src
 
-    # 1) STATIC SCAN -> strategy
-    findings = scan_target(target_src, invariants_src, manifest)
+def infer_target_name(src):
+    # last top-level `contract X` that is not an interface; NaiveOracle-style files
+    # put the main contract last.
+    s = _strip(src)
+    matches = re.findall(r"\bcontract\s+(\w+)", s)
+    return matches[-1] if matches else None
+
+def infer_invariants_name(src):
+    s = _strip(src)
+    for m in re.finditer(r"\bcontract\s+(\w+)\s*(is[^\{]*)?\{", s):
+        name = m.group(1)
+        # crude: does this contract define checkAll?
+        start = m.end()
+        depth = 1; i = start
+        while i < len(s) and depth > 0:
+            if s[i] == "{": depth += 1
+            elif s[i] == "}": depth -= 1
+            i += 1
+        body = s[start:i]
+        if "checkAll" in body:
+            return name
+    m = re.findall(r"\bcontract\s+(\w+)", s)
+    return m[-1] if m else None
+
+def _default_manifest():
+    return {"target": {"solc": SOLC, "evm_version": EVM_VERSION},
+            "deploy": {"constructor_args": [], "value_wei": str(DEFAULT_SEED_WEI)},
+            "invariants": {"predicates": []}}
+
+def prove_sources(name, target_src, invariants_src, manifest, do_verify=True):
+    import solcx
+    t0 = time.time()
+    steps = []
+    findings = scan_target(target_src, invariants_src or "", manifest)
     order = seeded_order(sorted(STRATEGY_ORDER, key=lambda f: (-findings["scores"].get(f,0), f)),
                          findings["scores"], 42)
-    chosen = None
-    exploit_src = None
+    chosen = exploit_src = None
     for fam in order:
         src = build_exploit(fam, findings)
         if src:
-            chosen, exploit_src = fam, src
-            break
+            chosen, exploit_src = fam, src; break
     steps.append({"step":"scan","title":"정적 분석 · 전략 선택",
                   "scores":findings["scores"],"strategy":chosen})
     if not exploit_src:
-        return {"name":name,"proven":False,"firstViolated":"",
-                "strategy":None,"steps":steps,"exploit_src":None,
-                "note":"no known-pattern candidate (likely a safe target)","ms":int((time.time()-t0)*1000)}
+        return {"name":name,"proven":False,"firstViolated":"","strategy":None,
+                "steps":steps,"exploit_src":None,"mode":"analyze",
+                "note":"공격 패턴 미검출 (멀쩡하거나 미지원 유형)","ms":int((time.time()-t0)*1000)}
+    steps.append({"step":"generate","title":"Exploit.sol 생성","strategy":chosen,"exploit_src":exploit_src})
 
-    steps.append({"step":"generate","title":"Exploit.sol 생성","strategy":chosen,
-                  "exploit_src":exploit_src})
+    if not do_verify or not invariants_src:
+        return {"name":name,"proven":None,"firstViolated":"","strategy":chosen,
+                "steps":steps,"exploit_src":exploit_src,"mode":"analyze",
+                "note":"불변식 미제공 — 후보 생성만 하고 검증은 생략했습니다.",
+                "ms":int((time.time()-t0)*1000)}
 
-    # 2) compile target + invariants + exploit
+    from web3 import Web3
+    from eth_tester import EthereumTester, PyEVMBackend
     _ensure_solc()
-    files = {f"{name}.sol":target_src, "Invariants.sol":invariants_src, "Exploit.sol":exploit_src}
+    inv_name = infer_invariants_name(invariants_src) or "Invariants"
+    files = {f"{name}.sol":target_src, "Invariants_src.sol":invariants_src, "Exploit.sol":exploit_src}
     std = {"language":"Solidity","sources":{k:{"content":v} for k,v in files.items()},
            "settings":{"evmVersion":EVM_VERSION,
                        "outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
-    compiled = solcx.compile_standard(std, allow_empty=True)
+    try:
+        compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception as e:
+        return {"name":name,"proven":False,"firstViolated":"","strategy":chosen,"steps":steps,
+                "exploit_src":exploit_src,"mode":"verify","error":"compile failed: "+str(e)[:300],
+                "ms":int((time.time()-t0)*1000)}
     arts = {}
     for _fn, cs in compiled.get("contracts",{}).items():
         for cn, c in cs.items():
             arts[cn] = {"abi":c["abi"],"bin":c["evm"]["bytecode"]["object"]}
+    for need in (name, inv_name, "Exploit"):
+        if need not in arts:
+            return {"name":name,"proven":False,"firstViolated":"","strategy":chosen,"steps":steps,
+                    "exploit_src":exploit_src,"mode":"verify",
+                    "error":f"missing artifact {need} (target/invariants name mismatch)",
+                    "ms":int((time.time()-t0)*1000)}
 
     backend = PyEVMBackend.from_mnemonic(
         "test test test test test test test test test test test junk",
@@ -652,7 +697,6 @@ def prove(name):
     et = EthereumTester(backend=backend)
     w3 = Web3(Web3.EthereumTesterProvider(et))
     acct = w3.eth.accounts[0]
-
     def deploy(art, args=None, value=0):
         C = w3.eth.contract(abi=art["abi"], bytecode=art["bin"])
         tx = C.constructor(*(args or [])).transact({"from":acct,"value":value,"gas":12_000_000})
@@ -661,23 +705,22 @@ def prove(name):
 
     dep = manifest.get("deploy",{})
     cargs = _coerce_args(dep.get("constructor_args",[]), Web3)
-    seed_wei = int(str(dep.get("value_wei","0")) or "0")
-
-    # 3) DEPLOY TARGET (Setup semantics: deploy{value: seed}(args))
-    target, taddr = deploy(arts[name], cargs, value=seed_wei)
-    inv, iaddr = deploy(arts["Invariants"])
+    seed_wei = int(str(dep.get("value_wei", str(DEFAULT_SEED_WEI))) or "0")
+    try:
+        target, taddr = deploy(arts[name], cargs, value=seed_wei)
+    except Exception:
+        seed_wei = 0
+        target, taddr = deploy(arts[name], cargs, value=0)  # retry non-payable
+    inv, iaddr = deploy(arts[inv_name])
     before = inv.functions.checkAll(taddr).call()
     bal_before = w3.eth.get_balance(taddr)
-    steps.append({"step":"deploy_target","title":"타깃 Foundry 배포 + 건강 검사",
-                  "address":taddr,"seed_wei":str(seed_wei),
-                  "balance_wei":str(bal_before),
+    steps.append({"step":"deploy_target","title":"타깃 배포 + 건강 검사","address":taddr,
+                  "seed_wei":str(seed_wei),"balance_wei":str(bal_before),
                   "checkAll_before":{"allHold":before[0],"firstViolated":before[1]}})
     if before[0] is not True:
-        return {"name":name,"proven":False,"firstViolated":before[1],
-                "strategy":chosen,"steps":steps,"exploit_src":exploit_src,
-                "note":"BAD TARGET DESIGN","ms":int((time.time()-t0)*1000)}
-
-    # 4) DEPLOY + RUN EXPLOIT (fund 10 ETH, run{value:10 ether})
+        return {"name":name,"proven":False,"firstViolated":before[1],"strategy":chosen,"steps":steps,
+                "exploit_src":exploit_src,"mode":"verify","note":"배포 직후 이미 불변식 위반(BAD TARGET DESIGN)",
+                "ms":int((time.time()-t0)*1000)}
     exp, eaddr = deploy(arts["Exploit"])
     w3.eth.send_transaction({"from":acct,"to":eaddr,"value":DEFAULT_EXPLOIT_FUNDING_WEI,"gas":1_000_000})
     run_err = None
@@ -686,22 +729,21 @@ def prove(name):
         w3.eth.wait_for_transaction_receipt(tx)
     except Exception as e:
         run_err = str(e)[:200]
-    steps.append({"step":"run_exploit","title":"Exploit 배포 + 실행",
-                  "exploit_address":eaddr,"run_error":run_err})
-
-    # 5) RE-CHECK
+    steps.append({"step":"run_exploit","title":"Exploit 배포 + 실행","exploit_address":eaddr,"run_error":run_err})
     after = inv.functions.checkAll(taddr).call()
     bal_after = w3.eth.get_balance(taddr)
     proven = after[0] is False
     steps.append({"step":"verify","title":"불변식 재검사",
                   "checkAll_after":{"allHold":after[0],"firstViolated":after[1]},
-                  "balance_wei":str(bal_after),
-                  "drained_wei":str(bal_before - bal_after),
-                  "proven":proven})
+                  "balance_wei":str(bal_after),"drained_wei":str(bal_before-bal_after),"proven":proven})
     return {"name":name,"proven":proven,"firstViolated":(after[1] if proven else ""),
-            "strategy":chosen,"exploit_src":exploit_src,"steps":steps,
+            "strategy":chosen,"exploit_src":exploit_src,"steps":steps,"mode":"verify",
             "balance_before_wei":str(bal_before),"balance_after_wei":str(bal_after),
             "ms":int((time.time()-t0)*1000)}
+
+def prove(name):
+    d = TARGETS[name]
+    return prove_sources(name, d["src"], d["inv"], d["manifest"], do_verify=True)
 
 def _run(name):
     if name not in TARGETS:
@@ -711,18 +753,58 @@ def _run(name):
     except Exception as e:
         return {"name":name,"error":str(e)[:400],"trace":traceback.format_exc()[-800:]}
 
+def _run_custom(body):
+    try:
+        data = json.loads(body or "{}")
+    except Exception as e:
+        return {"error":"invalid JSON body: "+str(e)[:120]}
+    contract = (data.get("contract") or "").strip()
+    invariants = (data.get("invariants") or "").strip()
+    if not contract:
+        return {"error":"'contract' source is required"}
+    if len(contract) > MAX_SRC or len(invariants) > MAX_SRC:
+        return {"error":f"source too large (max {MAX_SRC} bytes per field)"}
+    name = (data.get("targetName") or "").strip() or infer_target_name(contract)
+    if not name:
+        return {"error":"could not find a contract definition in 'contract'"}
+    manifest = _default_manifest()
+    um = data.get("manifest")
+    if isinstance(um, str) and um.strip():
+        try: um = json.loads(um)
+        except Exception as e: return {"error":"invalid manifest JSON: "+str(e)[:120]}
+    if isinstance(um, dict):
+        for k,v in um.items():
+            if isinstance(v,dict): manifest.setdefault(k,{}).update(v)
+            else: manifest[k]=v
+    try:
+        return prove_sources(name, contract, invariants or None, manifest, do_verify=bool(invariants))
+    except Exception as e:
+        return {"name":name,"error":str(e)[:400],"trace":traceback.format_exc()[-700:]}
+
 class handler(BaseHTTPRequestHandler):
     def _send(self, code, obj):
-        body = json.dumps(obj, ensure_ascii=False).encode()
+        b = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type","application/json; charset=utf-8")
         self.send_header("Access-Control-Allow-Origin","*")
+        self.send_header("Access-Control-Allow-Methods","GET,POST,OPTIONS")
+        self.send_header("Access-Control-Allow-Headers","Content-Type")
         self.send_header("Cache-Control","no-store")
         self.end_headers()
-        self.wfile.write(body)
+        self.wfile.write(b)
+    def do_OPTIONS(self):
+        self._send(200, {"ok":True})
     def do_GET(self):
         q = parse_qs(urlparse(self.path).query)
         name = (q.get("target") or [""])[0]
         if not name:
-            return self._send(200, {"targets":list(TARGETS.keys())})
+            return self._send(200, {"targets":list(TARGETS.keys()),
+                                    "usage":"GET ?target=<Name> | POST {contract,invariants?,manifest?,targetName?}"})
         self._send(200, _run(name))
+    def do_POST(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n).decode("utf-8", "replace") if n else ""
+        except Exception as e:
+            return self._send(400, {"error":"read body failed: "+str(e)[:120]})
+        self._send(200, _run_custom(body))
