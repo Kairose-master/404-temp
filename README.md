@@ -59,7 +59,8 @@ python3 agent/agent.py --contract targets/ReentrantVault/src/ReentrantVault.sol 
 
 ## 리서치 & 대시보드
 - 취약점 분석 + 4대 공격 기법 + 최신 논문 정리: [`FINDINGS.md`](./FINDINGS.md)
-- 라이브 대시보드: https://trust404-exploit-agent-godavid123-3215s-projects.vercel.app
+- 라이브 원버튼 콘솔(배포→생성→실행→증명): https://trust404-prover.vercel.app
+- 취약점 분석 대시보드: https://trust404-prover.vercel.app/analysis.html
 - 프론트엔드 소스: [`web/index.html`](./web/index.html)
 
 ## 레이아웃
