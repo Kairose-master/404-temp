@@ -640,69 +640,39 @@ def _default_manifest():
             "deploy": {"constructor_args": [], "value_wei": str(DEFAULT_SEED_WEI)},
             "invariants": {"predicates": []}}
 
-def prove_sources(name, target_src, invariants_src, manifest, do_verify=True):
-    import solcx
-    t0 = time.time()
-    steps = []
-    findings = scan_target(target_src, invariants_src or "", manifest)
-    order = seeded_order(sorted(STRATEGY_ORDER, key=lambda f: (-findings["scores"].get(f,0), f)),
-                         findings["scores"], 42)
-    chosen = exploit_src = None
-    for fam in order:
-        src = build_exploit(fam, findings)
-        if src:
-            chosen, exploit_src = fam, src; break
-    steps.append({"step":"scan","title":"정적 분석 · 전략 선택",
-                  "scores":findings["scores"],"strategy":chosen})
-    if not exploit_src:
-        return {"name":name,"proven":False,"firstViolated":"","strategy":None,
-                "steps":steps,"exploit_src":None,"mode":"analyze",
-                "note":"공격 패턴 미검출 (멀쩡하거나 미지원 유형)","ms":int((time.time()-t0)*1000)}
-    steps.append({"step":"generate","title":"Exploit.sol 생성","strategy":chosen,"exploit_src":exploit_src})
-
-    if not do_verify or not invariants_src:
-        return {"name":name,"proven":None,"firstViolated":"","strategy":chosen,
-                "steps":steps,"exploit_src":exploit_src,"mode":"analyze",
-                "note":"불변식 미제공 — 후보 생성만 하고 검증은 생략했습니다.",
-                "ms":int((time.time()-t0)*1000)}
-
+def _mk_evm():
     from web3 import Web3
     from eth_tester import EthereumTester, PyEVMBackend
+    backend = PyEVMBackend.from_mnemonic(
+        "test test test test test test test test test test test junk",
+        genesis_state_overrides={"balance":10**24})
+    w3 = Web3(Web3.EthereumTesterProvider(EthereumTester(backend=backend)))
+    return w3, w3.eth.accounts[0]
+
+def _verify_attempt(name, target_src, invariants_src, exploit_src, manifest):
+    """One EVM run of the harness _prove pipeline. Returns (proven, steps, meta)."""
+    import solcx
+    from web3 import Web3
     _ensure_solc()
     inv_name = infer_invariants_name(invariants_src) or "Invariants"
     files = {f"{name}.sol":target_src, "Invariants_src.sol":invariants_src, "Exploit.sol":exploit_src}
     std = {"language":"Solidity","sources":{k:{"content":v} for k,v in files.items()},
            "settings":{"evmVersion":EVM_VERSION,
                        "outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
-    try:
-        compiled = solcx.compile_standard(std, allow_empty=True)
-    except Exception as e:
-        return {"name":name,"proven":False,"firstViolated":"","strategy":chosen,"steps":steps,
-                "exploit_src":exploit_src,"mode":"verify","error":"compile failed: "+str(e)[:300],
-                "ms":int((time.time()-t0)*1000)}
+    compiled = solcx.compile_standard(std, allow_empty=True)
     arts = {}
     for _fn, cs in compiled.get("contracts",{}).items():
         for cn, c in cs.items():
             arts[cn] = {"abi":c["abi"],"bin":c["evm"]["bytecode"]["object"]}
     for need in (name, inv_name, "Exploit"):
         if need not in arts:
-            return {"name":name,"proven":False,"firstViolated":"","strategy":chosen,"steps":steps,
-                    "exploit_src":exploit_src,"mode":"verify",
-                    "error":f"missing artifact {need} (target/invariants name mismatch)",
-                    "ms":int((time.time()-t0)*1000)}
-
-    backend = PyEVMBackend.from_mnemonic(
-        "test test test test test test test test test test test junk",
-        genesis_state_overrides={"balance":10**24})
-    et = EthereumTester(backend=backend)
-    w3 = Web3(Web3.EthereumTesterProvider(et))
-    acct = w3.eth.accounts[0]
+            raise RuntimeError(f"missing artifact {need} (name mismatch)")
+    w3, acct = _mk_evm()
     def deploy(art, args=None, value=0):
         C = w3.eth.contract(abi=art["abi"], bytecode=art["bin"])
         tx = C.constructor(*(args or [])).transact({"from":acct,"value":value,"gas":12_000_000})
         r = w3.eth.wait_for_transaction_receipt(tx)
         return w3.eth.contract(address=r.contractAddress, abi=art["abi"]), r.contractAddress
-
     dep = manifest.get("deploy",{})
     cargs = _coerce_args(dep.get("constructor_args",[]), Web3)
     seed_wei = int(str(dep.get("value_wei", str(DEFAULT_SEED_WEI))) or "0")
@@ -710,17 +680,14 @@ def prove_sources(name, target_src, invariants_src, manifest, do_verify=True):
         target, taddr = deploy(arts[name], cargs, value=seed_wei)
     except Exception:
         seed_wei = 0
-        target, taddr = deploy(arts[name], cargs, value=0)  # retry non-payable
+        target, taddr = deploy(arts[name], cargs, value=0)
     inv, iaddr = deploy(arts[inv_name])
     before = inv.functions.checkAll(taddr).call()
     bal_before = w3.eth.get_balance(taddr)
-    steps.append({"step":"deploy_target","title":"타깃 배포 + 건강 검사","address":taddr,
-                  "seed_wei":str(seed_wei),"balance_wei":str(bal_before),
-                  "checkAll_before":{"allHold":before[0],"firstViolated":before[1]}})
     if before[0] is not True:
-        return {"name":name,"proven":False,"firstViolated":before[1],"strategy":chosen,"steps":steps,
-                "exploit_src":exploit_src,"mode":"verify","note":"배포 직후 이미 불변식 위반(BAD TARGET DESIGN)",
-                "ms":int((time.time()-t0)*1000)}
+        return False, [{"step":"deploy_target","title":"타깃 배포 + 건강 검사","address":taddr,
+                        "seed_wei":str(seed_wei),"balance_wei":str(bal_before),
+                        "checkAll_before":{"allHold":before[0],"firstViolated":before[1]}}], {"bad_target":True}
     exp, eaddr = deploy(arts["Exploit"])
     w3.eth.send_transaction({"from":acct,"to":eaddr,"value":DEFAULT_EXPLOIT_FUNDING_WEI,"gas":1_000_000})
     run_err = None
@@ -729,17 +696,61 @@ def prove_sources(name, target_src, invariants_src, manifest, do_verify=True):
         w3.eth.wait_for_transaction_receipt(tx)
     except Exception as e:
         run_err = str(e)[:200]
-    steps.append({"step":"run_exploit","title":"Exploit 배포 + 실행","exploit_address":eaddr,"run_error":run_err})
     after = inv.functions.checkAll(taddr).call()
     bal_after = w3.eth.get_balance(taddr)
     proven = after[0] is False
-    steps.append({"step":"verify","title":"불변식 재검사",
-                  "checkAll_after":{"allHold":after[0],"firstViolated":after[1]},
-                  "balance_wei":str(bal_after),"drained_wei":str(bal_before-bal_after),"proven":proven})
-    return {"name":name,"proven":proven,"firstViolated":(after[1] if proven else ""),
-            "strategy":chosen,"exploit_src":exploit_src,"steps":steps,"mode":"verify",
-            "balance_before_wei":str(bal_before),"balance_after_wei":str(bal_after),
-            "ms":int((time.time()-t0)*1000)}
+    steps = [
+        {"step":"deploy_target","title":"타깃 배포 + 건강 검사","address":taddr,"seed_wei":str(seed_wei),
+         "balance_wei":str(bal_before),"checkAll_before":{"allHold":before[0],"firstViolated":before[1]}},
+        {"step":"run_exploit","title":"Exploit 배포 + 실행","exploit_address":eaddr,"run_error":run_err},
+        {"step":"verify","title":"불변식 재검사","checkAll_after":{"allHold":after[0],"firstViolated":after[1]},
+         "balance_wei":str(bal_after),"drained_wei":str(bal_before-bal_after),"proven":proven},
+    ]
+    meta = {"firstViolated":(after[1] if proven else ""),
+            "balance_before_wei":str(bal_before),"balance_after_wei":str(bal_after)}
+    return proven, steps, meta
+
+def prove_sources(name, target_src, invariants_src, manifest, do_verify=True):
+    t0 = time.time()
+    findings = scan_target(target_src, invariants_src or "", manifest)
+    order = seeded_order(sorted(STRATEGY_ORDER, key=lambda f: (-findings["scores"].get(f,0), f)),
+                         findings["scores"], 42)
+    candidates = []
+    for fam in order:
+        src = build_exploit(fam, findings)
+        if src:
+            candidates.append((fam, src))
+    scan_step = {"step":"scan","title":"정적 분석 · 전략 선택","scores":findings["scores"],
+                 "strategy":(candidates[0][0] if candidates else None)}
+    if not candidates:
+        return {"name":name,"proven":False,"firstViolated":"","strategy":None,"steps":[scan_step],
+                "exploit_src":None,"mode":"analyze","note":"공격 패턴 미검출 (멀쩡하거나 미지원 유형)",
+                "ms":int((time.time()-t0)*1000)}
+    if not do_verify or not invariants_src:
+        fam, src = candidates[0]
+        return {"name":name,"proven":None,"firstViolated":"","strategy":fam,
+                "steps":[scan_step,{"step":"generate","title":"Exploit.sol 생성","strategy":fam,"exploit_src":src}],
+                "exploit_src":src,"mode":"analyze",
+                "note":"불변식 미제공 — 후보 생성만 하고 검증은 생략했습니다.","ms":int((time.time()-t0)*1000)}
+    # verify mode: try each candidate strategy until one PROVES
+    last = None
+    for fam, src in candidates:
+        try:
+            proven, vsteps, meta = _verify_attempt(name, target_src, invariants_src, src, manifest)
+        except Exception as e:
+            last = {"name":name,"proven":False,"firstViolated":"","strategy":fam,
+                    "steps":[scan_step,{"step":"generate","title":"Exploit.sol 생성","strategy":fam,"exploit_src":src}],
+                    "exploit_src":src,"mode":"verify","error":str(e)[:300],"ms":int((time.time()-t0)*1000)}
+            continue
+        steps = [scan_step,{"step":"generate","title":"Exploit.sol 생성","strategy":fam,"exploit_src":src}] + vsteps
+        res = {"name":name,"proven":proven,"firstViolated":meta.get("firstViolated",""),"strategy":fam,
+               "steps":steps,"exploit_src":src,"mode":"verify",
+               "balance_before_wei":meta.get("balance_before_wei"),"balance_after_wei":meta.get("balance_after_wei"),
+               "ms":int((time.time()-t0)*1000)}
+        if proven:
+            return res
+        last = res
+    return last
 
 def prove(name):
     d = TARGETS[name]
