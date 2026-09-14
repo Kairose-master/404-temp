@@ -12,7 +12,7 @@ SOLC = "0.8.24"
 EVM_VERSION = "cancun"
 DEFAULT_EXPLOIT_FUNDING_WEI = 10 * 10**18
 DEFAULT_SEED_WEI = 10 * 10**18
-MAX_SRC = 80000  # per-field source cap for custom uploads
+MAX_SRC = 500000  # per-field source cap for custom uploads
 
 TARGETS = {
  "ReentrantVault": {
@@ -785,6 +785,181 @@ def _run_effect(name, target_src, exploit_src, manifest):
           "balance_before_wei":str(b0),"balance_after_wei":str(b1)}
     return exploited, steps, meta
 
+ZERO_ADDR = "0x0000000000000000000000000000000000000000"
+_ATTACKER = "__ATTACKER__"; _TARGET = "__TARGET__"
+import itertools as _it
+
+def _fuzz_value_movers(target_src):
+    """names of functions whose body actually moves ETH out (drain-like)."""
+    movers=set()
+    for fn in _functions(_strip(target_src)):
+        b=fn["body"]
+        if re.search(r"\.call\s*\{\s*value\s*:", b) or re.search(r"\.transfer\s*\(", b) or re.search(r"\.send\s*\(", b):
+            movers.add(fn["name"])
+    return movers
+
+def _fuzz_fns(abi):
+    out=[]
+    for e in abi:
+        if e.get("type")!="function": continue
+        if e.get("stateMutability") in ("view","pure"): continue
+        types=[i["type"] for i in e.get("inputs",[])]
+        if any(not (t=="address" or t=="bool" or t.startswith("uint")) for t in types): continue
+        out.append({"name":e["name"],"types":types,"payable":e.get("stateMutability")=="payable"})
+    return out
+
+def _fuzz_pool(t, ctx):
+    if t.startswith("uint"): return [(1<<256)-1, ctx["seed"] or 10**19, 10**18, 1, 0]
+    if t=="address":
+        base=[_ATTACKER, ZERO_ADDR, _TARGET]
+        if ctx.get("owner0"): base.append(ctx["owner0"])
+        return base
+    if t=="bool": return [True, False]
+    return []
+
+def _fuzz_calls(fn, ctx, cap=12):
+    pools=[_fuzz_pool(t,ctx) for t in fn["types"]]
+    if any(len(p)==0 for p in pools): return []
+    combos=[()] if not fn["types"] else list(_it.product(*pools))[:cap]
+    vals=[0]+([10**18] if fn["payable"] else [])
+    return [{"name":fn["name"],"types":fn["types"],"args":list(c),"value":v} for c in combos for v in vals]
+
+def _fuzz_resolve(a, acct, taddr, Web3):
+    if a==_ATTACKER: return acct
+    if a==_TARGET: return taddr
+    if isinstance(a,str) and a.startswith("0x"): return Web3.to_checksum_address(a)
+    return a
+
+def _fuzz_lit(t, a):
+    if t=="address":
+        if a==_ATTACKER: return "address(this)"
+        if a==_TARGET: return "t"
+        if a==ZERO_ADDR: return "address(0)"
+        return f"address({a})"
+    if t=="bool": return "true" if a else "false"
+    if a==(1<<256)-1: return "type(uint256).max"
+    return str(a)
+
+def _fuzz_codegen(seq, payable_map):
+    sigs={}; calls=[]
+    for c in seq:
+        pay=" payable" if payable_map.get(c["name"]) else ""
+        sigs[c["name"]]=f"    function {c['name']}({', '.join(c['types'])}) external{pay};"
+        args=", ".join(_fuzz_lit(t,a) for t,a in zip(c["types"], c["args"]))
+        val=f"{{value: {c['value']}}}" if c.get("value") else ""
+        calls.append(f"        I(t).{c['name']}{val}({args});")
+    return ("// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n"
+            "// Strategy: fuzzed call sequence (template-free) discovered by the agent.\n"
+            "interface I {\n"+"\n".join(sigs.values())+"\n}\n\n"
+            "contract Exploit {\n"
+            "    function run(address t) external payable {\n"+"\n".join(calls)+"\n    }\n"
+            "    receive() external payable {}\n}\n")
+
+def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=500):
+    """Deploy target once, snapshot, search single + (setup->drain) pairwise call
+    sequences that trip the invariant/effect. Returns (seq, payable_map, reason) or None."""
+    import solcx
+    from web3 import Web3
+    _ensure_solc()
+    files={f"{name}.sol":target_src}
+    if do_verify and invariants_src: files["Invariants_src.sol"]=invariants_src
+    std={"language":"Solidity","sources":{k:{"content":v} for k,v in files.items()},
+         "settings":{"evmVersion":EVM_VERSION,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    compiled=solcx.compile_standard(std, allow_empty=True)
+    arts={}
+    for _fn,cs in compiled.get("contracts",{}).items():
+        for cn,c in cs.items(): arts[cn]={"abi":c["abi"],"bin":c["evm"]["bytecode"]["object"]}
+    if name not in arts: return None
+    w3,acct=_mk_evm()
+    def deploy(art,args=None,value=0):
+        C=w3.eth.contract(abi=art["abi"],bytecode=art["bin"])
+        tx=C.constructor(*(args or [])).transact({"from":acct,"value":value,"gas":12_000_000})
+        r=w3.eth.wait_for_transaction_receipt(tx)
+        return w3.eth.contract(address=r.contractAddress,abi=art["abi"]),r.contractAddress
+    dep=manifest.get("deploy",{}); cargs=_coerce_args(dep.get("constructor_args",[]),Web3)
+    seed_wei=int(str(dep.get("value_wei",str(DEFAULT_SEED_WEI))) or "0")
+    try: tc,taddr=deploy(arts[name],cargs,value=seed_wei)
+    except Exception:
+        seed_wei=0; tc,taddr=deploy(arts[name],cargs,value=0)
+    abi=arts[name]["abi"]
+    inv=None
+    if do_verify and invariants_src:
+        inv_name=infer_invariants_name(invariants_src) or "Invariants"
+        if inv_name not in arts: return None
+        inv,_=deploy(arts[inv_name])
+        if inv.functions.checkAll(taddr).call()[0] is not True: return None
+    owner0 = tc.functions.owner().call() if _has_getter(abi,"owner") else None
+    base_bal=w3.eth.get_balance(taddr)
+    has_debt=_has_getter(abi,"totalDebt") and _has_getter(abi,"totalCollateral")
+    def checker():
+        if inv is not None:
+            r=inv.functions.checkAll(taddr).call()
+            return (r[0] is False, r[1] if r[0] is False else "")
+        reasons=[]
+        if w3.eth.get_balance(taddr) < base_bal: reasons.append(f"funds drained ({(base_bal-w3.eth.get_balance(taddr))/1e18:g} ETH)")
+        if owner0 is not None and tc.functions.owner().call()!=owner0: reasons.append("owner hijacked")
+        if has_debt and tc.functions.totalDebt().call() > tc.functions.totalCollateral().call(): reasons.append("debt > collateral")
+        return (len(reasons)>0, "; ".join(reasons))
+    tester=w3.provider.ethereum_tester; snap=tester.take_snapshot()
+    ctx={"seed":seed_wei,"attacker":acct,"target":taddr,"owner0":owner0}
+    fns=_fuzz_fns(abi)
+    payable_map={f["name"]:f["payable"] for f in fns}
+    movers=_fuzz_value_movers(target_src)
+    calls_by_fn={f["name"]:_fuzz_calls(f,ctx) for f in fns}
+    all_calls=[c for f in fns for c in calls_by_fn[f["name"]]]
+    def do_call(c):
+        args=[_fuzz_resolve(a,acct,taddr,Web3) for a in c["args"]]
+        getattr(tc.functions,c["name"])(*args).transact({"from":acct,"value":c["value"],"gas":8_000_000})
+    b=0
+    # phase 1: single calls
+    for c in all_calls:
+        if b>=budget: break
+        b+=1; tester.revert_to_snapshot(snap)
+        try: do_call(c)
+        except Exception: pass
+        trip,reason=checker()
+        if trip: return [c], payable_map, reason
+    # phase 2: setup(any) -> drain(value-mover)
+    seconds=[c for c in all_calls if c["name"] in movers] or all_calls
+    for c1 in all_calls:
+        if b>=budget: break
+        for c2 in seconds:
+            if b>=budget: break
+            b+=1; tester.revert_to_snapshot(snap)
+            try: do_call(c1)
+            except Exception: continue
+            try: do_call(c2)
+            except Exception: pass
+            trip,reason=checker()
+            if trip: return [c1,c2], payable_map, reason
+    return None
+
+def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_step, t0):
+    try:
+        found=_fuzz_search(name, target_src, invariants_src, manifest, do_verify)
+    except Exception:
+        return None
+    if not found: return None
+    seq, payable_map, reason = found
+    exploit_src=_fuzz_codegen(seq, payable_map)
+    gen={"step":"generate","title":"Exploit.sol 생성 (fuzz)","strategy":"fuzz","exploit_src":exploit_src}
+    try:
+        if do_verify and invariants_src:
+            proven,vsteps,meta=_verify_attempt(name,target_src,invariants_src,exploit_src,manifest)
+        else:
+            proven,vsteps,meta=_run_effect(name,target_src,exploit_src,manifest)
+    except Exception:
+        return None
+    if not proven: return None
+    return {"name":name,"proven":True,"firstViolated":meta.get("firstViolated",reason),
+            "strategy":"fuzz ("+" → ".join(c["name"] for c in seq)+")",
+            "steps":[scan_step,gen]+vsteps,"exploit_src":exploit_src,
+            "mode":("verify" if (do_verify and invariants_src) else "effect"),
+            "balance_before_wei":meta.get("balance_before_wei"),
+            "balance_after_wei":meta.get("balance_after_wei"),
+            "note":"템플릿 미매치 → 범용 퍼저가 호출 시퀀스를 탐색해 성립시켰습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
 def prove_sources(name, target_src, invariants_src, manifest, do_verify=True):
     t0 = time.time()
     findings = scan_target(target_src, invariants_src or "", manifest)
@@ -798,8 +973,11 @@ def prove_sources(name, target_src, invariants_src, manifest, do_verify=True):
     scan_step = {"step":"scan","title":"정적 분석 · 전략 선택","scores":findings["scores"],
                  "strategy":(candidates[0][0] if candidates else None)}
     if not candidates:
+        use_inv = invariants_src if (do_verify and invariants_src) else None
+        fz = _fuzz_fallback(name, target_src, use_inv, manifest, bool(use_inv), scan_step, t0)
+        if fz: return fz
         return {"name":name,"proven":False,"firstViolated":"","strategy":None,"steps":[scan_step],
-                "exploit_src":None,"mode":"analyze","note":"공격 패턴 미검출 (멀쩡하거나 미지원 유형)",
+                "exploit_src":None,"mode":"analyze","note":"공격 패턴 미검출 (템플릿·퍼저 모두 미성립)",
                 "ms":int((time.time()-t0)*1000)}
     if not do_verify or not invariants_src:
         # No invariants: actually RUN each candidate and observe real effects
@@ -823,6 +1001,8 @@ def prove_sources(name, target_src, invariants_src, manifest, do_verify=True):
             if exploited:
                 return res
             last = res
+        fz = _fuzz_fallback(name, target_src, invariants_src or None, manifest, False, scan_step, t0)
+        if fz: return fz
         return last
     # verify mode: try each candidate strategy until one PROVES
     last = None
@@ -842,6 +1022,8 @@ def prove_sources(name, target_src, invariants_src, manifest, do_verify=True):
         if proven:
             return res
         last = res
+    fz = _fuzz_fallback(name, target_src, invariants_src, manifest, True, scan_step, t0)
+    if fz: return fz
     return last
 
 def prove(name):

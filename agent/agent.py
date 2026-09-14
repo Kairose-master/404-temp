@@ -107,19 +107,22 @@ def main(argv=None):
     note(f"# strategy order: {scored}")
 
     # ── LLM 1차 후보(선택) ────────────────────────────────────────────────────
+    # 로컬/셀프호스트 모델(LLM_BASE_URL, 예: Ollama)만 있어도 동작한다 — API 키·
+    # 레이트리밋·거부 없이 오프라인에서 신종 익스플로잇을 합성하는 경로.
     llm_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("LLM_API_KEY")
+    llm_base = os.environ.get("LLM_BASE_URL")
     candidates = []  # list of (strategy_label, exploit_source)
-    if llm_key:
+    if llm_key or llm_base:
         try:
             from llm import propose_exploit  # optional
             draft = propose_exploit(contract_src, invariants_src, findings, llm_key)
             if draft:
                 candidates.append(("llm", draft))
-                note("# LLM draft obtained (temperature=0)")
+                note(f"# LLM draft obtained (temperature=0, {'local:'+llm_base if llm_base else 'anthropic'})")
         except Exception as e:  # network blocked / parse fail → degrade
             note(f"# LLM unavailable, degrading to heuristics: {str(e)[:120]}")
     else:
-        note("# no LLM key; offline heuristic mode")
+        note("# no LLM configured; offline heuristic/template mode")
 
     # ── 휴리스틱 후보(전략 우선순위 순) ───────────────────────────────────────
     for fam in scored:
