@@ -130,7 +130,8 @@
     <div class="tag"><span class="dot"></span>CUSTOM · 임의 컨트랙트 검사</div>
     <h1 style="font-size:clamp(22px,3.4vw,30px)">직접 올린 컨트랙트를 <span class="grad">스캔·생성·증명</span></h1>
     <p class="lede" style="font-size:15px">컨트랙트 소스를 붙여넣거나 <b>.sol</b> 파일을 올리세요.
-      불변식(Invariants)까지 주면 실제 EVM에서 증명까지, 없으면 스캔 + Exploit.sol 생성만 합니다.</p>
+      불변식(Invariants)을 주면 그걸로 증명하고, 없으면 <b>자동 합성 효과 검사</b>로 실제 배포·실행해
+      자금 유출·소유권 탈취·부채 초과 같은 효과를 관찰합니다.</p>
 
     <div class="custom-grid">
       <div class="fld">
@@ -384,7 +385,7 @@ async function runCustom(){
   if(!contract){ document.getElementById('customhint').textContent = "컨트랙트 소스를 입력하세요."; return; }
   card.style.display = "flex"; btn.disabled = true;
   setVerdict("custom","run","RUNNING…"); stepsEl.innerHTML=""; outEl.innerHTML="";
-  document.getElementById('cmode').textContent = invariants ? "verify mode" : "analyze-only (불변식 없음)";
+  document.getElementById('cmode').textContent = invariants ? "verify mode (불변식 검증)" : "effect mode (불변식 자동 합성 · 실제 실행)";
   card.scrollIntoView({behavior:"smooth", block:"nearest"});
   let data;
   try{
@@ -395,14 +396,24 @@ async function runCustom(){
   if (data.error){ setVerdict("custom","idle","ERROR"); stepsEl.innerHTML=""; outEl.innerHTML=`<div class="err">${data.error}</div>`; btn.disabled=false; return; }
   document.getElementById('cname').textContent = data.name || "Custom";
   renderSteps(stepsEl, data);
-  if (data.proven === true){ setVerdict("custom","proven","PROVEN"); outEl.innerHTML = metricsHtml(data,true) + srcHtml(data); }
-  else if (data.proven === false && data.mode==="verify"){ setVerdict("custom","safe","NOT PROVEN"); outEl.innerHTML = metricsHtml(data,false) + srcHtml(data); }
-  else { // analyze-only or no-candidate
-    setVerdict("custom", data.exploit_src?"run":"safe", data.exploit_src?"GENERATED":"NO PATTERN");
+  const ran = (data.mode==="verify" || data.mode==="effect");
+  if (data.proven === true){
+    setVerdict("custom","proven", data.mode==="effect" ? "EXPLOITED" : "PROVEN");
+    outEl.innerHTML = metricsHtml(data,true) + srcHtml(data);
+  } else if (data.proven === false && ran && data.exploit_src){
+    setVerdict("custom","safe","NO EFFECT");
+    outEl.innerHTML = metricsHtml(data,false)
+      + `<div style="font-size:12px;color:var(--tx3);margin-top:8px">${data.error?('오류: '+data.error):'실행했으나 관찰 가능한 효과 없음 (안전하거나 이 템플릿으로는 미성립).'}</div>`
+      + srcHtml(data);
+  } else if (data.proven === null && data.exploit_src){ // generation-only (rare)
+    setVerdict("custom","run","GENERATED");
+    outEl.innerHTML = `<div style="font-size:12px;color:var(--tx3)">${data.note||""}</div>` + srcHtml(data);
+  } else { // no candidate matched
+    setVerdict("custom","safe","NO PATTERN");
     outEl.innerHTML = `<div class="metrics">
-      <div class="metric"><div class="k">모드</div><div class="v">${data.exploit_src?"후보 생성 (미검증)":"패턴 미검출"}</div></div>
-      <div class="metric"><div class="k">전략</div><div class="v">${data.strategy||"—"}</div></div>
-      </div><div style="font-size:12px;color:var(--tx3);margin-top:8px">${data.note||""}</div>` + srcHtml(data);
+      <div class="metric"><div class="k">결과</div><div class="v green">공격 패턴 미검출</div></div>
+      <div class="metric"><div class="k">전략</div><div class="v">—</div></div>
+      </div><div style="font-size:12px;color:var(--tx3);margin-top:8px">${data.note||""}</div>`;
   }
   btn.disabled=false;
 }

@@ -710,6 +710,81 @@ def _verify_attempt(name, target_src, invariants_src, exploit_src, manifest):
             "balance_before_wei":str(bal_before),"balance_after_wei":str(bal_after)}
     return proven, steps, meta
 
+def _has_getter(abi, name):
+    for e in abi:
+        if e.get("type")=="function" and e.get("name")==name and not e.get("inputs") \
+           and e.get("stateMutability") in ("view","pure"):
+            return True
+    return False
+
+def _run_effect(name, target_src, exploit_src, manifest):
+    """No invariants supplied: actually deploy + run the exploit and OBSERVE effects
+    (ETH drained, owner() hijacked, debt>collateral). Synthesizes the check in Python."""
+    import solcx
+    from web3 import Web3
+    _ensure_solc()
+    files = {f"{name}.sol":target_src, "Exploit.sol":exploit_src}
+    std = {"language":"Solidity","sources":{k:{"content":v} for k,v in files.items()},
+           "settings":{"evmVersion":EVM_VERSION,
+                       "outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    compiled = solcx.compile_standard(std, allow_empty=True)
+    arts = {}
+    for _fn, cs in compiled.get("contracts",{}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi":c["abi"],"bin":c["evm"]["bytecode"]["object"]}
+    if name not in arts or "Exploit" not in arts:
+        raise RuntimeError(f"missing artifact ({name}/Exploit)")
+    w3, acct = _mk_evm()
+    def deploy(art, args=None, value=0):
+        C = w3.eth.contract(abi=art["abi"], bytecode=art["bin"])
+        tx = C.constructor(*(args or [])).transact({"from":acct,"value":value,"gas":12_000_000})
+        r = w3.eth.wait_for_transaction_receipt(tx)
+        return w3.eth.contract(address=r.contractAddress, abi=art["abi"]), r.contractAddress
+    dep = manifest.get("deploy",{})
+    cargs = _coerce_args(dep.get("constructor_args",[]), Web3)
+    seed_wei = int(str(dep.get("value_wei", str(DEFAULT_SEED_WEI))) or "0")
+    try:
+        target, taddr = deploy(arts[name], cargs, value=seed_wei)
+    except Exception:
+        seed_wei = 0
+        target, taddr = deploy(arts[name], cargs, value=0)
+    abi = arts[name]["abi"]
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    # pre-snapshot
+    b0 = w3.eth.get_balance(taddr)
+    o0 = tc.functions.owner().call() if _has_getter(abi,"owner") else None
+    debt0 = tc.functions.totalDebt().call() if _has_getter(abi,"totalDebt") else None
+    col0 = tc.functions.totalCollateral().call() if _has_getter(abi,"totalCollateral") else None
+    steps=[{"step":"deploy_target","title":"타깃 배포 (불변식 자동 합성)","address":taddr,
+            "seed_wei":str(seed_wei),"balance_wei":str(b0),
+            "checkAll_before":{"allHold":True,"firstViolated":""}}]
+    # deploy + run exploit
+    exp, eaddr = deploy(arts["Exploit"])
+    w3.eth.send_transaction({"from":acct,"to":eaddr,"value":DEFAULT_EXPLOIT_FUNDING_WEI,"gas":1_000_000})
+    run_err=None
+    try:
+        tx = exp.functions.run(taddr).transact({"from":acct,"value":DEFAULT_EXPLOIT_FUNDING_WEI,"gas":12_000_000})
+        w3.eth.wait_for_transaction_receipt(tx)
+    except Exception as e:
+        run_err=str(e)[:200]
+    steps.append({"step":"run_exploit","title":"Exploit 배포 + 실행","exploit_address":eaddr,"run_error":run_err})
+    # post-snapshot + effect decision
+    b1 = w3.eth.get_balance(taddr)
+    o1 = tc.functions.owner().call() if _has_getter(abi,"owner") else None
+    debt1 = tc.functions.totalDebt().call() if _has_getter(abi,"totalDebt") else None
+    col1 = tc.functions.totalCollateral().call() if _has_getter(abi,"totalCollateral") else None
+    reasons=[]
+    if b1 < b0: reasons.append(f"funds drained ({(b0-b1)/1e18:g} ETH)")
+    if o0 is not None and o1 is not None and o0 != o1: reasons.append("owner hijacked")
+    if debt1 is not None and col1 is not None and debt1 > col1: reasons.append("debt > collateral")
+    exploited = len(reasons) > 0
+    steps.append({"step":"verify","title":"효과 관찰 (자동 합성 불변식)",
+                  "checkAll_after":{"allHold": not exploited,"firstViolated": ("; ".join(reasons) if exploited else "")},
+                  "balance_wei":str(b1),"drained_wei":str(b0-b1),"proven":exploited})
+    meta={"firstViolated":("; ".join(reasons) if exploited else ""),
+          "balance_before_wei":str(b0),"balance_after_wei":str(b1)}
+    return exploited, steps, meta
+
 def prove_sources(name, target_src, invariants_src, manifest, do_verify=True):
     t0 = time.time()
     findings = scan_target(target_src, invariants_src or "", manifest)
@@ -727,11 +802,28 @@ def prove_sources(name, target_src, invariants_src, manifest, do_verify=True):
                 "exploit_src":None,"mode":"analyze","note":"공격 패턴 미검출 (멀쩡하거나 미지원 유형)",
                 "ms":int((time.time()-t0)*1000)}
     if not do_verify or not invariants_src:
-        fam, src = candidates[0]
-        return {"name":name,"proven":None,"firstViolated":"","strategy":fam,
-                "steps":[scan_step,{"step":"generate","title":"Exploit.sol 생성","strategy":fam,"exploit_src":src}],
-                "exploit_src":src,"mode":"analyze",
-                "note":"불변식 미제공 — 후보 생성만 하고 검증은 생략했습니다.","ms":int((time.time()-t0)*1000)}
+        # No invariants: actually RUN each candidate and observe real effects
+        # (drained ETH / owner hijack / debt>collateral) via a synthesized check.
+        last = None
+        for fam, src in candidates:
+            gen = {"step":"generate","title":"Exploit.sol 생성","strategy":fam,"exploit_src":src}
+            try:
+                exploited, esteps, meta = _run_effect(name, target_src, src, manifest)
+            except Exception as e:
+                last = {"name":name,"proven":False,"firstViolated":"","strategy":fam,
+                        "steps":[scan_step,gen],"exploit_src":src,"mode":"effect",
+                        "error":str(e)[:300],"ms":int((time.time()-t0)*1000)}
+                continue
+            res = {"name":name,"proven":exploited,"firstViolated":meta.get("firstViolated",""),
+                   "strategy":fam,"steps":[scan_step,gen]+esteps,"exploit_src":src,"mode":"effect",
+                   "balance_before_wei":meta.get("balance_before_wei"),
+                   "balance_after_wei":meta.get("balance_after_wei"),
+                   "note":"불변식 미제공 — 자동 합성 효과 검사로 실제 실행했습니다.",
+                   "ms":int((time.time()-t0)*1000)}
+            if exploited:
+                return res
+            last = res
+        return last
     # verify mode: try each candidate strategy until one PROVES
     last = None
     for fam, src in candidates:
