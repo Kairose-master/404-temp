@@ -1,0 +1,211 @@
+# TRUST404 Track04 — candidate verifier.
+# 하네스 harness/src/Harness.sol 의 _prove() 절차를 그대로 재현한다:
+#   1. 결정론 시간 고정(내장 EVM은 배포 시점 고정 블록 사용)
+#   2. 배포 직후 checkAll(target) == (true,"") (아니면 BAD TARGET DESIGN)
+#   3. Exploit 에 10 ETH 지급 후 run{value: 10 ether}(target)
+#   4. 재검사 — allHold==false 면 PROVEN
+# 기본 검증기는 내장 EVM(solc 0.8.24 + eth-tester/py-evm)이라 forge 없이,
+# 네트워크 없이 오프라인으로 동작한다. TRUST404_VERIFIER=forge 로 두면
+# 참가 번들 하네스를 forge test 로 돌리는 경로를 쓴다(그 환경에 forge 필요).
+import os
+import warnings
+
+warnings.filterwarnings("ignore")
+
+DEFAULT_EXPLOIT_FUNDING_WEI = 10 * 10**18  # 하네스 규약 DEFAULT_EXPLOIT_FUNDING_WEI
+
+
+class VerifyUnavailable(Exception):
+    """검증 도구를 이 환경에서 사용할 수 없음."""
+
+
+def verify_candidate(target_name, target_src, invariants_src, exploit_src, manifest, seed):
+    mode = os.environ.get("TRUST404_VERIFIER", "evm").lower()
+    if mode == "forge":
+        return _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest)
+    return _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest)
+
+
+# ── 내장 EVM 검증기 ──────────────────────────────────────────────────────────
+def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest):
+    try:
+        import solcx
+        from web3 import Web3
+        from eth_tester import EthereumTester, PyEVMBackend
+    except Exception as e:
+        raise VerifyUnavailable(f"python EVM stack missing: {e}")
+
+    solc_version = manifest["target"].get("solc", "0.8.24")
+    evm_version = manifest["target"].get("evm_version", "cancun")
+    try:
+        solcx.set_solc_version(solc_version)
+    except Exception:
+        try:
+            solcx.install_solc(solc_version)
+            solcx.set_solc_version(solc_version)
+        except Exception as e:
+            raise VerifyUnavailable(f"solc {solc_version} unavailable: {e}")
+
+    files = {
+        f"{target_name}.sol": target_src,
+        "Invariants.sol": invariants_src,
+        "Exploit.sol": exploit_src,
+    }
+    std_in = {
+        "language": "Solidity",
+        "sources": {fn: {"content": s} for fn, s in files.items()},
+        "settings": {
+            "evmVersion": evm_version,
+            "outputSelection": {"*": {"*": ["abi", "evm.bytecode.object"]}},
+        },
+    }
+    compiled = solcx.compile_standard(std_in, allow_empty=True)
+    arts = {}
+    for _fn, contracts in compiled.get("contracts", {}).items():
+        for cname, c in contracts.items():
+            arts[cname] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+
+    for need in (target_name, "Invariants", "Exploit"):
+        if need not in arts:
+            raise RuntimeError(f"missing compiled artifact: {need}")
+
+    backend = PyEVMBackend.from_mnemonic(
+        "test test test test test test test test test test test junk",
+        genesis_state_overrides={"balance": 10**24},
+    )
+    et = EthereumTester(backend=backend)
+    w3 = Web3(Web3.EthereumTesterProvider(et))
+    acct = w3.eth.accounts[0]
+
+    def deploy(art, args=None, value=0):
+        C = w3.eth.contract(abi=art["abi"], bytecode=art["bin"])
+        tx = C.constructor(*(args or [])).transact({"from": acct, "value": value, "gas": 12_000_000})
+        r = w3.eth.wait_for_transaction_receipt(tx)
+        return w3.eth.contract(address=r.contractAddress, abi=art["abi"]), r.contractAddress
+
+    # manifest constructor args + seed funding (Setup semantics: deploy{value:seed}(args))
+    dep = manifest.get("deploy", {})
+    cargs = _coerce_args(dep.get("constructor_args", []), Web3)
+    seed_wei = _parse_decimal(str(dep.get("value_wei", "0")))
+
+    target, taddr = deploy(arts[target_name], cargs, value=seed_wei)
+    inv, iaddr = deploy(arts["Invariants"])
+
+    before = inv.functions.checkAll(taddr).call()
+    if before[0] is not True:
+        raise RuntimeError(f"BAD TARGET DESIGN: invariant already broken before exploit: {before[1]}")
+
+    exp, eaddr = deploy(arts["Exploit"])
+    # vm.deal(exploit, 10 ether) 후 run{value: 10 ether}
+    w3.eth.send_transaction({"from": acct, "to": eaddr, "value": DEFAULT_EXPLOIT_FUNDING_WEI, "gas": 1_000_000})
+    run_err = None
+    try:
+        tx = exp.functions.run(taddr).transact(
+            {"from": acct, "value": DEFAULT_EXPLOIT_FUNDING_WEI, "gas": 12_000_000})
+        w3.eth.wait_for_transaction_receipt(tx)
+    except Exception as e:
+        run_err = str(e)[:160]
+
+    after = inv.functions.checkAll(taddr).call()
+    proven = after[0] is False
+    detail = f"allHold={after[0]}" + (f" run_err={run_err}" if run_err else "")
+    return proven, (after[1] if proven else ""), detail
+
+
+def _coerce_args(args, Web3):
+    out = []
+    for a in args:
+        if isinstance(a, str):
+            if a.startswith("0x") and len(a) == 42:
+                out.append(Web3.to_checksum_address(a))
+            elif a.isdigit():
+                out.append(int(a))
+            else:
+                out.append(a)
+        else:
+            out.append(a)
+    return out
+
+
+def _parse_decimal(s):
+    s = s.strip()
+    if not s:
+        return 0
+    if not s.isdigit():
+        raise ValueError(f"value_wei not decimal: {s!r}")
+    return int(s)
+
+
+# ── forge 검증기(선택) ───────────────────────────────────────────────────────
+def _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest):
+    import shutil
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    if shutil.which("forge") is None:
+        raise VerifyUnavailable("forge not on PATH")
+    harness_dir = os.environ.get("TRUST404_HARNESS_DIR")
+    if not harness_dir or not Path(harness_dir).exists():
+        raise VerifyUnavailable("TRUST404_HARNESS_DIR not set / missing")
+
+    dep = manifest.get("deploy", {})
+    seed_wei = _parse_decimal(str(dep.get("value_wei", "0")))
+    block_number = manifest["determinism"]["block_number"]
+    block_timestamp = manifest["determinism"]["block_timestamp"]
+
+    work = Path(tempfile.mkdtemp(prefix="t404-forge-"))
+    src = work / "src"
+    test = work / "test"
+    src.mkdir(parents=True)
+    test.mkdir(parents=True)
+    (src / f"{target_name}.sol").write_text(target_src)
+    (src / "Invariants.sol").write_text(invariants_src)
+    (src / "Exploit.sol").write_text(exploit_src)
+    shutil.copytree(Path(harness_dir) / "src", work / "harness_src")
+    # forge-std remap for the harness import
+    (work / "foundry.toml").write_text(
+        "[profile.default]\n"
+        f"evm_version = \"{manifest['target'].get('evm_version','cancun')}\"\n"
+        "src = 'src'\ntest = 'test'\n"
+        "remappings = ['forge-std/=lib/forge-std/src/']\n"
+    )
+    # A concrete harness test that deploys target{value:seed}(args) + inv + exploit.
+    # (constructor arg encoding kept simple: address-or-none, matching public set.)
+    cargs = dep.get("constructor_args", [])
+    ctor = ""
+    if len(cargs) == 1 and isinstance(cargs[0], str) and cargs[0].startswith("0x"):
+        ctor = f"address({cargs[0]})"
+    test_src = f"""// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+import {{Harness}} from "../harness_src/Harness.sol";
+import {{{target_name}}} from "../src/{target_name}.sol";
+import {{Invariants}} from "../src/Invariants.sol";
+import {{Exploit}} from "../src/Exploit.sol";
+contract Run is Harness {{
+    function test_prove() public {{
+        vm.deal(address(this), {seed_wei});
+        {target_name} target = new {target_name}{{value: {seed_wei}}}({ctor});
+        Invariants inv = new Invariants();
+        Exploit exp = new Exploit();
+        (bool proven, string memory v) = _prove(
+            address(target), address(inv), address(exp),
+            {block_number}, {block_timestamp}, {DEFAULT_EXPLOIT_FUNDING_WEI});
+        if (proven) emit log_named_string("AGENT_RESULT", string.concat("PROVEN:", v));
+        else emit log_named_string("AGENT_RESULT", "NOT_PROVEN");
+    }}
+}}
+"""
+    (test / "Run.t.sol").write_text(test_src)
+    # needs forge-std; assume harness bundle provides it or forge installs
+    proc = subprocess.run(
+        ["forge", "test", "--match-contract", "Run", "-vv"],
+        cwd=work, capture_output=True, text=True, timeout=180)
+    out = proc.stdout + proc.stderr
+    if "AGENT_RESULT" not in out:
+        raise RuntimeError(f"forge produced no result:\n{out[-800:]}")
+    line = [l for l in out.splitlines() if "AGENT_RESULT" in l][-1]
+    if "PROVEN:" in line and "NOT_PROVEN" not in line:
+        violated = line.split("PROVEN:")[-1].strip().strip('"')
+        return True, violated, "forge"
+    return False, "", "forge NOT_PROVEN"
