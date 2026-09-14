@@ -1,0 +1,248 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TRUST404 · Live Exploit Console</title>
+<meta name="description" content="버튼 하나로: 컨트랙트 배포 → Exploit.sol 자동 생성 → 익스플로잇 배포·실행 → 불변식 검증. 실제 EVM에서 라이브 실행.">
+<style>
+  :root{
+    --bg:#0a0b0f; --card:#141722; --card2:#191d2b; --line:#232838; --line2:#2e3446;
+    --tx:#e8ecf5; --tx2:#a4adc4; --tx3:#6b7488;
+    --acc:#7c5cff; --acc2:#22d3ee;
+    --red:#ff5c72; --red-bg:#2a1420; --green:#3ddc97; --green-bg:#0f2620;
+    --amber:#ffb454; --amber-bg:#2a2113;
+    --mono:'SF Mono',ui-monospace,'JetBrains Mono',Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--tx);font-family:var(--sans);line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+    background-image:radial-gradient(1100px 560px at 82% -10%,rgba(124,92,255,.13),transparent),
+                     radial-gradient(820px 460px at -8% 8%,rgba(34,211,238,.09),transparent);}
+  a{color:var(--acc2);text-decoration:none}a:hover{text-decoration:underline}
+  .wrap{max-width:1000px;margin:0 auto;padding:0 20px}
+  .mono{font-family:var(--mono)}
+  nav{position:sticky;top:0;z-index:20;backdrop-filter:blur(12px);background:rgba(10,11,15,.72);border-bottom:1px solid var(--line)}
+  nav .wrap{display:flex;align-items:center;gap:16px;height:56px}
+  nav .brand{font-weight:700;font-size:15px;margin-right:auto}
+  nav .brand b{color:var(--acc)}
+  nav a.nl{color:var(--tx2);font-size:13.5px;font-weight:500}
+  header{padding:56px 0 26px}
+  .tag{display:inline-flex;align-items:center;gap:8px;font-family:var(--mono);font-size:12px;color:var(--acc2);
+    background:rgba(34,211,238,.08);border:1px solid rgba(34,211,238,.22);padding:5px 12px;border-radius:999px;margin-bottom:20px}
+  .tag .dot{width:7px;height:7px;border-radius:50%;background:var(--acc2);box-shadow:0 0 10px var(--acc2)}
+  h1{font-size:clamp(28px,4.8vw,46px);line-height:1.1;margin:0 0 16px;letter-spacing:-1px;font-weight:800}
+  h1 .grad{background:linear-gradient(100deg,var(--acc),var(--acc2));-webkit-background-clip:text;background-clip:text;color:transparent}
+  .lede{font-size:clamp(15px,2vw,18px);color:var(--tx2);max-width:660px;margin:0 0 8px}
+  .pipeline-hint{font-family:var(--mono);font-size:12.5px;color:var(--tx3);margin-top:14px}
+  .pipeline-hint b{color:var(--acc2)}
+  .runall{margin:26px 0 8px;display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+  .btn{display:inline-flex;align-items:center;gap:8px;padding:11px 20px;border-radius:11px;font-weight:700;font-size:14px;cursor:pointer;border:0;font-family:var(--sans)}
+  .btn.primary{background:linear-gradient(100deg,var(--acc),#9b7cff);color:#fff}
+  .btn.primary:hover{filter:brightness(1.08)}
+  .btn.primary:disabled{opacity:.5;cursor:not-allowed}
+  .apihint{font-size:12.5px;color:var(--tx3)}
+  section{padding:12px 0 60px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:800px){.grid{grid-template-columns:1fr}}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:16px;overflow:hidden;display:flex;flex-direction:column}
+  .card.vuln{border-top:3px solid var(--red)} .card.safe{border-top:3px solid var(--green)}
+  .ch{padding:16px 18px 12px;display:flex;align-items:flex-start;gap:10px}
+  .ch .name{font-size:17px;font-weight:750}
+  .ch .cls{font-family:var(--mono);font-size:11.5px;color:var(--tx3);margin-top:2px}
+  .verdict{margin-left:auto;font-family:var(--mono);font-size:11px;font-weight:700;padding:4px 9px;border-radius:7px;white-space:nowrap}
+  .verdict.idle{color:var(--tx3);background:var(--card2);border:1px solid var(--line2)}
+  .verdict.run{color:var(--amber);background:var(--amber-bg);border:1px solid rgba(255,180,84,.3)}
+  .verdict.proven{color:var(--red);background:var(--red-bg);border:1px solid rgba(255,92,114,.35)}
+  .verdict.safe{color:var(--green);background:var(--green-bg);border:1px solid rgba(61,220,151,.35)}
+  .cbody{padding:0 18px 16px;display:flex;flex-direction:column;gap:12px}
+  .runbtn{width:100%;padding:10px;border-radius:10px;border:1px solid var(--acc);background:rgba(124,92,255,.12);color:#fff;font-weight:700;font-size:13.5px;cursor:pointer;font-family:var(--sans)}
+  .runbtn:hover{background:rgba(124,92,255,.2)}
+  .runbtn:disabled{opacity:.5;cursor:not-allowed}
+  .steps{display:flex;flex-direction:column;gap:7px}
+  .st{display:flex;gap:10px;align-items:flex-start;font-size:12.7px;color:var(--tx3);opacity:.4;transition:.25s}
+  .st.on{opacity:1;color:var(--tx2)}
+  .st .ic{width:18px;height:18px;border-radius:50%;border:1.5px solid var(--line2);display:grid;place-items:center;font-size:10px;flex-shrink:0;margin-top:2px}
+  .st.done .ic{border-color:var(--green);color:var(--green)}
+  .st.fail .ic{border-color:var(--red);color:var(--red)}
+  .st.on .ic{border-color:var(--acc2)}
+  .st .d b{color:var(--tx);font-weight:600}
+  .metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px}
+  .metric{background:var(--card2);border:1px solid var(--line);border-radius:9px;padding:8px 10px}
+  .metric .k{color:var(--tx3);font-size:10.5px;text-transform:uppercase;letter-spacing:.5px}
+  .metric .v{font-family:var(--mono);font-size:13px;margin-top:2px}
+  .metric .v.red{color:var(--red)} .metric .v.green{color:var(--green)}
+  details{background:#080910;border:1px solid var(--line);border-radius:10px}
+  summary{cursor:pointer;padding:9px 12px;font-size:12.5px;color:var(--tx2);font-family:var(--mono)}
+  pre{margin:0;padding:12px 13px;overflow-x:auto;font-family:var(--mono);font-size:11.6px;line-height:1.6;color:#c7cff0;border-top:1px solid var(--line)}
+  .warn{margin:22px 0 0;font-size:12px;color:var(--tx3);background:var(--amber-bg);border:1px solid rgba(255,180,84,.2);border-radius:10px;padding:11px 14px}
+  .warn b{color:var(--amber)}
+  footer{border-top:1px solid var(--line);padding:26px 0 50px;color:var(--tx3);font-size:12.5px}
+  .err{color:var(--red);font-size:12px;font-family:var(--mono)}
+</style>
+</head>
+<body>
+<nav><div class="wrap">
+  <div class="brand"><b>TRUST404</b> · Live Exploit Console</div>
+  <a class="nl" href="/analysis.html">분석 대시보드</a>
+  <a class="nl" href="https://github.com/Kairose-master/404-temp" target="_blank" rel="noopener">GitHub</a>
+</div></nav>
+
+<header><div class="wrap">
+  <div class="tag"><span class="dot"></span>ONE BUTTON · LIVE ON A REAL EVM</div>
+  <h1>버튼 하나로 <span class="grad">배포 → 생성 → 실행 → 증명</span></h1>
+  <p class="lede">각 타깃의 <b>Run</b> 버튼을 누르면 서버의 실제 in-memory EVM에서
+     파이프라인이 라이브로 돕니다. 미리 계산된 값이 아니라 매 클릭마다 새 EVM에서 실행됩니다.</p>
+  <div class="pipeline-hint">
+    <b>1</b> 타깃 배포 · <b>2</b> Exploit.sol 자동 생성 · <b>3</b> Exploit 배포 · <b>4</b> 실행 · <b>5</b> 불변식 재검사
+  </div>
+  <div class="runall">
+    <button class="btn primary" id="runAll">전체 6개 실행 ▶</button>
+    <span class="apihint" id="apihint"></span>
+  </div>
+  <div class="warn"><b>주의.</b> 격리된 in-memory EVM에서 방어 연구·자동 검증 목적으로만 실행됩니다.
+     실제 배포된 컨트랙트나 온체인 자금 대상이 아닙니다.</div>
+</div></header>
+
+<section><div class="wrap">
+  <div class="grid" id="grid"></div>
+</div></section>
+
+<footer><div class="wrap">
+  TRUST404 · Track 04 — Autonomous Exploit Prover ·
+  <span class="mono">/api/prove</span> 가 solc 0.8.24 + py-evm 으로 라이브 실행 ·
+  <a href="/analysis.html">취약점 분석 & 논문</a>
+</div></footer>
+
+<script>
+const TARGETS = [
+  {name:"ReentrantVault", verdictKind:"vuln", cls:"Reentrancy · CEI 위반"},
+  {name:"OpenVault",      verdictKind:"vuln", cls:"Broken Access Control"},
+  {name:"BadAccounting",  verdictKind:"vuln", cls:"Integer Underflow"},
+  {name:"NaiveOracle",    verdictKind:"vuln", cls:"Price Oracle Manipulation"},
+  {name:"SafeVault",      verdictKind:"safe", cls:"CEI + nonReentrant (멀쩡)"},
+  {name:"BoundedOwner",   verdictKind:"safe", cls:"타임락 + 상한 (멀쩡)"},
+];
+const STEP_DEFS = [
+  {key:"scan",          label:"정적 분석 · 전략 선택"},
+  {key:"generate",      label:"Exploit.sol 생성"},
+  {key:"deploy_target", label:"타깃 Foundry 배포 + 건강 검사"},
+  {key:"run_exploit",   label:"Exploit 배포 + 실행"},
+  {key:"verify",        label:"불변식 재검사"},
+];
+const fmtEth = wei => { try { return (Number(BigInt(wei))/1e18).toLocaleString(undefined,{maximumFractionDigits:4}) + " ETH"; } catch { return wei; } };
+
+const grid = document.getElementById('grid');
+TARGETS.forEach(t => {
+  const el = document.createElement('div');
+  el.className = `card ${t.verdictKind}`;
+  el.innerHTML = `
+    <div class="ch">
+      <div><div class="name">${t.name}</div><div class="cls">${t.cls}</div></div>
+      <span class="verdict idle" id="v-${t.name}">IDLE</span>
+    </div>
+    <div class="cbody">
+      <button class="runbtn" data-t="${t.name}">▶ Run pipeline</button>
+      <div class="steps" id="steps-${t.name}">
+        ${STEP_DEFS.map((s,i)=>`<div class="st" id="st-${t.name}-${i}"><span class="ic">${i+1}</span><div class="d">${s.label}</div></div>`).join('')}
+      </div>
+      <div id="out-${t.name}"></div>
+    </div>`;
+  grid.appendChild(el);
+});
+
+function setVerdict(name, kind, text){
+  const v = document.getElementById(`v-${name}`);
+  v.className = `verdict ${kind}`; v.textContent = text;
+}
+function resetSteps(name){
+  STEP_DEFS.forEach((_,i)=>{ const s=document.getElementById(`st-${name}-${i}`); s.className="st"; });
+  document.getElementById(`out-${name}`).innerHTML="";
+}
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+
+async function run(name){
+  const btn = document.querySelector(`.runbtn[data-t="${name}"]`);
+  btn.disabled = true; resetSteps(name); setVerdict(name,"run","RUNNING…");
+  // animate step 1..2 immediately (client side) for feel
+  for (let i=0;i<2;i++){ document.getElementById(`st-${name}-${i}`).classList.add("on"); await sleep(160); }
+  let data;
+  try {
+    const res = await fetch(`/api/prove?target=${encodeURIComponent(name)}`, {cache:"no-store"});
+    data = await res.json();
+  } catch(e){
+    setVerdict(name,"idle","API ERROR");
+    document.getElementById(`out-${name}`).innerHTML = `<div class="err">API 호출 실패: ${e}</div>`;
+    btn.disabled=false; return data;
+  }
+  if (data.error){
+    setVerdict(name,"idle","ERROR");
+    document.getElementById(`out-${name}`).innerHTML = `<div class="err">${data.error}</div>`;
+    btn.disabled=false; return data;
+  }
+  // map returned steps to the fixed 5 rows
+  const byKey = {}; (data.steps||[]).forEach(s=>byKey[s.step]=s);
+  for (let i=0;i<STEP_DEFS.length;i++){
+    const def = STEP_DEFS[i]; const s = byKey[def.key];
+    const row = document.getElementById(`st-${name}-${i}`);
+    row.classList.add("on"); await sleep(180);
+    if (s){
+      row.classList.add("done");
+      // enrich step text
+      if (def.key==="scan" && s.strategy) row.querySelector(".d").innerHTML = `${def.label} → <b>${s.strategy}</b>`;
+      if (def.key==="deploy_target") row.querySelector(".d").innerHTML = `${def.label} → <b>${fmtEth(s.balance_wei)}</b> 시드`;
+      if (def.key==="verify"){
+        const v=s.checkAll_after;
+        row.querySelector(".d").innerHTML = `${def.label} → allHold=<b>${v.allHold}</b>${v.firstViolated?` · <b>${v.firstViolated}</b>`:""}`;
+      }
+    } else {
+      // step not present (e.g. safe target: no generate/run) — mark neutral
+      row.classList.add("done"); row.querySelector(".d").innerHTML = `${def.label} → <b>skip</b>`;
+    }
+  }
+  // verdict + metrics
+  const out = document.getElementById(`out-${name}`);
+  if (data.proven){
+    setVerdict(name,"proven","PROVEN");
+    out.innerHTML = metricsHtml(data, true) + srcHtml(data);
+  } else if (data.note){
+    setVerdict(name,"safe","NOT PROVEN");
+    out.innerHTML = `<div class="metrics"><div class="metric"><div class="k">결과</div><div class="v green">불변식 유지 (오탐 없음)</div></div>
+      <div class="metric"><div class="k">스캐너</div><div class="v">공격 패턴 미검출</div></div></div>`;
+  } else {
+    setVerdict(name,"safe","NOT PROVEN");
+    out.innerHTML = metricsHtml(data,false) + srcHtml(data);
+  }
+  btn.disabled=false; return data;
+}
+
+function metricsHtml(data, proven){
+  const v = (data.steps||[]).find(s=>s.step==="verify") || {};
+  const dt = (data.steps||[]).find(s=>s.step==="deploy_target") || {};
+  const drained = v.drained_wei ? fmtEth(v.drained_wei) : "0 ETH";
+  return `<div class="metrics">
+    <div class="metric"><div class="k">깨진 술어</div><div class="v ${proven?'red':'green'}">${data.firstViolated||"—"}</div></div>
+    <div class="metric"><div class="k">탈취 금액</div><div class="v ${proven?'red':''}">${drained}</div></div>
+    <div class="metric"><div class="k">잔액 전 → 후</div><div class="v">${fmtEth(data.balance_before_wei||dt.balance_wei||'0')} → ${fmtEth(data.balance_after_wei||v.balance_wei||'0')}</div></div>
+    <div class="metric"><div class="k">실행 시간</div><div class="v">${data.ms||0} ms</div></div>
+  </div>`;
+}
+function srcHtml(data){
+  if(!data.exploit_src) return "";
+  const esc = s=>s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  return `<details style="margin-top:10px"><summary>생성된 Exploit.sol 보기</summary><pre>${esc(data.exploit_src)}</pre></details>`;
+}
+
+document.querySelectorAll('.runbtn').forEach(b=>b.onclick=()=>run(b.dataset.t));
+document.getElementById('runAll').onclick = async ()=>{
+  const btn=document.getElementById('runAll'); btn.disabled=true;
+  for (const t of TARGETS){ await run(t.name); }
+  btn.disabled=false;
+};
+
+// warm hint + first-call notice
+document.getElementById('apihint').textContent = "첫 실행은 solc 준비로 몇 초 걸릴 수 있어요.";
+</script>
+</body>
+</html>
