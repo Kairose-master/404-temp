@@ -354,6 +354,7 @@ const STEP_DEFS = [
   {key:"verify",        label:"불변식 재검사"},
 ];
 const fmtEth = wei => { try { return (Number(BigInt(wei))/1e18).toLocaleString(undefined,{maximumFractionDigits:4}) + " ETH"; } catch { return wei; } };
+const shortAddr = a => { try { return a.slice(0,6)+"…"+a.slice(-4); } catch { return a; } };
 
 const grid = document.getElementById('grid');
 TARGETS.forEach(t => {
@@ -413,7 +414,10 @@ async function run(name){
       row.classList.add("done");
       // enrich step text
       if (def.key==="scan" && s.strategy) row.querySelector(".d").innerHTML = `${def.label} → <b>${s.strategy}</b>`;
-      if (def.key==="deploy_target") row.querySelector(".d").innerHTML = `${def.label} → <b>${fmtEth(s.balance_wei)}</b> 시드`;
+      if (def.key==="deploy_target") row.querySelector(".d").innerHTML = s.address
+        ? `${def.label} → <b>${shortAddr(s.address)}</b>${s.library_address?` · lib <b>${shortAddr(s.library_address)}</b>`:""}`
+        : `${def.label} → <b>${fmtEth(s.balance_wei)}</b> 시드`;
+      if (def.key==="run_exploit" && s.exploit_address) row.querySelector(".d").innerHTML = `${def.label} → <b>${shortAddr(s.exploit_address)}</b>`;
       if (def.key==="verify"){
         const v=s.checkAll_after;
         row.querySelector(".d").innerHTML = `${def.label} → allHold=<b>${v.allHold}</b>${v.firstViolated?` · <b>${v.firstViolated}</b>`:""}`;
@@ -635,7 +639,11 @@ function renderSteps(stepsEl, data){
       cls += " on done";
       if (def.key==="scan" && s.strategy) txt = `${base} → <b>${s.strategy}</b>`;
       if (def.key==="scan" && !s.strategy) txt = `${base} → <b>패턴 없음</b>`;
-      if (def.key==="deploy_target") txt = `${base} → <b>${fmtEth(s.balance_wei)}</b> 시드`;
+      if (def.key==="deploy_target"){
+        if (s.address) txt = `${base} → <b>${shortAddr(s.address)}</b>${s.library_address?` · lib <b>${shortAddr(s.library_address)}</b>`:""}`;
+        else txt = `${base} → <b>${fmtEth(s.balance_wei)}</b> 시드`;
+      }
+      if (def.key==="run_exploit" && s.exploit_address) txt = `${base} → <b>${shortAddr(s.exploit_address)}</b>`;
       if (def.key==="verify" && s.checkAll_after){ const v=s.checkAll_after; txt = `${base} → allHold=<b>${v.allHold}</b>${v.firstViolated?` · <b>${v.firstViolated}</b>`:""}`; }
     } else {
       // 성립했는데 특정 스텝이 없으면 '수행함(요약 결과에 포함)'으로, 미성립일 때만 skip

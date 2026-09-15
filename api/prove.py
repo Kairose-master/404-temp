@@ -2284,8 +2284,12 @@ def _synth_storage_collision(name, target_src, invariants_src, manifest, scan_st
         f"        IT(t).{f}(0);\n"
         "    }\n    receive() external payable {}\n}\n")
     gen = {"step":"generate","title":"Exploit.sol 생성 (storage-collision)","strategy":"storage-collision","exploit_src":poc}
+    dep_step = {"step":"deploy_target","title":f"타깃 {name} + 라이브러리 {lib} 배포 (in-memory EVM)",
+                "address":taddr,"library_address":laddr}
+    run_step = {"step":"run_exploit","title":f"Exploit(Pwn) 배포 + {f}() 2단계 delegatecall 실행",
+                "exploit_address":paddr,"firstViolated":f"{priv} hijacked (storage collision)"}
     return {"name":name,"proven":True,"firstViolated":f"{priv} hijacked (storage collision)",
-            "strategy":f"storage-collision:{f}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "strategy":f"storage-collision:{f}","steps":[scan_step,gen,dep_step,run_step],"exploit_src":poc,"mode":"effect",
             "note":"delegatecall 스토리지 충돌로 라이브러리 포인터를 덮어쓰고 특권 슬롯을 탈취했습니다.",
             "ms":int((time.time()-t0)*1000)}
 
