@@ -1062,7 +1062,9 @@ def _solc_for(target_src):
 def _coerce_args(args, Web3):
     out = []
     for a in args:
-        if isinstance(a, str):
+        if isinstance(a, (list, tuple)):
+            out.append(_coerce_args(a, Web3))  # 배열 인자: 원소별 재귀 변환
+        elif isinstance(a, str):
             if a.startswith("0x") and len(a) == 42:
                 out.append(Web3.to_checksum_address(a))
             elif a.startswith("0x") and len(a) > 2:
@@ -1248,6 +1250,9 @@ def _run_effect(name, target_src, exploit_src, manifest):
     b0 = w3.eth.get_balance(taddr)
     o0 = tc.functions.owner().call() if _has_getter(abi,"owner") else None
     adm0 = tc.functions.admin().call() if _has_getter(abi,"admin") else None
+    _bal_of = any(e.get("type")=="function" and e.get("name")=="balanceOf"
+                  and [i["type"] for i in e.get("inputs",[])]==["address"]
+                  and e.get("stateMutability") in ("view","pure") for e in abi)
     debt0 = tc.functions.totalDebt().call() if _has_getter(abi,"totalDebt") else None
     col0 = tc.functions.totalCollateral().call() if _has_getter(abi,"totalCollateral") else None
     steps=[{"step":"deploy_target","title":"타깃 배포 (불변식 자동 합성)","address":taddr,
@@ -1255,6 +1260,7 @@ def _run_effect(name, target_src, exploit_src, manifest):
             "checkAll_before":{"allHold":True,"firstViolated":""}}]
     # deploy + run exploit
     exp, eaddr = deploy(arts["Exploit"])
+    tb0 = tc.functions.balanceOf(eaddr).call() if _bal_of else 0
     w3.eth.send_transaction({"from":acct,"to":eaddr,"value":DEFAULT_EXPLOIT_FUNDING_WEI,"gas":1_000_000})
     run_err=None
     try:
@@ -1274,6 +1280,8 @@ def _run_effect(name, target_src, exploit_src, manifest):
     if o0 is not None and o1 is not None and o0 != o1: reasons.append("owner hijacked")
     if adm0 is not None and adm1 is not None and adm0 != adm1: reasons.append("admin hijacked")
     if debt1 is not None and col1 is not None and debt1 > col1: reasons.append("debt > collateral")
+    if _bal_of and tc.functions.balanceOf(eaddr).call() > tb0 + 10**40:
+        reasons.append("token balance inflated (overflow/underflow)")
     exploited = len(reasons) > 0
     steps.append({"step":"verify","title":"효과 관찰 (자동 합성 불변식)",
                   "checkAll_after":{"allHold": not exploited,"firstViolated": ("; ".join(reasons) if exploited else "")},
@@ -1341,8 +1349,11 @@ def _fuzz_lit(t, a):
 def _fuzz_codegen(seq, payable_map):
     sigs={}; calls=[]
     for c in seq:
-        if c.get("raw"):  # receive/fallback 트리거용 원시 송금
-            calls.append(f"        (bool _ok,) = t.call{{value: {c['value']}}}(\"\"); _ok;")
+        if c.get("raw"):  # receive/fallback 트리거
+            if c.get("data"):  # 셀렉터 calldata → fallback→delegatecall
+                calls.append(f"        (bool _ok,) = t.call(hex\"{c['data'][2:] if c['data'].startswith('0x') else c['data']}\"); _ok;  // {c.get('sel_of','')}()")
+            else:
+                calls.append(f"        (bool _ok,) = t.call{{value: {c['value']}}}(\"\"); _ok;")
             continue
         pay=" payable" if payable_map.get(c["name"]) else ""
         sigs[c["name"]]=f"    function {c['name']}({', '.join(c['types'])}) external{pay};"
@@ -1418,6 +1429,11 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=N
     admin0 = tc.functions.admin().call() if _has_getter(abi,"admin") else None
     base_bal=w3.eth.get_balance(taddr)
     has_debt=_has_getter(abi,"totalDebt") and _has_getter(abi,"totalCollateral")
+    # ERC20 잔액 인플레(언더플로 등) 탐지용 balanceOf(address)->uint 게터
+    bal_of = any(e.get("type")=="function" and e.get("name")=="balanceOf"
+                 and [i["type"] for i in e.get("inputs",[])]==["address"]
+                 and e.get("stateMutability") in ("view","pure") for e in abi)
+    tbal0 = tc.functions.balanceOf(acct).call() if bal_of else 0
     def checker():
         if inv is not None:
             r=inv.functions.checkAll(taddr).call()
@@ -1427,6 +1443,8 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=N
         if owner0 is not None and tc.functions.owner().call()!=owner0: reasons.append("owner hijacked")
         if admin0 is not None and tc.functions.admin().call()!=admin0: reasons.append("admin hijacked")
         if has_debt and tc.functions.totalDebt().call() > tc.functions.totalCollateral().call(): reasons.append("debt > collateral")
+        if bal_of and tc.functions.balanceOf(acct).call() > tbal0 + 10**40:
+            reasons.append("token balance inflated (overflow/underflow)")
         return (len(reasons)>0, "; ".join(reasons))
     tester=w3.provider.ethereum_tester; snap=tester.take_snapshot()
     ctx={"seed":seed_wei,"attacker":acct,"target":taddr,"owner0":owner0}
@@ -1438,6 +1456,16 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=N
     # 원시 ETH 전송(receive/fallback 로직 트리거) 도 시퀀스 요소로 포함한다 —
     # Ethernaut Fallback 류(직접 송금으로 owner 탈취)를 잡기 위함.
     raw_calls=[{"name":"__raw_send__","types":[],"args":[],"value":v,"raw":True} for v in (1, 10**15 - 1, 10**18)]
+    # 프록시 fallback→delegatecall 대응: 소스의 모든 무인자 함수 셀렉터를 raw calldata
+    # 로 타깃에 보내 fallback 을 통해 delegatecall 이 실행되게 한다(Ethernaut Delegation).
+    if re.search(r"\bfallback\s*\(|delegatecall", target_src):
+        seen=set()
+        for f in _functions(_strip(target_src)):
+            if not f["args"] and f["name"] and f["name"] not in seen:
+                seen.add(f["name"])
+                sel = Web3.keccak(text=f"{f['name']}()")[:4].hex()
+                raw_calls.append({"name":"__raw_data__","types":[],"args":[],"value":0,
+                                  "raw":True,"data":sel,"sel_of":f["name"]})
     all_calls = all_calls + raw_calls
     # ── SliSE 류 슬라이싱 근사: 값-이동/권한 함수(sink)가 읽는 상태를 쓰는 함수
     # (setup)를 먼저 시도하도록 all_calls 를 우선순위화한다(데이터 의존 기반). ──
@@ -1455,7 +1483,9 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=N
     all_calls.sort(key=_prio, reverse=True)
     def do_call(c):
         if c.get("raw"):
-            w3.eth.send_transaction({"from":acct,"to":taddr,"value":c["value"],"gas":300_000}); return
+            tx={"from":acct,"to":taddr,"value":c["value"],"gas":300_000}
+            if c.get("data"): tx["data"]=c["data"]
+            w3.eth.send_transaction(tx); return
         args=[_fuzz_resolve(a,acct,taddr,Web3) for a in c["args"]]
         getattr(tc.functions,c["name"])(*args).transact({"from":acct,"value":c["value"],"gas":8_000_000})
     b=0
@@ -1767,10 +1797,12 @@ def _storage_attempt(name, target_src, invariants_src, manifest, scan_step, t0):
         return None
     abi = arts[name]["abi"]
     # 단일 인자(bytes32/uint256/address) 게이트 함수가 없으면 스킵
+    def _gate_type(t):
+        return t in ("uint256", "address") or bool(re.fullmatch(r"bytes\d+", t))
     gate_fns = [e for e in abi if e.get("type")=="function"
                 and e.get("stateMutability") not in ("view","pure")
                 and len(e.get("inputs",[]))==1
-                and e["inputs"][0]["type"] in ("bytes32","uint256","address")]
+                and _gate_type(e["inputs"][0]["type"])]
     if not gate_fns:
         return None
     bool_getters = [e["name"] for e in abi if e.get("type")=="function" and not e.get("inputs")
@@ -1838,13 +1870,14 @@ def _storage_attempt(name, target_src, invariants_src, manifest, scan_step, t0):
         return None
     for fn in gate_fns:
         typ = fn["inputs"][0]["type"]; nm = fn["name"]
+        nbytes = int(typ[5:]) if typ.startswith("bytes") else 0
         cand = []
         for s in slots:
-            if typ == "bytes32": cand.append(s)
+            if typ.startswith("bytes"): cand.append(bytes(s[:nbytes]))   # 슬롯의 앞 N바이트(예: bytes16)
             elif typ == "uint256": cand.append(int.from_bytes(s, "big"))
             elif typ == "address": cand.append(Web3.to_checksum_address("0x"+s.hex()[-40:]))
         for a in cargs:  # 우리가 배포에 쓴 값(자체 배포이므로 알고 있음)
-            if typ == "bytes32" and isinstance(a, (bytes, bytearray)) and len(a) == 32: cand.append(bytes(a))
+            if typ.startswith("bytes") and isinstance(a, (bytes, bytearray)): cand.append(bytes(a[:nbytes]))
             if typ == "uint256" and isinstance(a, int): cand.append(a)
             if typ == "address" and isinstance(a, str) and a.startswith("0x"): cand.append(a)
         for v in cand:
@@ -1855,8 +1888,8 @@ def _storage_attempt(name, target_src, invariants_src, manifest, scan_step, t0):
                 continue
             why = tripped()
             if why:
-                if typ == "bytes32":
-                    lit = "bytes32(0x" + (v.hex() if isinstance(v,(bytes,bytearray)) else "%064x" % v) + ")"
+                if typ.startswith("bytes"):
+                    lit = f"{typ}(0x" + (v.hex() if isinstance(v,(bytes,bytearray)) else "%x" % v) + ")"
                 elif typ == "address":
                     lit = f"address({v})"
                 else:

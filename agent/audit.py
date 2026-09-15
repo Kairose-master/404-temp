@@ -61,9 +61,11 @@ def concrete_contracts(src, eng):
             continue
         body = bodies.get(name, "")
         fns = eng._functions(body)
-        if any(f.get("external") and "view" not in f["head"] and "pure" not in f["head"] for f in fns):
-            if name not in out:
-                out.append(name)
+        has_mut = any(f.get("external") and "view" not in f["head"] and "pure" not in f["head"] for f in fns)
+        # receive/fallback 만 있거나 위험 프리미티브를 쓰는 컨트랙트도 분석 대상
+        interesting = bool(re.search(r"\breceive\s*\(|\bfallback\s*\(|delegatecall|selfdestruct|\.call\s*\{\s*value", body))
+        if (has_mut or interesting) and name not in out:
+            out.append(name)
     return out
 
 
@@ -74,12 +76,28 @@ def synth_ctor_args(eng, src, contract):
     m = re.search(r"constructor\s*\(([^)]*)\)", body)
     if not m or not m.group(1).strip():
         return []
+    def default_for(t):
+        if t == "address": return "0x000000000000000000000000000000000000dEaD"
+        if t.startswith("uint") or t.startswith("int"): return 10**18
+        if t == "bool": return False
+        if t == "bytes32": return "0x" + "11" * 32
+        if re.fullmatch(r"bytes\d+", t): return "0x" + "11" * int(t[5:])
+        if t == "string": return "trust404"
+        if t == "bytes": return "0x"
+        return None
     args = []
     for p in m.group(1).split(","):
         toks = p.split()
         if not toks:
             continue
         t = toks[0]
+        arr = re.fullmatch(r"([a-z0-9]+)\[(\d+)\]", t)
+        if arr:
+            elem = default_for(arr.group(1))
+            if elem is None:
+                return None
+            args.append([elem] * int(arr.group(2)))
+            continue
         if t == "address":
             args.append("0x000000000000000000000000000000000000dEaD")  # 유효한 20-byte 테스트 주소
         elif t.startswith("uint") or t.startswith("int"):
@@ -168,6 +186,10 @@ CLASS = {
         "rule": "TR404-ORACLE", "cwe": "CWE-345", "title": "Multi-contract AMM price manipulation",
         "fix": "TWAP·외부 오라클·거래 슬리피지/편차 상한. 얇은 풀의 즉시 준비금 신뢰 금지.",
         "hot": r"swap|reserve|quote|spotPrice"},
+    "storage": {
+        "rule": "SWC-136", "cwe": "CWE-767", "title": "Private data read from storage",
+        "fix": "온체인 스토리지는 공개다. 비밀/키/암호를 평문으로 저장하지 말 것(오프체인 커밋/해시).",
+        "hot": r"private"},
     "generic": {
         "rule": "TR404-EXPLOIT", "cwe": "CWE-284", "title": "Exploitable asset loss / privilege change",
         "fix": "관찰된 자산 손실·권한 변경 경로를 재현 PoC로 확인 후 근본 원인(접근제어/CEI/검증)을 수정.",
@@ -218,12 +240,20 @@ FIX_DIFF = {
     "TR404-EXPLOIT": (
         "// 관찰된 자산 손실/권한 변경 경로에 접근 제어·CEI·입력 검증을 적용하고\n"
         "// 재현 PoC 로 재검증하십시오."),
+    "SWC-136": (
+        "-    bytes32 private password;   // 온체인 스토리지는 공개 — 평문 노출\n"
+        "+    bytes32 private passwordHash;              // keccak256(secret) 만 저장\n"
+        "+    function unlock(bytes32 s) external {\n"
+        "+        require(keccak256(abi.encode(s)) == passwordHash);\n"
+        "+    }"),
 }
 
 
 def classify(strategy, family_hint=None):
     """전략/계열 라벨을 표준 분류로 매핑한다."""
     s = strategy or ""
+    if s.startswith("storage"):
+        return CLASS["storage"]
     if s.startswith("amm-manip"):
         return CLASS["amm"]
     if s.startswith("flashloan"):
@@ -527,6 +557,8 @@ def main(argv=None):
             pos = {k: v for k, v in scores.items() if v > 0}
             fam_hint = max(pos, key=pos.get) if pos else None
             cls = classify(res.get("strategy"), fam_hint)
+            if cls is CLASS["generic"] and "inflated" in (res.get("firstViolated") or ""):
+                cls = CLASS["integer_underflow"]   # 토큰 잔액 오버·언더플로 (기타 계열 아닐 때만)
             decl_ln, hot_ln = find_location(eng, src, c, cls)
             findings.append({"contract": c, "file": str(fp), "severity": sev,
                              "evidence": evidence, "res": res, "poc_file": poc_file,
