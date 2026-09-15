@@ -1099,10 +1099,14 @@ def _verify_attempt(name, target_src, invariants_src, exploit_src, manifest):
         C = w3.eth.contract(abi=art["abi"], bytecode=art["bin"])
         tx = C.constructor(*(args or [])).transact({"from":acct,"value":value,"gas":12_000_000})
         r = w3.eth.wait_for_transaction_receipt(tx)
+        if r.contractAddress is None:
+            raise RuntimeError("constructor reverted (non-payable ctor sent value, or out of gas)")
         return w3.eth.contract(address=r.contractAddress, abi=art["abi"]), r.contractAddress
     dep = manifest.get("deploy",{})
     cargs = _coerce_args(dep.get("constructor_args",[]), Web3)
     seed_wei = int(str(dep.get("value_wei", str(DEFAULT_SEED_WEI))) or "0")
+    if not _ctor_payable(arts[name]["abi"]):
+        seed_wei = 0  # 비-payable 생성자에 값 전송 금지(리버트 → contractAddress None)
     try:
         target, taddr = deploy(arts[name], cargs, value=seed_wei)
     except Exception:
@@ -1144,6 +1148,14 @@ def _has_getter(abi, name):
             return True
     return False
 
+def _ctor_payable(abi):
+    """생성자가 payable 인지(값을 함께 보내도 되는지). 기본 생성자(ABI에 constructor
+    엔트리 없음)는 payable 이 아니다."""
+    for e in abi:
+        if e.get("type") == "constructor":
+            return e.get("stateMutability") == "payable"
+    return False
+
 def _run_effect(name, target_src, exploit_src, manifest):
     """No invariants supplied: actually deploy + run the exploit and OBSERVE effects
     (ETH drained, owner() hijacked, debt>collateral). Synthesizes the check in Python."""
@@ -1166,10 +1178,14 @@ def _run_effect(name, target_src, exploit_src, manifest):
         C = w3.eth.contract(abi=art["abi"], bytecode=art["bin"])
         tx = C.constructor(*(args or [])).transact({"from":acct,"value":value,"gas":12_000_000})
         r = w3.eth.wait_for_transaction_receipt(tx)
+        if r.contractAddress is None:
+            raise RuntimeError("constructor reverted (non-payable ctor sent value, or out of gas)")
         return w3.eth.contract(address=r.contractAddress, abi=art["abi"]), r.contractAddress
     dep = manifest.get("deploy",{})
     cargs = _coerce_args(dep.get("constructor_args",[]), Web3)
     seed_wei = int(str(dep.get("value_wei", str(DEFAULT_SEED_WEI))) or "0")
+    if not _ctor_payable(arts[name]["abi"]):
+        seed_wei = 0  # 비-payable 생성자에 값 전송 금지(리버트 → contractAddress None)
     try:
         target, taddr = deploy(arts[name], cargs, value=seed_wei)
     except Exception:
@@ -1248,7 +1264,8 @@ def _fuzz_calls(fn, ctx, cap=12):
     pools=[_fuzz_pool(t,ctx) for t in fn["types"]]
     if any(len(p)==0 for p in pools): return []
     combos=[()] if not fn["types"] else list(_it.product(*pools))[:cap]
-    vals=[0]+([10**18] if fn["payable"] else [])
+    # payable 은 0 / 1 wei(임계 미만 게이트 통과용) / 1 ether 를 시도한다.
+    vals=[0]+([1, 10**18] if fn["payable"] else [])
     return [{"name":fn["name"],"types":fn["types"],"args":list(c),"value":v} for c in combos for v in vals]
 
 def _fuzz_resolve(a, acct, taddr, Web3):
@@ -1270,6 +1287,9 @@ def _fuzz_lit(t, a):
 def _fuzz_codegen(seq, payable_map):
     sigs={}; calls=[]
     for c in seq:
+        if c.get("raw"):  # receive/fallback 트리거용 원시 송금
+            calls.append(f"        (bool _ok,) = t.call{{value: {c['value']}}}(\"\"); _ok;")
+            continue
         pay=" payable" if payable_map.get(c["name"]) else ""
         sigs[c["name"]]=f"    function {c['name']}({', '.join(c['types'])}) external{pay};"
         args=", ".join(_fuzz_lit(t,a) for t,a in zip(c["types"], c["args"]))
@@ -1298,16 +1318,24 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=5
         for cn,c in cs.items(): arts[cn]={"abi":c["abi"],"bin":c["evm"]["bytecode"]["object"]}
     if name not in arts: return None
     w3,acct=_mk_evm()
-    def deploy(art,args=None,value=0):
+    # 타깃은 배포자(owner) 와 다른 계정에서 배포한다 — 공격자(acct)가 owner 로
+    # 바뀌는 탈취(예: Ethernaut Fallback)를 owner() 변화로 탐지할 수 있게.
+    accts = list(w3.eth.accounts)
+    deployer = accts[1] if len(accts) > 1 else acct
+    def deploy(art,args=None,value=0,frm=None):
         C=w3.eth.contract(abi=art["abi"],bytecode=art["bin"])
-        tx=C.constructor(*(args or [])).transact({"from":acct,"value":value,"gas":12_000_000})
+        tx=C.constructor(*(args or [])).transact({"from":frm or acct,"value":value,"gas":12_000_000})
         r=w3.eth.wait_for_transaction_receipt(tx)
+        if r.contractAddress is None:
+            raise RuntimeError("constructor reverted")
         return w3.eth.contract(address=r.contractAddress,abi=art["abi"]),r.contractAddress
     dep=manifest.get("deploy",{}); cargs=_coerce_args(dep.get("constructor_args",[]),Web3)
     seed_wei=int(str(dep.get("value_wei",str(DEFAULT_SEED_WEI))) or "0")
-    try: tc,taddr=deploy(arts[name],cargs,value=seed_wei)
+    if not _ctor_payable(arts[name]["abi"]):
+        seed_wei=0
+    try: tc,taddr=deploy(arts[name],cargs,value=seed_wei,frm=deployer)
     except Exception:
-        seed_wei=0; tc,taddr=deploy(arts[name],cargs,value=0)
+        seed_wei=0; tc,taddr=deploy(arts[name],cargs,value=0,frm=deployer)
     abi=arts[name]["abi"]
     inv=None
     if do_verify and invariants_src:
@@ -1334,7 +1362,13 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=5
     movers=_fuzz_value_movers(target_src)
     calls_by_fn={f["name"]:_fuzz_calls(f,ctx) for f in fns}
     all_calls=[c for f in fns for c in calls_by_fn[f["name"]]]
+    # 원시 ETH 전송(receive/fallback 로직 트리거) 도 시퀀스 요소로 포함한다 —
+    # Ethernaut Fallback 류(직접 송금으로 owner 탈취)를 잡기 위함.
+    raw_calls=[{"name":"__raw_send__","types":[],"args":[],"value":v,"raw":True} for v in (1, 10**15 - 1, 10**18)]
+    all_calls = all_calls + raw_calls
     def do_call(c):
+        if c.get("raw"):
+            w3.eth.send_transaction({"from":acct,"to":taddr,"value":c["value"],"gas":300_000}); return
         args=[_fuzz_resolve(a,acct,taddr,Web3) for a in c["args"]]
         getattr(tc.functions,c["name"])(*args).transact({"from":acct,"value":c["value"],"gas":8_000_000})
     b=0
@@ -1346,8 +1380,8 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=5
         except Exception: pass
         trip,reason=checker()
         if trip: return [c], payable_map, reason
-    # phase 2: setup(any) -> drain(value-mover)
-    seconds=[c for c in all_calls if c["name"] in movers] or all_calls
+    # phase 2: setup(any) -> drain/hijack (value-mover 또는 raw send)
+    seconds=[c for c in all_calls if c.get("raw") or c["name"] in movers] or all_calls
     for c1 in all_calls:
         if b>=budget: break
         for c2 in seconds:
