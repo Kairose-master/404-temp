@@ -1310,6 +1310,8 @@ def _flatten_sources(main_src, sources):
     loose_txt = "\n".join(x for x in loose if x.strip())
     return header + (loose_txt + "\n\n" if loose_txt.strip() else "") + "\n\n".join(d["text"] for d in out_order) + "\n"
 
+_DEPLOY_LEDGER = []   # 현재 EVM 세션에서 배포된 컨트랙트 주소 수집(스텝에 표시)
+
 def _mk_evm():
     from web3 import Web3
     from eth_tester import EthereumTester, PyEVMBackend
@@ -1317,6 +1319,29 @@ def _mk_evm():
         "test test test test test test test test test test test junk",
         genesis_state_overrides={"balance":10**24})
     w3 = Web3(Web3.EthereumTesterProvider(EthereumTester(backend=backend)))
+    # 배포 주소 원장 초기화 + receipt 조회를 감싸서 contractAddress 를 모두 기록한다.
+    # 모든 synth 가 이 헬퍼로 EVM 을 만들고 wait_for_transaction_receipt/get_transaction_receipt
+    # 로 배포 receipt 를 받으므로, 여기 한 곳만 감싸면 배포 주소를 빠짐없이 모을 수 있다.
+    global _DEPLOY_LEDGER
+    _DEPLOY_LEDGER = []
+    def _wrap(orig):
+        def _tracked(*a, **k):
+            r = orig(*a, **k)
+            try:
+                ca = None
+                if hasattr(r, "contractAddress"): ca = r.contractAddress
+                elif isinstance(r, dict): ca = r.get("contractAddress")
+                if ca and ca not in _DEPLOY_LEDGER:
+                    _DEPLOY_LEDGER.append(ca)
+            except Exception:
+                pass
+            return r
+        return _tracked
+    for meth in ("wait_for_transaction_receipt", "get_transaction_receipt"):
+        try:
+            setattr(w3.eth, meth, _wrap(getattr(w3.eth, meth)))
+        except Exception:
+            pass
     return w3, w3.eth.accounts[0]
 
 def _verify_attempt(name, target_src, invariants_src, exploit_src, manifest):
@@ -4792,20 +4817,36 @@ def _normalize_synth_steps(res):
     have = {s.get("step") for s in steps if isinstance(s, dict)}
     strat = res.get("strategy")
     fv = res.get("firstViolated") or ""
+    deployed = list(_DEPLOY_LEDGER)   # 이번 실행에서 실제 배포된 컨트랙트 주소들
     # 1) scan 스텝에 성립 전략 주입 → '패턴 없음' 대신 선택된 전략 표시
     for s in steps:
         if isinstance(s, dict) and s.get("step") == "scan" and not s.get("strategy"):
             s["strategy"] = strat
-    # 2) 타깃 배포 스텝(실제로 in-memory EVM 에 배포함)
+    # 이미 deploy_target 스텝이 있는데 주소가 없으면 원장 주소를 채운다
+    for s in steps:
+        if isinstance(s, dict) and s.get("step") == "deploy_target" and not s.get("address") and not s.get("addresses") and deployed:
+            s["addresses"] = deployed
+    # 2) 타깃 배포 스텝(실제로 in-memory EVM 에 배포함) — 배포된 주소를 모두 표시
     if "deploy_target" not in have:
-        steps.append({"step":"deploy_target","title":"타깃 배포 + 건강 검사 (in-memory EVM)",
-                      "balance_wei": str(res.get("balance_before_wei") or "0")})
+        dt = {"step":"deploy_target"}
+        if deployed:
+            dt["title"] = f"컨트랙트 {len(deployed)}개 배포 (in-memory EVM)"
+            dt["addresses"] = deployed
+            dt["address"] = deployed[0]
+        else:
+            dt["title"] = "타깃 배포 + 건강 검사 (in-memory EVM)"
+            dt["balance_wei"] = str(res.get("balance_before_wei") or "0")
+        steps.append(dt)
     # 3) Exploit 배포 + 실행 스텝(합성한 공격 컨트랙트를 실제로 실행함)
     if "run_exploit" not in have:
-        steps.append({"step":"run_exploit","title":"Exploit 배포 + 실행",
-                      "firstViolated": fv,
-                      "balance_before_wei": res.get("balance_before_wei"),
-                      "balance_after_wei": res.get("balance_after_wei")})
+        rx = {"step":"run_exploit","title":"Exploit 배포 + 실행",
+              "firstViolated": fv,
+              "balance_before_wei": res.get("balance_before_wei"),
+              "balance_after_wei": res.get("balance_after_wei")}
+        # 배포가 2개 이상이면 마지막을 공격 컨트랙트로 표기(대개 타깃 다음 공격 컨트랙트 배포)
+        if len(deployed) >= 2:
+            rx["exploit_address"] = deployed[-1]
+        steps.append(rx)
     # 4) 효과 관찰 스텝(불변식 미제공 effect 모드는 자동 합성 술어 위반을 관찰) → skip 방지
     if "verify" not in have:
         steps.append({"step":"verify","title":"효과 관찰 (자동 합성 술어)",

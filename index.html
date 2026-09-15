@@ -414,8 +414,9 @@ async function run(name){
       row.classList.add("done");
       // enrich step text
       if (def.key==="scan" && s.strategy) row.querySelector(".d").innerHTML = `${def.label} → <b>${s.strategy}</b>`;
-      if (def.key==="deploy_target") row.querySelector(".d").innerHTML = s.address
-        ? `${def.label} → <b>${shortAddr(s.address)}</b>${s.library_address?` · lib <b>${shortAddr(s.library_address)}</b>`:""}`
+      if (def.key==="deploy_target") row.querySelector(".d").innerHTML =
+        (s.addresses && s.addresses.length) ? `${def.label} → ${s.addresses.map(a=>`<b>${shortAddr(a)}</b>`).join(', ')}`
+        : s.address ? `${def.label} → <b>${shortAddr(s.address)}</b>${s.library_address?` · lib <b>${shortAddr(s.library_address)}</b>`:""}`
         : `${def.label} → <b>${fmtEth(s.balance_wei)}</b> 시드`;
       if (def.key==="run_exploit" && s.exploit_address) row.querySelector(".d").innerHTML = `${def.label} → <b>${shortAddr(s.exploit_address)}</b>`;
       if (def.key==="verify"){
@@ -489,6 +490,9 @@ function srcHtml(data){
       let l = "["+s.step+"]";
       if(s.strategy) l += " strategy="+s.strategy;
       if(s.title) l += " · "+s.title;
+      if(s.addresses && s.addresses.length) l += " · deployed="+s.addresses.join(",");
+      else if(s.address) l += " · addr="+s.address+(s.library_address?(" lib="+s.library_address):"");
+      if(s.exploit_address) l += " · exploit="+s.exploit_address;
       if(s.balance_wei) l += " · balance="+fmtEth(s.balance_wei);
       if(s.checkAll_after) l += " · allHold="+s.checkAll_after.allHold+(s.checkAll_after.firstViolated?(" violated="+s.checkAll_after.firstViolated):"");
       if(s.drained_wei) l += " · drained="+fmtEth(s.drained_wei);
@@ -640,7 +644,8 @@ function renderSteps(stepsEl, data){
       if (def.key==="scan" && s.strategy) txt = `${base} → <b>${s.strategy}</b>`;
       if (def.key==="scan" && !s.strategy) txt = `${base} → <b>패턴 없음</b>`;
       if (def.key==="deploy_target"){
-        if (s.address) txt = `${base} → <b>${shortAddr(s.address)}</b>${s.library_address?` · lib <b>${shortAddr(s.library_address)}</b>`:""}`;
+        if (s.addresses && s.addresses.length) txt = `${base} → ${s.addresses.map(a=>`<b>${shortAddr(a)}</b>`).join(', ')}`;
+        else if (s.address) txt = `${base} → <b>${shortAddr(s.address)}</b>${s.library_address?` · lib <b>${shortAddr(s.library_address)}</b>`:""}`;
         else txt = `${base} → <b>${fmtEth(s.balance_wei)}</b> 시드`;
       }
       if (def.key==="run_exploit" && s.exploit_address) txt = `${base} → <b>${shortAddr(s.exploit_address)}</b>`;
