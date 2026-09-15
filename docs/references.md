@@ -8,6 +8,8 @@ TRUST404 Track 04(Autonomous Exploit Prover)를 만들며 참고한 자료 모�
 - **생성-검증 루프**: 정적 스캐너(7계열 템플릿) + 범용 퍼저(호출 시퀀스 · 재진입 합성 ·
   다중 컨트랙트 AMM 조작 · 플래시론 차용자 · 스토리지 보조)로 후보를 만들고, 내장 EVM에서
   불변식/효과가 실제로 깨지는지 검증한 것만 보고한다(오탐 0 지향).
+- **profit ≠ proven**: `trust404.profit` 이 THEFT/GRIEF/INTENDED_PATH 를 가른다. 의도된
+  차익은 성공이 아니다 — [`docs/FRONTIER.md`](FRONTIER.md).
 - **멀티버전 백엔드**: 타깃 pragma에 맞춰 solc 0.6/0.7/0.8을 골라 컴파일(pre-0.8 정수
   래핑 등 실제 의미 재현).
 - **분류·연동**: 발견마다 SWC/CWE + 수정 diff + 소스 위치, SARIF 2.1.0 출력(GitHub code

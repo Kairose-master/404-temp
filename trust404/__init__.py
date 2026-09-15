@@ -4,6 +4,10 @@ Layers:
   scan        — 7-family static scores (canonical)
   features    — capability IR extracted from source (generalized level-solvers)
   registry    — feature-gated synth providers
+  hkg         — protocol → cause → primitive graph (EvoPoC lift)
+  profit      — extractable-value oracle (THEFT/GRIEF/INTENDED_PATH/NONE)
+  world       — cross-contract plan folded into run(address)
+  benches     — VERITE/SCONE/EVMbench adapters + frontier fixtures
   targets     — load track fixtures from disk
   critique    — self-validation loop feedback for the next candidate
 """

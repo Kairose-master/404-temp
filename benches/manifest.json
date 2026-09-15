@@ -1,0 +1,62 @@
+{
+  "schema": "trust404.benches/0.1",
+  "note": "Upstream trees are attached via env, never vendored. Local fixtures always run.",
+  "datasets": [
+    {
+      "id": "track04",
+      "title": "TRUST404 Track 04 (12 paired targets)",
+      "paper": "this repo targets/",
+      "metric": "invariant_break",
+      "n": 12,
+      "attach_env": "",
+      "path": "targets",
+      "note": "regression gate: 7 PROVEN / 5 NOT PROVEN. Wargame-shaped, not a public exploit bench."
+    },
+    {
+      "id": "frontier-local",
+      "title": "Frontier class fixtures (profit / grief / intended_path / cross-contract)",
+      "paper": "docs/FRONTIER.md",
+      "metric": "classification",
+      "n": 4,
+      "attach_env": "",
+      "path": "benches/fixtures",
+      "note": "Pedagogical. intended_arb is the case profit-only agents get wrong."
+    },
+    {
+      "id": "verite",
+      "title": "VERITE profitable-exploit incidents",
+      "paper": "https://arxiv.org/abs/2501.08834",
+      "metric": "profit_usd",
+      "n": 27,
+      "attach_env": "TRUST404_VERITE_DIR",
+      "note": "Fork-state. Attach the Verite artifact tree; we will not pretend to score it without the dumps."
+    },
+    {
+      "id": "scone",
+      "title": "SCONE-bench (Anthropic / DefiHackLabs, post-cutoff split)",
+      "paper": "https://www.anthropic.com/research/smart-contracts",
+      "metric": "profit_usd_post_cutoff",
+      "n": 405,
+      "attach_env": "TRUST404_SCONE_DIR",
+      "note": "The honest generalization split. Requires historical FX for USD. Do not train on pre-cutoff and report post-cutoff."
+    },
+    {
+      "id": "evmbench",
+      "title": "EVMbench detect / patch / exploit (OpenAI + Paradigm + OtterSec)",
+      "paper": "https://arxiv.org/abs/2603.04915",
+      "metric": "exploit_and_patch_rate",
+      "n": 117,
+      "attach_env": "TRUST404_EVMBENCH_DIR",
+      "note": "Patch rate (42%) is the dual we do not yet score. Exploit-only tables hide that."
+    },
+    {
+      "id": "poco-patch",
+      "title": "PoCo Proof-of-Patch 23",
+      "paper": "https://arxiv.org/abs/2511.02780",
+      "metric": "logical_poc",
+      "n": 23,
+      "attach_env": "TRUST404_POCO_DIR",
+      "note": "https://github.com/ASSERT-KTH/Proof-of-Patch — well-formed 50/50, logical 32/50."
+    }
+  ]
+}

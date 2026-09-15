@@ -1,4 +1,31 @@
-# TRUST404 엔진 아키텍처 강화안 (v0.2)
+# TRUST404 엔진 아키텍처 강화안 (v0.3)
+
+이 문서는 `docs/references.md` · `FINDINGS.md` 에 모아 둔 도구/논문을 **직접 읽고**
+현재 코드에 대조해 내린 강화안이다. v0.2 는 레벨 솔버를 capability 로 일반화했다.
+v0.3 은 그 위에 **1 profit · 2 HKG · 3 공개벤치 · 4 월드 모델** 을 코드로 넣는다.
+
+아직 논문이 못 닫은 구멍은 [`docs/FRONTIER.md`](docs/FRONTIER.md) 가 주제다.
+`intended_arb` 픽스처가 그 반례다.
+
+> 원칙: 하네스 계약(`IExploit.run(address)` / `IInvariants.checkAll`)은 유지한다.
+> 레벨 솔버는 버리지 않고 **계열(capability)로 일반화해 엔진에 남긴다.**
+> PROVEN 은 불변식 위반이다. 수익은 별도 분류다. 둘을 섞어 성공이라고 부르지 않는다.
+
+---
+
+## 0. v0.3 에서 착수한 코드
+
+| 축 | 파일 | 하는 일 |
+|---|---|---|
+| 1 profit oracle | `trust404/profit.py` · `agent/verify.py` | 펀딩 이후 vs run 이후 Δ. THEFT/GRIEF/INTENDED_PATH/NONE |
+| 2 HKG | `trust404/hkg.py` | 프로토콜 → 원인 → 프리미티브. synth 순서 |
+| 3 공개 벤치 | `trust404/benches.py` `benches/` | VERITE/SCONE/EVMbench 어댑터. 없으면 NOT_ATTACHED |
+| 4 월드 모델 | `trust404/world.py` | N 컨트랙트 시퀀스를 `run(address)` 로 접음 |
+| 프론티어 | `docs/FRONTIER.md` `benches/fixtures/` | intended_arb / grief_lock / profit_drain / cross_router |
+
+`python -m trust404.benches` 는 로컬 4개만 채점하고 업스트림을 점수라고 거짓말하지 않는다.
+
+---
 
 이 문서는 `docs/references.md` · `FINDINGS.md` 에 모아 둔 도구/논문을 **직접 읽고**
 현재 코드(`api/prove.py` 5555줄, 레벨 솔버 26개)에 대조해 내린 강화안이다.
@@ -221,6 +248,9 @@ Backends      py-evm (기본) | anvil+forge (교차검증)
 트랙 12/12 와 Ethernaut 32 증명은 **회귀 게이트**로 유지한다. 일반화 패치가
 정탐을 떨어뜨리면 피처 태그를 느슨하게 (OR) 되돌린다 — `should_run` 의 기본이
 이미 OR 이다.
+
+프론티어 질문(의도 경로, 교차 프로토콜, 정지 규칙, 패치 쌍대)은 이 표의 다음
+칸이 아니라 [`docs/FRONTIER.md`](docs/FRONTIER.md) 다. 벤치 점수로 덮지 말 것.
 
 ---
 
