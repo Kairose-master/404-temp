@@ -18,6 +18,8 @@ RUN python -c "import solcx; solcx.install_solc('0.8.24')"
 COPY agent /work/agent
 COPY harness /work/harness
 COPY api /work/api
+COPY trust404 /work/trust404
+COPY targets /work/targets
 
 ENV TRUST404_HARNESS_DIR=/work/harness
 

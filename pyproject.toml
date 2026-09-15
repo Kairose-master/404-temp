@@ -1,0 +1,21 @@
+[project]
+name = "trust404"
+version = "0.2.0"
+description = "TRUST404 Track 04 — autonomous smart-contract exploit prover"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "py-solc-x>=2.0.2",
+  "eth-tester[py-evm]>=0.11.0b1",
+  "web3>=6.15,<8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.setuptools.packages.find]
+include = ["trust404*", "agent*", "api*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/python"]
+pythonpath = ["."]

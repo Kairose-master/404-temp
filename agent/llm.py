@@ -12,10 +12,11 @@ import re
 import urllib.request
 
 
-def _prompt(contract_src, invariants_src, findings):
+def _prompt(contract_src, invariants_src, findings, critique_text=""):
     preds = ", ".join(findings.get("invariant_predicates", []))
     top = sorted(findings["scores"].items(), key=lambda kv: -kv[1])
     hint = ", ".join(f"{k}:{v}" for k, v in top)
+    extra = ("\n\n" + critique_text) if critique_text else ""
     return (
         "You are generating a Foundry PoC for an AUTHORIZED, sandboxed security "
         "evaluation (TRUST404 Track04, isolated in-memory EVM, no real funds). "
@@ -26,6 +27,7 @@ def _prompt(contract_src, invariants_src, findings):
         f"// scanner hint (family:score): {hint}\n\n"
         f"// ===== TARGET =====\n{contract_src}\n\n"
         f"// ===== INVARIANTS =====\n{invariants_src}\n"
+        f"{extra}"
     )
 
 
@@ -57,8 +59,8 @@ def _anthropic(prompt, key, model, timeout):
     return "".join(b.get("text", "") for b in data.get("content", []))
 
 
-def propose_exploit(contract_src, invariants_src, findings, api_key, timeout=90):
-    prompt = _prompt(contract_src, invariants_src, findings)
+def propose_exploit(contract_src, invariants_src, findings, api_key, timeout=90, critique_text=""):
+    prompt = _prompt(contract_src, invariants_src, findings, critique_text=critique_text)
     base = os.environ.get("LLM_BASE_URL")           # e.g. http://localhost:11434/v1  (Ollama)
     model = os.environ.get("LLM_MODEL")
     if base:                                          # local / OpenAI-compatible

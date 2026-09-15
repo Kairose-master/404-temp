@@ -36,6 +36,19 @@ from scanner import scan_target
 from strategies import STRATEGY_ORDER, build_exploit, seeded_order
 from verify import verify_candidate, VerifyUnavailable
 
+try:
+    from pathlib import Path as _P
+    import sys as _s
+    _r = _P(__file__).resolve().parent.parent
+    if str(_r) not in _s.path:
+        _s.path.insert(0, str(_r))
+    from trust404.critique import Critique, format_for_llm
+    from trust404.features import extract_features
+except Exception:  # package optional at import time
+    Critique = None
+    format_for_llm = None
+    extract_features = None
+
 
 def _load_engine():
     """api/prove.py 엔진을 경로로 로드(합성·퍼저 후보 생성기 iter_engine_candidates 용).
@@ -127,6 +140,13 @@ def main(argv=None):
     scored = seeded_order(scored, findings["scores"], args.seed)
     note(f"# scan scores: " + ", ".join(f"{k}={findings['scores'].get(k,0)}" for k in STRATEGY_ORDER))
     note(f"# strategy order: {scored}")
+    feats = set()
+    if extract_features is not None:
+        try:
+            feats = extract_features(contract_src, target_name)
+            note("# features: " + ",".join(sorted(feats)[:40]))
+        except Exception as e:
+            note(f"# feature extract failed: {str(e)[:80]}")
 
     # ── 후보 생성기(단계별·지연) 구성 ─────────────────────────────────────────
     # 자기검증 루프의 '탐색·생성' 축. 각 단계는 앞 단계가 검증에 실패했을 때에만
@@ -174,6 +194,8 @@ def main(argv=None):
     verifier_ok = True
     stages_seen = []
     held_invariants = {}  # 실패한 시도에서 '유지된' 불변식 관찰(피드백)
+    critiques = []
+    critique_llm_done = False
     for stage, label, source in candidate_stream():
         if attempts >= args.max_attempts:
             note(f"# budget exhausted after {attempts} attempts (max={args.max_attempts})")
@@ -221,6 +243,54 @@ def main(argv=None):
         held_invariants[label] = detail
         note(f"attempt {attempts} [{stage}/{label}]: NOT PROVEN — invariants held ({detail}); "
              f"→ escalate search/generation")
+        if Critique is not None:
+            critiques.append(Critique(
+                stage=stage, label=label, held=str(detail)[:400],
+                source_head=(source or "")[:400],
+                features=sorted(feats)[:24],
+            ))
+        # PoCo/A1: 실패를 LLM 재시도의 탐색 신호로 (키가 있을 때만, 1회)
+        if (not critique_llm_done and format_for_llm is not None and critiques
+                and (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("LLM_API_KEY")
+                     or os.environ.get("LLM_BASE_URL"))):
+            critique_llm_done = True
+            try:
+                from llm import propose_exploit
+                ctext = format_for_llm(
+                    critiques, findings.get("invariant_predicates") or [])
+                draft = propose_exploit(
+                    contract_src, invariants_src, findings,
+                    os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("LLM_API_KEY"),
+                    critique_text=ctext)
+                if draft:
+                    note("# critique-conditioned LLM retry queued")
+                    # inject by running immediately as extra attempt
+                    if attempts < args.max_attempts:
+                        attempts += 1
+                        last_source = draft
+                        proven2, fv2, d2 = verify_candidate(
+                            target_name=target_name, target_src=contract_src,
+                            invariants_src=invariants_src, exploit_src=draft,
+                            manifest=manifest, seed=args.seed)
+                        if proven2:
+                            note(f"attempt {attempts} [llm/critique]: PROVEN — {fv2}")
+                            write_exploit(out_dir, draft)
+                            _write_result(out_dir, {
+                                "proven": True, "target": target_name, "stage": "llm",
+                                "strategy": "llm-critique", "invariant_violated": fv2,
+                                "how": _explain("llm-critique", fv2),
+                                "attempts": attempts, "stages": stages_seen + ["llm"],
+                                "seed": args.seed,
+                                "elapsed_s": round(time.time() - started, 2),
+                                "critiques": [c.as_dict() for c in critiques],
+                            })
+                            write_log(out_dir, log)
+                            print(f"PROVEN target={target_name} strategy=llm-critique violated={fv2}")
+                            return EXIT_FOUND
+                        held_invariants["llm-critique"] = d2
+                        note(f"attempt {attempts} [llm/critique]: NOT PROVEN ({d2})")
+            except Exception as e:
+                note(f"# critique LLM retry skipped: {str(e)[:120]}")
 
     # ── 예산 내 미발견 ────────────────────────────────────────────────────────
     write_exploit(out_dir, last_source)
@@ -229,6 +299,8 @@ def main(argv=None):
         "attempts": attempts, "stages": stages_seen,
         "verifier_available": verifier_ok,
         "feedback": held_invariants,
+        "critiques": [c.as_dict() for c in critiques] if critiques else [],
+        "features": sorted(feats),
         "seed": args.seed, "elapsed_s": round(time.time() - started, 2),
     })
     write_log(out_dir, log)

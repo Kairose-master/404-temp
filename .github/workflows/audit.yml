@@ -27,6 +27,8 @@ jobs:
         run: |
           pip install -r agent/requirements.txt
           python -c "import solcx; solcx.install_solc('0.8.24')"
+      - name: Unit tests (feature IR / scanner / targets)
+        run: python3 -m unittest discover -s tests/python -v
       - name: Run exploit-prover audit
         run: |
           python3 agent/audit.py "${{ github.event.inputs.path || 'targets' }}" \
