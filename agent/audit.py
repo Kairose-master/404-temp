@@ -64,7 +64,9 @@ def concrete_contracts(src, eng):
         has_mut = any(f.get("external") and "view" not in f["head"] and "pure" not in f["head"] for f in fns)
         # receive/fallback 만 있거나 위험 프리미티브를 쓰는 컨트랙트도 분석 대상
         interesting = bool(re.search(r"\breceive\s*\(|\bfallback\s*\(|delegatecall|selfdestruct|\.call\s*\{\s*value", body))
-        if (has_mut or interesting) and name not in out:
+        # 함수가 전혀 없는 inert 컨트랙트(Force 원형)도 강제-ETH 대상으로 분석
+        inert = (not fns) and (not re.search(r"\b(receive|fallback|payable)\b", body))
+        if (has_mut or interesting or inert) and name not in out:
             out.append(name)
     return out
 
@@ -200,6 +202,14 @@ CLASS = {
         "rule": "TR404-CALLBACK", "cwe": "CWE-807", "title": "Trusting an untrusted callback's return",
         "fix": "외부(특히 msg.sender) 콜백 반환을 신뢰해 분기·상태전이하지 말 것. 같은 값을 재호출로 두 번 믿지 말고, 결과를 캐시·검증하거나 신뢰 경계를 명확히.",
         "hot": r"\)\s*\.\s*\w+\s*\("},
+    "forced_ether": {
+        "rule": "SWC-132", "cwe": "CWE-667", "title": "Unexpected ether balance (forced via selfdestruct)",
+        "fix": "address(this).balance 를 로직 불변식으로 신뢰하지 말 것. selfdestruct/코인베이스로 강제 입금될 수 있다.",
+        "hot": r"balance"},
+    "lockup_bypass": {
+        "rule": "SWC-105", "cwe": "CWE-284", "title": "Token lockup bypass via transferFrom",
+        "fix": "락업/제한을 transfer 뿐 아니라 transferFrom(그리고 _update/_transfer 훅 등 모든 이전 경로)에 일관 적용.",
+        "hot": r"transferFrom"},
     "generic": {
         "rule": "TR404-EXPLOIT", "cwe": "CWE-284", "title": "Exploitable asset loss / privilege change",
         "fix": "관찰된 자산 손실·권한 변경 경로를 재현 PoC로 확인 후 근본 원인(접근제어/CEI/검증)을 수정.",
@@ -286,8 +296,14 @@ def classify(strategy, family_hint=None):
         return CLASS["weak_randomness"]
     if s.startswith("king-dos") or s.startswith("griefing"):
         return CLASS["griefing_dos"]
-    if s.startswith("callback"):
+    if s.startswith("callback") or s.startswith("shop"):
         return CLASS["callback_inconsistency"]
+    if s.startswith("force"):
+        return CLASS["forced_ether"]
+    if s.startswith("lockup"):
+        return CLASS["lockup_bypass"]
+    if s.startswith("gas-griefing"):
+        return CLASS["griefing_dos"]
     if s.startswith("amm-manip"):
         return CLASS["amm"]
     if s.startswith("flashloan"):
