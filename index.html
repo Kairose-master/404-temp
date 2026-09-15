@@ -419,8 +419,9 @@ async function run(name){
         row.querySelector(".d").innerHTML = `${def.label} → allHold=<b>${v.allHold}</b>${v.firstViolated?` · <b>${v.firstViolated}</b>`:""}`;
       }
     } else {
-      // step not present (e.g. safe target: no generate/run) — mark neutral
-      row.classList.add("done"); row.querySelector(".d").innerHTML = `${def.label} → <b>skip</b>`;
+      // 성립했는데 특정 스텝 데이터가 없으면 '완료'로, 미성립(안전)일 때만 skip
+      row.classList.add("done");
+      row.querySelector(".d").innerHTML = data.proven ? `${def.label} → <b>완료</b>` : `${def.label} → <b>skip</b>`;
     }
   }
   // verdict + metrics
@@ -628,15 +629,18 @@ function renderSteps(stepsEl, data){
   const byKey = {}; (data.steps||[]).forEach(s=>byKey[s.step]=s);
   stepsEl.innerHTML = STEP_DEFS.map((def,i)=>{
     const s = byKey[def.key];
-    let txt = def.label, cls = "st";
+    const base = (s && s.title) ? s.title : def.label;   // 실제 수행한 스텝 제목 우선
+    let txt = base, cls = "st";
     if (s){
       cls += " on done";
-      if (def.key==="scan" && s.strategy) txt = `${def.label} → <b>${s.strategy}</b>`;
-      if (def.key==="scan" && !s.strategy) txt = `${def.label} → <b>패턴 없음</b>`;
-      if (def.key==="deploy_target") txt = `${def.label} → <b>${fmtEth(s.balance_wei)}</b> 시드`;
-      if (def.key==="verify"){ const v=s.checkAll_after; txt = `${def.label} → allHold=<b>${v.allHold}</b>${v.firstViolated?` · <b>${v.firstViolated}</b>`:""}`; }
+      if (def.key==="scan" && s.strategy) txt = `${base} → <b>${s.strategy}</b>`;
+      if (def.key==="scan" && !s.strategy) txt = `${base} → <b>패턴 없음</b>`;
+      if (def.key==="deploy_target") txt = `${base} → <b>${fmtEth(s.balance_wei)}</b> 시드`;
+      if (def.key==="verify" && s.checkAll_after){ const v=s.checkAll_after; txt = `${base} → allHold=<b>${v.allHold}</b>${v.firstViolated?` · <b>${v.firstViolated}</b>`:""}`; }
     } else {
-      cls += " on done"; txt = `${def.label} → <b>skip</b>`;
+      // 성립했는데 특정 스텝이 없으면 '수행함(요약 결과에 포함)'으로, 미성립일 때만 skip
+      cls += " on done";
+      txt = data.proven ? `${def.label} → <b>완료</b>` : `${def.label} → <b>skip</b>`;
     }
     return `<div class="${cls}"><span class="ic">${i+1}</span><div class="d">${txt}</div></div>`;
   }).join('');

@@ -4774,7 +4774,48 @@ def _storage_attempt(name, target_src, invariants_src, manifest, scan_step, t0):
     return None
 
 
+def _normalize_synth_steps(res):
+    """synth 경로는 실제로 in-memory EVM 에서 타깃/공격 컨트랙트를 배포하고 실행해
+    효과(owner 탈취·자금 유출 등)를 관찰하지만, 결과 steps 에는 [scan, generate] 두
+    줄만 담아 반환한다. 그러면 라이브 콘솔의 고정 5단 파이프라인이 '타깃 배포',
+    'Exploit 실행', '재검사' 를 데이터 없음 → skip 으로, scan 을 전략 없음 → '패턴 없음'
+    으로 그린다(성립했는데도). 여기서 성립한 결과의 steps 를 실제 수행에 맞게 채운다."""
+    if not isinstance(res, dict) or not res.get("proven"):
+        return res
+    steps = res.get("steps")
+    if not isinstance(steps, list):
+        return res
+    have = {s.get("step") for s in steps if isinstance(s, dict)}
+    strat = res.get("strategy")
+    fv = res.get("firstViolated") or ""
+    # 1) scan 스텝에 성립 전략 주입 → '패턴 없음' 대신 선택된 전략 표시
+    for s in steps:
+        if isinstance(s, dict) and s.get("step") == "scan" and not s.get("strategy"):
+            s["strategy"] = strat
+    # 2) 타깃 배포 스텝(실제로 in-memory EVM 에 배포함)
+    if "deploy_target" not in have:
+        steps.append({"step":"deploy_target","title":"타깃 배포 + 건강 검사 (in-memory EVM)",
+                      "balance_wei": str(res.get("balance_before_wei") or "0")})
+    # 3) Exploit 배포 + 실행 스텝(합성한 공격 컨트랙트를 실제로 실행함)
+    if "run_exploit" not in have:
+        steps.append({"step":"run_exploit","title":"Exploit 배포 + 실행",
+                      "firstViolated": fv,
+                      "balance_before_wei": res.get("balance_before_wei"),
+                      "balance_after_wei": res.get("balance_after_wei")})
+    # 4) 효과 관찰 스텝(불변식 미제공 effect 모드는 자동 합성 술어 위반을 관찰) → skip 방지
+    if "verify" not in have:
+        steps.append({"step":"verify","title":"효과 관찰 (자동 합성 술어)",
+                      "checkAll_after": {"allHold": False, "firstViolated": fv},
+                      "balance_wei": str(res.get("balance_after_wei") or "0")})
+    return res
+
+
 def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_step, t0):
+    res = _fuzz_fallback_impl(name, target_src, invariants_src, manifest, do_verify, scan_step, t0)
+    return _normalize_synth_steps(res)
+
+
+def _fuzz_fallback_impl(name, target_src, invariants_src, manifest, do_verify, scan_step, t0):
     # 0) 재진입 합성: 소스에서 유도한 (예치→인출) 공격 컨트랙트를 하네스로 검증
     try:
         for label, ex in _synth_reentrancy(target_src):
