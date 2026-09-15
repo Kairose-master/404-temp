@@ -1,5 +1,7 @@
 # DualSurface
 
+트랙 12가 아니다. METHOD §6 한계의 작업 예제.
+
 Worked example for the unsolved frontier: **the same contract has a
 designed swap and a real vault bug.** Revenue is not the label.
 

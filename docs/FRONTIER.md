@@ -1,5 +1,8 @@
 # 아직 안 닫힌 프론티어
 
+> 트랙 제출 입구가 아니다. 채점은 [`README.md`](../README.md) · [`METHOD.md`](../METHOD.md).
+> 이 문서는 METHOD §6 한계의 확장 노트다.
+
 2025–2026 문헌(A1, PoCo, ReX, EvoPoC, Verite, SmartFuzz, EVMbench, SCONE/Mythos,
 软件学报 2026 DeFi 서베이, Smart-Target)이 **실행 익스플로잇**을 주전장으로
 옮겼다. 이 문서는 그 논문들이 *풀었다고 주장하는 것*과, 코드에 방금 넣은
