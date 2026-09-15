@@ -101,8 +101,13 @@ LLM 은 **선택적 가속**이다. 키가 있으면 `claude-sonnet-5`, `tempera
   `deploy.helpers` 로 먼저 배포한 주소를 끼운다. Setup.s.sol 이 있으면
   형제를 같이 컴파일한다.
 - 교차 컨트랙트: 같은 컴파일 유닛 + `token()`/`pool()`/`oracle()` 게터로 형제를
-  찾아 `run(address)` 안에 접는다. 피해자 `approve` 선행은 `vm.prank(victim)`
-  (forge) / 두번째 EOA (py-evm). 교차 체인·다른 키의 피해자 선행 트랜잭션은 밖.
+  찾아 `run(address)` 안에 접는다. 피해자 approve 가 Setup/`world.txs` 로
+  **이미 들어가 있으면** 치트코드 없이 `transferFrom` 한다. py-evm 는
+  `manifest.world.txs` 를 두번째 EOA 의 실제 트랜잭션으로 보낸다.
+  교차 체인은 같은 EVM 안의 메신저(`lzReceive`/`relayMessage`) 목까지.
+  실제 두 체인·다른 키의 오프라인 서명 트랜잭션은 밖.
+- 의도 경로: 불변식이 유지된 채 ETH 만 움직인 swap-only 후보는
+  `intended_path` 로 분류하고 PROVEN(exit 0) 으로 치지 않는다.
 - 여러 취약점이 조합돼야 성립하는 공격, 다중 트랜잭션/다중 블록 상태가 필요한
   공격은 단일 `run()` 템플릿으로는 얕게만 시도한다.
 - 검증기는 하네스 `_prove` 의 단일 호출 의미를 재현한다. 하네스가 향후 다중 호출·

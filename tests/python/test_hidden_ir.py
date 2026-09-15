@@ -245,5 +245,59 @@ class VictimApprove(unittest.TestCase):
         self.assertIn("vm.prank", src)
 
 
+class IntentPath(unittest.TestCase):
+    def test_swap_only_is_intended(self):
+        from trust404.intent import decide, is_success, INTENDED_PATH, THEFT
+        swap = "contract Exploit { function run(address t) external payable { I(t).swap0to1(); } }"
+        self.assertEqual(decide({"swap"}, swap, False, "intended_path"), INTENDED_PATH)
+        self.assertFalse(is_success(INTENDED_PATH))
+        drain = "contract Exploit { function run(address t) { I(t).withdraw(); } }"
+        self.assertEqual(decide({"cei_violation"}, drain, True, "theft"), THEFT)
+        self.assertTrue(is_success(THEFT))
+
+    def test_dual_surface_swap_poc_is_intended(self):
+        from trust404.intent import decide, INTENDED_PATH
+        swap = (ROOT / "examples/frontier/ExploitSwap.sol").read_text()
+        self.assertEqual(decide({"swap"}, swap, False, None), INTENDED_PATH)
+
+
+class SeededAllowance(unittest.TestCase):
+    SRC = """
+    contract Vault {
+        address public victim;
+        address public token;
+        function pull() external {}
+        function seed() external { Token(token).approve(address(this), 1); }
+    }
+    interface Token { function approve(address,uint256) external returns (bool); }
+    """
+
+    def test_no_prank_synth(self):
+        f = extract_features(self.SRC, "Vault")
+        self.assertIn("setup_seeded_allowance", f)
+        labels = [l for l, _ in iter_defi_families(self.SRC, "Vault")]
+        self.assertTrue(any(l.startswith("seeded-allowance") for l in labels))
+        body = next(s for l, s in iter_defi_families(self.SRC, "Vault") if l.startswith("seeded-allowance"))
+        self.assertNotIn("vm.prank", body)
+        self.assertIn("transferFrom", body)
+
+
+class CrossChain(unittest.TestCase):
+    SRC = """
+    contract Bridge {
+        function lzReceive(uint16 srcChain, bytes memory src, uint64 nonce, bytes memory payload) external {}
+        function token() external view returns (address) { return address(0); }
+    }
+    """
+
+    def test_feature_and_synth(self):
+        f = extract_features(self.SRC, "Bridge")
+        self.assertIn("cross_chain_bridge", f)
+        self.assertTrue(should_run("cross_chain_bridge", f))
+        labels = [l for l, _ in iter_defi_families(self.SRC, "Bridge")]
+        self.assertTrue(any(l.startswith("cross-chain") for l in labels))
+
+
+
 if __name__ == "__main__":
     unittest.main()

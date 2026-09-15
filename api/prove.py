@@ -1521,6 +1521,14 @@ def _run_effect(name, target_src, exploit_src, manifest):
     if _bal_of and tc.functions.balanceOf(eaddr).call() > tb0 + 10**40:
         reasons.append("token balance inflated (overflow/underflow)")
     exploited = len(reasons) > 0
+    if exploited and reasons and all("funds drained" in r for r in reasons):
+        try:
+            from trust404.intent import is_swap_only
+            if is_swap_only(exploit_src):
+                exploited = False
+                reasons = ["intended_path: swap-only ETH movement"]
+        except Exception:
+            pass
     steps.append({"step":"verify","title":"효과 관찰 (자동 합성 불변식)",
                   "checkAll_after":{"allHold": not exploited,"firstViolated": ("; ".join(reasons) if exploited else "")},
                   "balance_wei":str(b1),"drained_wei":str(b0-b1),"proven":exploited})

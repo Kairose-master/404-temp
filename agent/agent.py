@@ -155,7 +155,11 @@ def main(argv=None):
     feats = set()
     if extract_features is not None:
         try:
-            feats = extract_features(contract_src, target_name)
+        try:
+            blob = contract_src
+            if extra_sources:
+                blob = contract_src + "\n" + "\n".join(extra_sources.values())
+            feats = extract_features(blob, target_name)
             note("# features: " + ",".join(sorted(feats)[:40]))
             if hkg_lift is not None:
                 hkg = hkg_lift(feats)
@@ -248,6 +252,19 @@ def main(argv=None):
             note(f"attempt {attempts} [{stage}/{label}]: verify error → refine ({str(e)[:140]})")
             continue
 
+        intent_cls = None
+        try:
+            from trust404.intent import decide, is_success
+            pcls = getattr(getattr(result, "profit", None), "classification", None)
+            intent_cls = decide(feats, source, proven, pcls)
+            if proven and not is_success(intent_cls):
+                note(f"attempt {attempts} [{stage}/{label}]: INTENDED_PATH — "
+                     f"value moved but not theft (invariants held or swap-only); skip")
+                proven = False
+                detail = (detail or "") + " intent=intended_path"
+        except Exception:
+            intent_cls = None
+
         if proven:
             note(f"attempt {attempts} [{stage}/{label}]: PROVEN — invariant violated: {first_violated}")
             if getattr(result, "profit", None) is not None:
@@ -262,8 +279,8 @@ def main(argv=None):
             }
             if getattr(result, "profit", None) is not None:
                 payload["profit"] = result.profit.as_dict()
-                if result.profit.classification == "intended_path":
-                    payload["how"] += " [profit oracle: value extracted but invariants held — not theft]"
+            if intent_cls:
+                payload["classification"] = intent_cls
             _write_result(out_dir, payload)
             write_log(out_dir, log)
             print(f"PROVEN target={target_name} strategy={label} violated={first_violated}")

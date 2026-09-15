@@ -155,6 +155,11 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
     target, taddr = deploy(arts[target_name], cargs, value=seed_wei)
     inv, iaddr = deploy(arts["Invariants"])
 
+    try:
+        _apply_world_txs(w3, arts, taddr, helpers_addr, manifest, acct)
+    except Exception:
+        pass
+
     before = inv.functions.checkAll(taddr).call()
     if before[0] is not True:
         raise RuntimeError(f"BAD TARGET DESIGN: invariant already broken before exploit: {before[1]}")
@@ -285,6 +290,62 @@ def _phased_retry(w3, et, exp, taddr, inv, exploit_src):
     w3.eth.wait_for_transaction_receipt(tx)
     after = inv.functions.checkAll(taddr).call()
     return after[0] is False, after, ""
+
+
+def _apply_world_txs(w3, arts, taddr, helpers, manifest, acct0):
+    """Send real txs from a second EOA (no cheatcodes).
+
+    manifest.world.txs: [{from: "victim", to: "$token"| "$target", sig: "approve(address,uint256)", args: [...]}]
+    `victim` is w3.eth.accounts[1]. $Name resolved from deploy.helpers.
+    """
+    txs = ((manifest.get("world") or {}).get("txs")) or []
+    if not txs:
+        return
+    accounts = list(w3.eth.accounts)
+    victim = accounts[1] if len(accounts) > 1 else accounts[0]
+    try:
+        w3.eth.send_transaction({"from": acct0, "to": victim, "value": 10**18, "gas": 21000})
+    except Exception:
+        pass
+
+    def resolve_addr(x):
+        if not isinstance(x, str):
+            return x
+        if x in ("$target", "target"):
+            return taddr
+        if x.startswith("$") and x[1:] in helpers:
+            return helpers[x[1:]]
+        if x.startswith("0x") and len(x) == 42:
+            return w3.to_checksum_address(x)
+        return x
+
+    for step in txs:
+        actor = (step.get("from") or step.get("actor") or "attacker")
+        frm = victim if str(actor).lower() in ("victim", "user", "alice", "holder") else acct0
+        to = resolve_addr(step.get("to") or "$target")
+        sig = step.get("sig") or step.get("fn") or ""
+        args = [resolve_addr(a) if isinstance(a, str) else a for a in (step.get("args") or [])]
+        args = ["max" if a == "max" else a for a in args]
+        args = [2**256 - 1 if a == "max" else a for a in args]
+        if not sig or not to:
+            continue
+        name, _, rest = sig.partition("(")
+        types = [t.strip() for t in rest.rstrip(")").split(",") if t.strip()]
+        abi = [{
+            "type": "function", "name": name,
+            "inputs": [{"type": t, "name": f"a{i}"} for i, t in enumerate(types)],
+            "outputs": [],
+        }]
+        c = w3.eth.contract(address=to, abi=abi)
+        fn = getattr(c.functions, name)
+        from trust404.abi import coerce
+        coerced = coerce(args, w3)
+        tx = fn(*coerced).transact({
+            "from": frm,
+            "value": int(step.get("value") or 0),
+            "gas": 2_000_000,
+        })
+        w3.eth.wait_for_transaction_receipt(tx)
 
 
 # ── forge 검증기(선택) ───────────────────────────────────────────────────────
