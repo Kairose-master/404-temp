@@ -7,6 +7,11 @@ warnings.filterwarnings("ignore")
 os.environ.setdefault("SOLCX_BINARY_PATH", "/tmp/solcx-bin")
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
+from pathlib import Path as _Path
+import sys as _sys
+_ROOT = _Path(__file__).resolve().parent.parent
+if str(_ROOT) not in _sys.path:
+    _sys.path.insert(0, str(_ROOT))
 
 SOLC = "0.8.24"
 EVM_VERSION = "cancun"
@@ -423,6 +428,16 @@ TARGETS = {
   }
  }
 }
+
+# Disk is the source of truth when targets/ is shipped (CLI/Docker/CI).
+# Embedded copies above remain the Vercel serverless fallback.
+try:
+    from trust404.targets import load_all as _load_targets_disk
+    _disk = _load_targets_disk()
+    if _disk:
+        TARGETS.update(_disk)
+except Exception:
+    pass
 
 # TRUST404 Track04 — static scanner.
 # 타깃 소스를 정규식/패턴으로 훑어 (a) 취약 유형별 점수와 (b) 템플릿 파라미터화에
@@ -5169,6 +5184,12 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     findings = scan_target(target_src, invariants_src or "", manifest)
     order = seeded_order(sorted(STRATEGY_ORDER, key=lambda f: (-findings["scores"].get(f,0), f)),
                          findings["scores"], 42)
+    feats = None
+    try:
+        from trust404.features import extract_features
+        feats = extract_features(target_src, name)
+    except Exception:
+        feats = None
     # 1) 템플릿 단계
     for fam in order:
         try:
@@ -5178,7 +5199,8 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
         if src:
             yield ("template", fam, src)
     # 2) 합성 단계 — 소스를 여러 개 낼 수 있는 생성기
-    t0 = time.time(); scan_step = {"step":"scan","scores":findings["scores"]}
+    t0 = time.time(); scan_step = {"step":"scan","scores":findings["scores"],
+                                  "features":sorted(feats) if feats else []}
     for gen in (lambda: _synth_reentrancy(target_src),
                 lambda: _synth_amm(target_src, name),
                 lambda: _synth_flashloan(target_src, name)):
@@ -5187,9 +5209,22 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
                 yield ("synth", label, ex)
         except Exception:
             pass
+    # 2c) 일반화 DeFi/CTF 계열 (DVD Unstoppable/Truster/Selfie/Climber — 레벨명 없음)
+    try:
+        from trust404.synth_defi import iter_defi_families
+        from trust404.registry import should_run as _sr_defi
+        for label, ex in iter_defi_families(target_src, name):
+            fam = label.split(":")[0].replace("-", "_")
+            if not _sr_defi(fam, feats):
+                continue
+            yield ("synth", label, ex)
+    except Exception:
+        pass
     # 2b) 합성 단계 — 실행으로 소스를 확정하는 단일 결과형 생성기
+    # 레벨 솔버는 계열 capability 로 게이트된다 (trust404.registry).
+    # 피처가 없으면 전부 실행(폴백). 태그가 안 겹치면 컴파일/배포를 건너뛴다.
     inv = invariants_src if do_verify else None
-    for fn in (_storage_attempt, _proxy_attempt, _multiblock_attempt,
+    _synth_fns = (_storage_attempt, _proxy_attempt, _multiblock_attempt,
                _synth_storage_collision, _synth_king_dos, _synth_callback_inconsistency,
                _synth_shop, _synth_lockup_bypass, _synth_gas_griefing, _synth_force,
                _synth_gatekeeper_two, _synth_gatekeeper_one, _synth_magicnumber,
@@ -5197,7 +5232,14 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
                _synth_dex_two_drain, _synth_dex_drain, _synth_good_samaritan,
                _synth_eip7702_reentrancy, _synth_gatekeeper_three, _synth_stake_accounting,
                _synth_uninitialized, _synth_puzzle_wallet, _synth_ecdsa_malleability,
-               _synth_magic_carousel, _synth_commitment_collision):
+               _synth_magic_carousel, _synth_commitment_collision)
+    try:
+        from trust404.registry import should_run as _should_run
+    except Exception:
+        _should_run = lambda _n, _f: True
+    for fn in _synth_fns:
+        if not _should_run(fn.__name__, feats):
+            continue
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:

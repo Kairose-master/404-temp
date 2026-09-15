@@ -31,26 +31,46 @@ TRUST404 Track 04(Autonomous Exploit Prover)를 만들며 참고한 자료 모�
 
 ## 3. 중국 区块链 스마트컨트랙트 보안 연구
 취약점을 Solidity 코드층·EVM 실행층·시스템층으로, 탐지를 형식검증·심볼릭·퍼징·중간표현·
-딥러닝으로 분류하는 서베이 다수(국내 중국 연구는 퍼징·ML 집중).
-- 智能合约安全漏洞检测技术研究综述, 软件学报 — https://www.jos.org.cn/jos/article/abstract/6375
-- 智能合约漏洞检测技术综述, 软件学报 2024 — https://www.jos.org.cn/html/2024/1/6810.htm
+딥러닝(·오염분석)으로 분류하는 서베이. **탐지의 exploitability 가 낮다**는 공통 한계가
+이 도구(동적 PoC)의 자리이다. 상세 매핑은 [`ARCHITECTURE.md`](../ARCHITECTURE.md) §1.5.
+
+- 钱鹏 등, 智能合约安全漏洞检测技术研究综述, 软件学报 2022, 33(8):3059-3085
+  DOI 10.13328/j.cnki.jos.006375 — https://www.jos.org.cn/html/2022/8/6375.htm
+  3계층(코드/EVM/시스템) × 5방법. 형식검증은 자동화 낮음·도달 불가 경로 FP.
+  심볼릭은 경로폭발. 퍼징은 의미 부족. IR은 규칙 우회. DL은 위치 설명 없음.
+- 董伟良 등, 智能合约漏洞检测技术综述, 소프트웨어学报 2024, 35(1):38-62
+  DOI 10.13328/j.cnki.jos.006810 — https://www.jos.org.cn/html/2024/1/6810.htm
+  84편(~2021-07). 6방법(+오염). 중국=퍼징·ML, 국제=심볼릭·형식검증.
+  개방성 중국 26% / 국제 63%. EthPloit(퍼징+오염→익스플로잇), teEther(심볼릭 페이로드).
 - 智能合约安全漏洞检测研究进展, 软件学报 — https://www.jos.org.cn/jos/article/abstract/7046
 - 区块链智能合约漏洞检测与自动化修复综述, 计算机应用 — https://www.joca.cn/CN/10.11772/j.issn.1001-9081.2022020179
 - 基于深度学习的智能合约漏洞检测方法综述, 四川大学学报 2023 — http://science.scu.edu.cn/zh/article/doi/10.19907/j.0490-6756.2023.020001/
 - BCodeVis：面向区块链智能合约的漏洞检测可视分析方法, 计算机辅助设计与图形学学报 2024 — https://www.jcad.cn/cn/article/pdf/preview/10.3724/SP.J.1089.2024-00496.pdf
-- SliSE — Efficiently Detecting Reentrancy Vulnerabilities in Complex Smart Contracts (프로그램 슬라이싱+심볼릭), Zexu Wang 등, 中山大学·哈尔滨工业大学, FSE 2024 — https://arxiv.org/abs/2403.11254
+- SliSE — FSE 2024, 中山大学·哈尔滨工业大学 — https://arxiv.org/abs/2403.11254
+  I-PDG 슬라이싱 + 심볼릭. 복잡 컨트랙트 F1 78.65% (비교도구 ≤9.26%).
 - A Comparative Evaluation of Automated Analysis Tools for Solidity, Zhiyuan Wei 등, 2023 — https://arxiv.org/abs/2310.20212
 
 ## 4. 자동 익스플로잇 생성 · 벤치마크
 - A1: AI Agent Smart Contract Exploit Generation — https://arxiv.org/pdf/2507.05558
-- PoCo: Agentic Proof-of-Concept Exploit Generation (ACM TOSEM) — https://doi.org/10.1145/3816704
+  도구 6개(소스·ctor·상태·sanitizer·concrete exec·수익). 실패 PoC 히스토리.
+- PoCo: Agentic Proof-of-Concept Exploit Generation (ACM TOSEM) — https://doi.org/10.1145/3816704 · https://arxiv.org/abs/2511.02780
+  ReAct + forge compile/test. 잘 만들어진 PoC 50/50, 논리 정확 32/50.
+  데이터셋 https://github.com/ASSERT-KTH/Proof-of-Patch/
 - AI agents find smart contract exploits (Anthropic) — https://red.anthropic.com/2025/smart-contracts/
 - SoK: Root Causes of $1 Billion Loss in SC Attacks — https://arxiv.org/html/2507.20175
 
-## 5. 컨트랙트 워게임 (벤치마크)
-- The Ethernaut — https://ethernaut.openzeppelin.com (본 도구 벤치마크: `examples/ethernaut/RESULTS.md`)
-- Damn Vulnerable DeFi — https://www.damnvulnerabledefi.xyz
+## 5. 컨트랙트 워게임 · 실사고 (벤치마크, 레벨 솔버 아님)
+- The Ethernaut — https://ethernaut.openzeppelin.com (`examples/ethernaut/RESULTS.md`, 32 자동 증명)
+- Damn Vulnerable DeFi v4 — https://www.damnvulnerabledefi.xyz
+  계열 승격: Unstoppable→donation DoS, Truster→unpermissioned callback,
+  Selfie→governance flashloan, Climber→execute-before-schedule.
+  솔버 참고(베끼지 않음): https://github.com/SunWeb3Sec/damn-vulnerable-defi-v4-solutions
 - Capture the Ether — https://capturetheether.com
+- Paradigm CTF — Vault 등(프록시 Guard + emergencyCall)
+- WTF-CTF (Foundry 모음) — https://github.com/WTFAcademy/WTF-CTF
+- 실사고 2026-09 Ether.fi AtomicQueue (SlowMist): `solve()` 의 solver 인자
+  접근제어 없음 → Truster 와 **같은 계열**. https://x.com/SlowMist_Team/status/2098344499923784048
+- 인브라우저 EVM 재실행 플레이그라운드 (24건 Aug–Sep 2026): https://crypto.training/hacks/
 
 ## 6. 접근 비교 (요약)
 | 도구/연구 | 방법 | 산출 | 확증 방식 |
@@ -59,4 +79,6 @@ TRUST404 Track 04(Autonomous Exploit Prover)를 만들며 참고한 자료 모�
 | Beosin VaaS | 형식 검증 | 위험 위치·사유 | 정형 증명 |
 | ChainMaker/WANA | 심볼릭+규칙 (WASM CFG) | 규칙 매칭 경보 | 경로 조건 |
 | SliSE | 슬라이싱+심볼릭 | 재진입 경보 | 도달성 검증 |
-| **본 도구** | 스캐너+퍼저 **생성-검증** | 실행 PoC + SWC/CWE + 수정 diff | **내장 EVM 동적 증명** |
+| EthPloit / teEther | 퍼징+오염 / 심볼릭 페이로드 | 익스플로잇 시드 | 부분 실행 |
+| PoCo / A1 | LLM ReAct + Foundry | PoC 초안 | forge test · 역사 상태 |
+| **본 도구** | 스캐너+계열 synth+퍼저 **생성-검증** | 실행 PoC + SWC/CWE + 수정 diff | **내장 EVM 동적 증명** |

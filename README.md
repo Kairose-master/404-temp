@@ -8,6 +8,10 @@
 `_prove()` 를 재현한 검증기로 실제 불변식 위반을 확인하고, 결과를 `result.json`(위반한
 불변식 + **어떻게** 위반했는지)과 `attempts.log`(단계 격상 추적)로 남긴다.
 
+엔진 패키지 `trust404/` — 스캐너·capability IR·계열 레지스트리·크리티크.
+레벨 솔버는 이름 하드코딩이 아니라 소스 피처로 발화한다. 설계:
+[`ARCHITECTURE.md`](./ARCHITECTURE.md) · 참고자료: [`docs/references.md`](./docs/references.md).
+
 ## 제출물 3종
 | # | 제출물 | 위치 |
 |---|---|---|
