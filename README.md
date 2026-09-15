@@ -1,8 +1,12 @@
 # TRUST404 · Track 04 — Autonomous Exploit Prover
 
 스마트컨트랙트 취약점을 **재현 가능한 PoC로 자동 증명**하는 에이전트.
-타깃을 입력받아 취약 유형을 스코어링하고, `Exploit.sol` 을 결정론적으로 생성한 뒤,
-하네스 `_prove()` 절차를 재현한 검증기로 실제 불변식이 깨지는지 확인한다.
+입력(타깃 `.sol`·불변식 세트·매니페스트)을 읽어 **탐색 → 생성 → 검증 → (불변식 미위반 시)
+탐색·생성 반복** 의 **자기검증 루프(Self-validation Loop)** 를 돈다. 한 후보 PoC 가
+불변식을 못 깨면 멈추지 않고 더 강한 방법으로 단계를 격상한다:
+`0) LLM(선택) → 1) 계열 템플릿 → 2) 합성(synth) → 3) 범용 퍼저(fuzz)`. 각 후보는 하네스
+`_prove()` 를 재현한 검증기로 실제 불변식 위반을 확인하고, 결과를 `result.json`(위반한
+불변식 + **어떻게** 위반했는지)과 `attempts.log`(단계 격상 추적)로 남긴다.
 
 ## 제출물 3종
 | # | 제출물 | 위치 |
@@ -114,7 +118,8 @@ The Ethernaut 공개 레벨 **12/12 전부 자동 증명**(총 13개 컨트랙�
 
 ## 레이아웃
 ```
-agent/       에이전트 (agent.py=트랙 CLI, audit.py=실무 감사 CLI, scanner, strategies, verify, llm, Dockerfile)
+agent/       에이전트 (agent.py=트랙 CLI·자기검증 루프, audit.py=실무 감사 CLI, scanner, strategies, verify, llm, Dockerfile)
+api/prove.py 공용 엔진 — 스캐너/템플릿/합성/퍼저 + iter_engine_candidates(단계별 후보 생성기)
 exploits/    타깃별 생성된 Exploit.sol + attempts.log (제출물 C)
 harness/     참가 번들 하네스 사본 (forge 검증 경로용)
 targets/     타깃 12개 (공개셋 6 + 워게임 유도 6: 취약 7 / 안전 5)

@@ -2681,6 +2681,64 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             "note":"템플릿 미매치 → 범용 퍼저가 호출 시퀀스를 탐색해 성립시켰습니다.",
             "ms":int((time.time()-t0)*1000)}
 
+def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify=True):
+    """트랙 자기검증 루프(agent.py)용 후보 생성기.
+
+    탐색·생성 단계를 지연(lazy) 산출해 (stage, label, exploit_src) 로 내보낸다. 각 단계는
+    앞 단계가 실패했을 때에만 소비되므로 '생성한 PoC 가 불변식을 위반하지 못하면 탐색과
+    생성을 반복'하는 자기검증 루프의 탐색 축을 이룬다. 실제 검증(불변식 위반 확인)은
+    호출자(verify.verify_candidate)가 수행한다 — 생성과 검증을 분리해 루프를 명시화한다.
+
+    단계 순서(점점 강한 일반화):
+      template  → 계열별 결정론 템플릿(정적 스코어 순)
+      synth     → 재진입/AMM/플래시론/스토리지/프록시/다중블록/스토리지충돌/그리핑DoS/콜백 합성
+      fuzz      → 범용 호출 시퀀스 탐색(SliSE 류 슬라이싱 우선순위) → codegen
+    """
+    findings = scan_target(target_src, invariants_src or "", manifest)
+    order = seeded_order(sorted(STRATEGY_ORDER, key=lambda f: (-findings["scores"].get(f,0), f)),
+                         findings["scores"], 42)
+    # 1) 템플릿 단계
+    for fam in order:
+        try:
+            src = build_exploit(fam, findings)
+        except Exception:
+            src = None
+        if src:
+            yield ("template", fam, src)
+    # 2) 합성 단계 — 소스를 여러 개 낼 수 있는 생성기
+    t0 = time.time(); scan_step = {"step":"scan","scores":findings["scores"]}
+    for gen in (lambda: _synth_reentrancy(target_src),
+                lambda: _synth_amm(target_src, name),
+                lambda: _synth_flashloan(target_src, name)):
+        try:
+            for label, ex in gen():
+                yield ("synth", label, ex)
+        except Exception:
+            pass
+    # 2b) 합성 단계 — 실행으로 소스를 확정하는 단일 결과형 생성기
+    inv = invariants_src if do_verify else None
+    for fn in (_storage_attempt, _proxy_attempt, _multiblock_attempt,
+               _synth_storage_collision, _synth_king_dos, _synth_callback_inconsistency):
+        try:
+            r = fn(name, target_src, inv, manifest, scan_step, t0)
+        except Exception:
+            r = None
+        if isinstance(r, dict) and r.get("exploit_src"):
+            yield ("synth", r.get("strategy") or fn.__name__, r["exploit_src"])
+    # 3) 범용 퍼저 단계
+    try:
+        found = _fuzz_search(name, target_src, inv, manifest, bool(do_verify))
+    except Exception:
+        found = None
+    if found:
+        seq, payable_map, reason = found
+        label = "fuzz(" + " → ".join(c.get("name", "raw") for c in seq) + ")"
+        try:
+            yield ("fuzz", label, _fuzz_codegen(seq, payable_map))
+        except Exception:
+            pass
+
+
 def prove_sources(name, target_src, invariants_src, manifest, do_verify=True, extra_candidates=None):
     t0 = time.time()
     findings = scan_target(target_src, invariants_src or "", manifest)
