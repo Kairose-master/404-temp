@@ -324,6 +324,8 @@ def classify(strategy, family_hint=None):
         return CLASS["amm"]
     if s.startswith("good-samaritan"):
         return CLASS["callback_inconsistency"]
+    if s.startswith("eip7702"):
+        return CLASS["reentrancy"]
     if s.startswith("amm-manip"):
         return CLASS["amm"]
     if s.startswith("flashloan"):
