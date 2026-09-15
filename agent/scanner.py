@@ -8,6 +8,18 @@ FAM_REENTRANCY = "reentrancy"
 FAM_ACCESS = "access_control"
 FAM_INTEGER = "integer_underflow"
 FAM_ORACLE = "oracle_manipulation"
+# Families drawn from the classic contract wargames (Ethernaut, Damn
+# Vulnerable DeFi, Capture the Ether) and the SoK vulnerability taxonomies.
+FAM_DELEGATECALL = "delegatecall_hijack"   # Ethernaut Delegation/Preservation, Parity
+FAM_RANDOMNESS = "weak_randomness"         # Ethernaut CoinFlip, CTE Predict-the-Future
+FAM_INIT = "unprotected_init"              # Ethernaut Motorbike, uninitialized proxies
+
+# On-chain entropy sources that are fully known to the caller in-transaction —
+# using any of these to gate a payout is exploitable (predictable RNG).
+_ENTROPY_TOKENS = (
+    "block.timestamp", "block.prevrandao", "block.difficulty",
+    "block.number", "blockhash", "block.coinbase", "block.gaslimit",
+)
 
 
 def _strip_comments(src):
@@ -78,7 +90,10 @@ def _has_owner_guard(fn, src):
 def scan_target(contract_src, invariants_src, manifest):
     src = _strip_comments(contract_src)
     fns = _functions(src)
-    scores = {FAM_REENTRANCY: 0, FAM_ACCESS: 0, FAM_INTEGER: 0, FAM_ORACLE: 0}
+    scores = {
+        FAM_REENTRANCY: 0, FAM_ACCESS: 0, FAM_INTEGER: 0, FAM_ORACLE: 0,
+        FAM_DELEGATECALL: 0, FAM_RANDOMNESS: 0, FAM_INIT: 0,
+    }
     sig = {"functions": fns}
 
     # ── Reentrancy ────────────────────────────────────────────────────────────
@@ -151,6 +166,70 @@ def scan_target(contract_src, invariants_src, manifest):
             sig["oracle_deposit"] = fn
         if re.match(r"swap\w*For\w*", fn["name"] or ""):
             sig["oracle_swap"] = fn
+
+    # ── Delegatecall hijack ───────────────────────────────────────────────────
+    # A function that delegatecalls an address it received as a PARAMETER runs
+    # attacker code in this contract's storage → owner/admin (slot 0) can be
+    # overwritten. Delegatecall to an immutable/state module is not attacker-
+    # controlled and is not flagged (LibraryVault stays safe).
+    for fn in fns:
+        if not fn["external"]:
+            continue
+        b = fn["body"]
+        m = re.search(r"(\w+)\s*\.\s*delegatecall\s*\(", b)
+        if not m:
+            continue
+        receiver = m.group(1)
+        addr_params = [an for (t, an) in fn["args"] if t == "address"]
+        has_bytes = any(t.startswith("bytes") for t, _ in fn["args"])
+        if receiver in addr_params:
+            # attacker supplies the delegatecall target
+            scores[FAM_DELEGATECALL] += 5
+            sig["delegatecall_entry"] = {"fn": fn, "receiver": receiver, "has_bytes": has_bytes}
+        # receiver is a state var / immutable → not attacker-controlled → no score
+
+    # ── Weak / predictable randomness ─────────────────────────────────────────
+    # A payout gated on an on-chain entropy source the caller can read in the
+    # same tx is exploitable: the attacker computes the identical value and
+    # always wins. Require (entropy source) AND (keccak256 or modulo mixing)
+    # AND (a value transfer) in the same function, so a mere block.timestamp
+    # deadline check does not trip it.
+    for fn in fns:
+        if not fn["external"]:
+            continue
+        b = fn["body"]
+        has_entropy = any(tok in b for tok in _ENTROPY_TOKENS)
+        mixes = ("keccak256" in b) or ("%" in b)
+        transfers = bool(re.search(r"\.call\s*\{\s*value\s*:", b)) or \
+            bool(re.search(r"balance[sfO]?\w*\[[^\]]+\]\s*\+=", b))
+        if has_entropy and mixes and transfers:
+            scores[FAM_RANDOMNESS] += 5
+            sig["randomness_fn"] = fn
+
+    # ── Unprotected initializer ───────────────────────────────────────────────
+    # An initializer that sets owner/admin with neither an `initialized` guard
+    # nor access control lets the first caller seize the contract. A guarded
+    # initializer (require(!initialized) / initializer modifier) is safe.
+    init_name = re.compile(r"^(initialize|init|initializer|__init)\w*$", re.I)
+    for fn in fns:
+        if not fn["external"]:
+            continue
+        b = fn["body"]
+        head = fn["head"]
+        looks_init = bool(init_name.match(fn["name"]))
+        sets_privilege_to_sender = bool(
+            re.search(r"\b(owner|admin)\b\s*=\s*msg\.sender", b))
+        sets_privilege_to_param = bool(
+            re.search(r"\b(owner|admin)\b\s*=\s*\w+", b)) and looks_init
+        guarded = bool(
+            re.search(r"require\s*\(\s*!\s*\w*[Ii]nitialized", b)
+            or re.search(r"\binitializer\b", head)
+            or "_disableInitializers" in src
+            or _has_owner_guard(fn, src))
+        if (looks_init or sets_privilege_to_sender) and \
+           (sets_privilege_to_sender or sets_privilege_to_param) and not guarded:
+            scores[FAM_INIT] += 5
+            sig["init_fn"] = fn
 
     sig["scores"] = scores
     sig["invariant_predicates"] = manifest.get("invariants", {}).get("predicates", [])

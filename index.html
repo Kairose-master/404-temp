@@ -129,7 +129,7 @@
     <b>1</b> 타깃 배포 · <b>2</b> Exploit.sol 자동 생성 · <b>3</b> Exploit 배포 · <b>4</b> 실행 · <b>5</b> 불변식 재검사
   </div>
   <div class="runall">
-    <button class="btn primary" id="runAll">전체 6개 실행 ▶</button>
+    <button class="btn primary" id="runAll">전체 12개 실행 ▶</button>
     <span class="apihint" id="apihint"></span>
   </div>
   <div class="warn"><b>주의.</b> 격리된 in-memory EVM에서 방어 연구·자동 검증 목적으로만 실행됩니다.
@@ -238,12 +238,18 @@
 
 <script>
 const TARGETS = [
-  {name:"ReentrantVault", verdictKind:"vuln", cls:"Reentrancy · CEI 위반"},
-  {name:"OpenVault",      verdictKind:"vuln", cls:"Broken Access Control"},
-  {name:"BadAccounting",  verdictKind:"vuln", cls:"Integer Underflow"},
-  {name:"NaiveOracle",    verdictKind:"vuln", cls:"Price Oracle Manipulation"},
-  {name:"SafeVault",      verdictKind:"safe", cls:"CEI + nonReentrant (멀쩡)"},
-  {name:"BoundedOwner",   verdictKind:"safe", cls:"타임락 + 상한 (멀쩡)"},
+  {name:"ReentrantVault",    verdictKind:"vuln", cls:"Reentrancy · CEI 위반"},
+  {name:"OpenVault",         verdictKind:"vuln", cls:"Broken Access Control"},
+  {name:"BadAccounting",     verdictKind:"vuln", cls:"Integer Underflow"},
+  {name:"NaiveOracle",       verdictKind:"vuln", cls:"Price Oracle Manipulation"},
+  {name:"DelegateVault",     verdictKind:"vuln", cls:"Delegatecall Hijack · Ethernaut Delegation"},
+  {name:"PredictableLottery",verdictKind:"vuln", cls:"Weak Randomness · Ethernaut CoinFlip"},
+  {name:"OpenInitializer",   verdictKind:"vuln", cls:"Unprotected Initializer · Motorbike"},
+  {name:"SafeVault",         verdictKind:"safe", cls:"CEI + nonReentrant (멀쩡)"},
+  {name:"BoundedOwner",      verdictKind:"safe", cls:"타임락 + 상한 (멀쩡)"},
+  {name:"LibraryVault",      verdictKind:"safe", cls:"고정 모듈 delegatecall (멀쩡)"},
+  {name:"CommitLottery",     verdictKind:"safe", cls:"커밋-리빌 난수 (멀쩡)"},
+  {name:"GuardedInitializer",verdictKind:"safe", cls:"initialized 가드 (멀쩡)"},
 ];
 const STEP_DEFS = [
   {key:"scan",          label:"정적 분석 · 전략 선택"},
