@@ -344,7 +344,8 @@ def analyze_source(eng, src, contract, invariants, seed_eth, seed):
 
 def build_report(findings, args, total_analyzed=None):
     proven = [f for f in findings if f["res"].get("proven")]
-    heur = [f for f in findings if (not f["res"].get("proven")) and f["severity"] == "MEDIUM"]
+    heur = [f for f in findings if (not f["res"].get("proven"))
+            and (f["severity"] == "MEDIUM" or f["res"].get("heuristics"))]
     clean = [f for f in findings if f["severity"] in ("INFO",) and not f["res"].get("proven")]
     counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
     for f in findings:
@@ -375,6 +376,8 @@ def build_report(findings, args, total_analyzed=None):
             "line": f.get("line"),
             "severity": f["severity"],
             "proven": bool(r.get("proven")),
+            "heuristic": bool(r.get("heuristics")),
+            "why": (r.get("heuristics") or [{}])[0].get("why", ""),
             "strategy": r.get("strategy"),
             "rule": cls["rule"],
             "cwe": cls["cwe"],
@@ -415,8 +418,8 @@ def render_md(report):
     L.append("|---|---|---|---|---|---|")
     def sev_key(f): return (-SEV_ORDER.get(f["severity"], 0), not f["proven"])
     for f in sorted(report["findings"], key=sev_key):
-        verdict = "PROVEN" if f["proven"] else ("휴리스틱" if f["severity"] == "MEDIUM" else "clean")
-        strat = f["strategy"] or (", ".join(f["scanner_scores"].keys()) or "—")
+        verdict = "PROVEN" if f["proven"] else ("휴리스틱" if (f.get("heuristic") or f["severity"] == "MEDIUM") else "clean")
+        strat = f["strategy"] or (", ".join(f["scanner_scores"].keys()) or ("정적 휴리스틱" if f.get("heuristic") else "—"))
         ev = (f["evidence"] or "").replace("|", "\\|")
         L.append(f"| `{f['contract']}` | {badge.get(f['severity'],f['severity'])} | {verdict} | {strat} | {f['rule']} · {f['cwe']} | {ev} |")
     L.append("")
@@ -442,12 +445,21 @@ def render_md(report):
                 L.append(f["fix_diff"])
                 L.append("```")
             L.append("")
-    heur = [f for f in report["findings"] if (not f["proven"]) and f["severity"] == "MEDIUM"]
+    heur = [f for f in report["findings"] if (not f["proven"]) and (f.get("heuristic") or f["severity"] == "MEDIUM")]
     if heur:
-        L.append("## 휴리스틱 플래그 (미증명 — 수동 확인 권장)")
+        L.append("## 휴리스틱 플래그 (동적 미증명 — 수동 확인 권장)")
         L.append("")
         for f in heur:
-            L.append(f"- `{f['contract']}` — 정적 신호: {', '.join(f['scanner_scores'].keys())}")
+            if f.get("heuristic"):
+                L.append(f"### `{f['contract']}` — {f['title']} — {badge.get(f['severity'],f['severity'])}")
+                L.append(f"- 위치: `{f['file']}:{f.get('line')}` · 분류: **{f['rule']} · {f['cwe']}**")
+                if f.get("why"): L.append(f"- 근거: {f['why']}")
+                if f.get("remediation"): L.append(f"- 수정 가이드: {f['remediation']}")
+                if f.get("fix_diff"):
+                    L.append(""); L.append("```diff"); L.append(f["fix_diff"]); L.append("```")
+                L.append("")
+            else:
+                L.append(f"- `{f['contract']}` — 정적 신호: {', '.join(f['scanner_scores'].keys())}")
         L.append("")
     L.append("---")
     L.append("_모든 PoC는 격리된 in-memory EVM(네트워크 차단)에서 방어 연구·자동 검증"
@@ -576,6 +588,24 @@ def main(argv=None):
             log(f"analyzing {fp}:{c} …")
             res = analyze_source(eng, src, c, inv_src, args.seed_eth, args.seed)
             sev, evidence, is_finding = severity_for(res)
+            # 동적 미성립 시: 정적 휴리스틱(예: EIP-7702 receiver-callback 재진입)을 소견으로 승격
+            heur_cls = None
+            if not res.get("proven"):
+                try:
+                    allh = eng.static_findings(src) if hasattr(eng, "static_findings") else []
+                    bodies = eng._contract_bodies(eng._strip_comments(src)) if hasattr(eng, "_contract_bodies") else {}
+                    body = bodies.get(c, src)
+                    hs = [h for h in allh if (h.get("core") in body or h.get("function") in body)]
+                except Exception:
+                    hs = []
+                if hs:
+                    res["heuristics"] = hs
+                    h0 = hs[0]
+                    sev = h0.get("severity", "HIGH"); is_finding = True
+                    evidence = h0.get("why") or h0.get("title")
+                    heur_cls = {"rule": h0["rule"], "cwe": h0["cwe"], "title": h0["title"],
+                                "fix": h0.get("fix", ""),
+                                "hot": r"onERC721Received|checkOnERC721Received|tx\.origin"}
             drained = None
             try:
                 bb = res.get("balance_before_wei"); ba = res.get("balance_after_wei")
@@ -590,7 +620,7 @@ def main(argv=None):
             scores = (res.get("steps") or [{}])[0].get("scores") or {}
             pos = {k: v for k, v in scores.items() if v > 0}
             fam_hint = max(pos, key=pos.get) if pos else None
-            cls = classify(res.get("strategy"), fam_hint)
+            cls = heur_cls or classify(res.get("strategy"), fam_hint)
             if cls is CLASS["generic"] and "inflated" in (res.get("firstViolated") or ""):
                 cls = CLASS["integer_underflow"]   # 토큰 잔액 오버·언더플로 (기타 계열 아닐 때만)
             decl_ln, hot_ln = find_location(eng, src, c, cls)

@@ -504,6 +504,72 @@ def _has_owner_guard(fn, src):
     return False
 
 
+_RECEIVER_HOOKS = ("checkOnERC721Received", "onERC721Received",
+                   "onERC1155Received", "onERC1155BatchReceived", "tokensReceived")
+
+def static_findings(contract_src):
+    """동적 증명이 성립하지 않는(또는 샌드박스가 모델링 못 하는) 취약 패턴을 정적
+    신호로 잡아 '휴리스틱' 소견으로 낸다. 오탐 억제를 위해 고신호 조합만 발화한다.
+    현재 계열:
+      - receiver-callback-before-mint 재진입 + tx.origin==msg.sender EOA 게이트
+        (EIP-7702 로 코드 보유 EOA 가 게이트를 통과해 재진입 → 민팅 한도/유일성 우회)."""
+    out = []
+    src = _strip_comments(contract_src)
+    hook_re = re.compile(r"\b(" + "|".join(_RECEIVER_HOOKS) + r")\s*\(")
+    mint_re = re.compile(r"\b(_safeMint|_mint|_update)\s*\(")
+    txorigin = bool(re.search(r"tx\.origin\s*==\s*msg\.sender|msg\.sender\s*==\s*tx\.origin", src))
+    has_guard_import = "nonReentrant" in src
+    for fn in _functions(src):
+        b = fn["body"]
+        hm = hook_re.search(b); mm = mint_re.search(b)
+        # receiver 훅이 있고, 같은 함수에서 mint/state-commit 보다 '먼저' 실행되면 CEI 위반
+        if not hm:
+            continue
+        hook_before_mint = bool(mm) and hm.start() < mm.start()
+        # balanceOf 등 per-caller 가드가 훅보다 앞서 검사됨(우회 대상)
+        gm = re.search(r"balanceOf\s*\(\s*msg\.sender\s*\)|balanceOf\s*\(\s*_?to\s*\)", b)
+        guard_before_hook = bool(gm) and gm.start() < hm.start()
+        if not (hook_before_mint and guard_before_hook):
+            continue
+        this_guarded = "nonReentrant" in fn["head"]
+        # 이 취약 코어를 호출하는 공개 진입점 중 nonReentrant 없이 도달 가능한 것
+        callers = [f for f in _functions(src)
+                   if re.search(r"\b" + re.escape(fn["name"]) + r"\s*\(", f["body"]) and f["name"] != fn["name"]]
+        unguarded_entry = None
+        for c in callers:
+            if "nonReentrant" not in c["head"]:
+                unguarded_entry = c["name"]; break
+        # 코어 자체가 public 이고 nonReentrant 없으면 그것도 무방비 진입점
+        if fn["external"] and not this_guarded and unguarded_entry is None:
+            unguarded_entry = fn["name"]
+        if unguarded_entry is None and (this_guarded or not callers):
+            continue
+        entry = unguarded_entry or fn["name"]
+        eip7702 = txorigin and any(
+            re.search(r"tx\.origin\s*==\s*msg\.sender|msg\.sender\s*==\s*tx\.origin", c["body"])
+            for c in _functions(src) if c["name"] == entry)
+        why = (f"`{fn['name']}` 가 mint 이전에 수신자 콜백({hm.group(1)})을 호출하는데, "
+               f"per-caller 가드(balanceOf)가 그 앞에서만 검사됩니다(CEI 위반). "
+               f"`{entry}` 경로는 nonReentrant 가 없어 콜백 도중 재진입해 가드/유일성을 우회할 수 있습니다.")
+        if eip7702:
+            why += (" 이 경로의 `tx.origin == msg.sender` EOA 게이트는 EIP-7702(Pectra) 로 "
+                    "코드를 위임받은 EOA 가 통과할 수 있어, 컨트랙트가 아닌 EOA 로도 콜백 재진입이 성립합니다.")
+        out.append({
+            "rule": "SWC-107", "cwe": "CWE-841",
+            "title": ("Reentrancy via receiver callback before mint"
+                      + (" (EIP-7702 tx.origin bypass)" if eip7702 else "")),
+            "severity": "HIGH",
+            "family": "reentrancy",
+            "function": entry, "core": fn["name"],
+            "eip7702": eip7702,
+            "why": why,
+            "fix": ("Checks-Effects-Interactions 준수: 상태 변경(_mint) 후에 수신자 콜백을 호출하고 "
+                    "(_safeMint 는 mint 뒤 콜백), 모든 mint 경로에 nonReentrant 적용. "
+                    "tx.origin==msg.sender 를 EOA 판별로 쓰지 말 것(EIP-7702 로 무력화)."),
+        })
+    return out
+
+
 def scan_target(contract_src, invariants_src, manifest):
     src = _strip_comments(contract_src)
     fns = _functions(src)
@@ -2912,6 +2978,16 @@ def _run_custom(body):
         res=prove_sources(name, contract, invariants or None, manifest,
                           do_verify=bool(invariants), extra_candidates=extra)
         if llm_note: res["llm_note"]=llm_note
+        # 동적 미성립 시: 정적 휴리스틱 소견을 덧붙여 'NO PATTERN' 대신 근거 있는 경고를 준다
+        if isinstance(res, dict) and not res.get("proven"):
+            try:
+                h = static_findings(contract)
+            except Exception:
+                h = []
+            if h:
+                res["heuristics"] = h
+                res["note"] = (res.get("note") or "") + \
+                    f" · 동적 증명은 미성립이나 정적 휴리스틱 {len(h)}건 발견(예: {h[0]['title']})."
         return _attach_inputs(res, contract, invariants or None, manifest)
     except Exception as e:
         return {"name":name,"error":str(e)[:400],"trace":traceback.format_exc()[-700:]}

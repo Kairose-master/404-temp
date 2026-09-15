@@ -100,6 +100,12 @@ docker run --rm -v "$PWD:/scan" track04 audit /scan --out /scan/audit
 CI: [`.github/workflows/audit.yml`](./.github/workflows/audit.yml) 가 PR·푸시마다 감사를
 돌려 `report.sarif` 를 GitHub code scanning 에 업로드한다(리포트는 아티팩트로 보관). 게이트로
 쓰려면 워크플로의 `--fail-on critical` 스텝을 켠다.
+동적 증명이 성립하지 않거나 샌드박스가 모델링하지 못하는 계열은 **정적 휴리스틱**으로
+잡아 별도 소견(HIGH, "휴리스틱")으로 보고한다 — 예: **수신자 콜백을 mint 이전에 부르는
+재진입**과 그 `tx.origin == msg.sender` EOA 게이트가 **EIP-7702(Pectra)** 로 무력화되는
+NFT 패턴(코드 보유 EOA 가 콜백 재진입으로 유일성/한도 우회). 동적 증명(PROVEN)과
+정적 휴리스틱을 명확히 구분해 오탐 없이 보고한다.
+
 발견마다 **SWC/CWE 표준 분류 + 수정 가이드 + 소스 위치(파일:라인)**를 붙인다. 엔진
 전량(스캐너 7계열 템플릿 + 범용 퍼저: 호출 시퀀스 · 재진입 합성 · 다중 컨트랙트 AMM
 가격 조작(플래시론식) · 시스템 내부 플래시론 차용자 · 스토리지 보조(private 슬롯 읽기) ·
