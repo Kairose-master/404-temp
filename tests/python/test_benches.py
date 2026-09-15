@@ -22,8 +22,9 @@ class Benches(unittest.TestCase):
 
     def test_four_frontier_fixtures(self):
         names = {p.name for p in local_fixtures()}
-        self.assertEqual(
-            names, {"profit_drain", "grief_lock", "intended_arb", "cross_router"}
+        self.assertTrue(
+            {"profit_drain", "grief_lock", "intended_arb", "cross_router", "dual_surface"}
+            <= names
         )
 
     def test_intended_arb_is_the_frontier_class(self):
@@ -50,6 +51,6 @@ class Benches(unittest.TestCase):
     def test_summary_does_not_claim_verite_score(self):
         s = summary()
         self.assertEqual(s["n_attached_upstream"], 0)
-        self.assertEqual(s["n_local"], 4)
+        self.assertEqual(s["n_local"], 5)
         verite = next(d for d in s["datasets"] if d["id"] == "verite")
         self.assertEqual(verite["status"], "NOT_ATTACHED")

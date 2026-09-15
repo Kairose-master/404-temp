@@ -17,7 +17,7 @@
       "title": "Frontier class fixtures (profit / grief / intended_path / cross-contract)",
       "paper": "docs/FRONTIER.md",
       "metric": "classification",
-      "n": 4,
+      "n": 5,
       "attach_env": "",
       "path": "benches/fixtures",
       "note": "Pedagogical. intended_arb is the case profit-only agents get wrong."

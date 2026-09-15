@@ -12,6 +12,7 @@
 레벨 솔버는 이름 하드코딩이 아니라 소스 피처로 발화한다. 설계:
 [`ARCHITECTURE.md`](./ARCHITECTURE.md) · 참고자료: [`docs/references.md`](./docs/references.md)
 · **아직 안 닫힌 구멍:** [`docs/FRONTIER.md`](./docs/FRONTIER.md).
+작업 예제(한 프로토콜, 두 라벨): [`examples/frontier/DualSurface.sol`](./examples/frontier/DualSurface.sol).
 
 ## 제출물 3종
 | # | 제출물 | 위치 |
