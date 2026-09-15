@@ -139,6 +139,12 @@ PROVIDERS: List[Provider] = [
     Provider("cross_chain_bridge", "cross_chain_bridge", "synth",
              frozenset({"cross_chain_bridge"}),
              "같은 EVM 안의 메신저/LZ/OP relay 콜백"),
+    Provider("liquidate_other", "liquidate_other", "synth",
+             frozenset({"liquidate_other", "no_key_path"}),
+             "키 없는 피해자: liquidate(address)/skim/rescue (Handsel MiniVault)"),
+    Provider("imported_protocol", "imported_protocol", "synth",
+             frozenset({"imported_amm", "imported_lending"}),
+             "import 된 Uni/Aave 인터페이스 — 게터로 접음"),
 ]
 
 _BY_FN = {p.fn_name: p for p in PROVIDERS}
@@ -147,11 +153,15 @@ _BY_FN = {p.fn_name: p for p in PROVIDERS}
 def should_run(fn_name: str, features: Optional[Set[str]]) -> bool:
     """If features is None (extractor failed), run everything.
 
-    Unknown fn_name → run (forward-compat). Empty feature set → skip
-    specialized synths (they cannot match) but that is the caller's choice;
-    we return False when needs ∩ features is empty.
+    Opaque IR (Vyper/Yul) → skip specialized synths; fuzz still runs
+    because unknown fn_name returns True at the call site that uses fuzz.
     """
     if features is None:
+        return True
+    if "opaque_ir" in features:
+        spec = _BY_FN.get(fn_name)
+        if spec is not None:
+            return False
         return True
     spec = _BY_FN.get(fn_name)
     if spec is None:

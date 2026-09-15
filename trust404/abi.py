@@ -185,11 +185,21 @@ def load_extra_sources(manifest_path, contract_path, manifest) -> dict:
             extras[setup] = p.read_text(encoding="utf-8")
     cpath = Path(contract_path)
     src_dir = cpath.parent
+    seen = {cpath.resolve()}
     if src_dir.is_dir():
-        for p in sorted(src_dir.glob("*.sol")):
-            if p.resolve() == cpath.resolve():
+        for p in sorted(src_dir.rglob("*.sol")):
+            if p.resolve() in seen:
                 continue
-            extras[f"src/{p.name}"] = p.read_text(encoding="utf-8")
+            seen.add(p.resolve())
+            try:
+                rel = p.relative_to(man_dir)
+            except ValueError:
+                rel = Path("src") / p.name
+            extras[str(rel)] = p.read_text(encoding="utf-8")
+    for rel in ((manifest.get("world") or {}).get("files") or []):
+        p = man_dir / rel
+        if p.is_file():
+            extras[str(rel)] = p.read_text(encoding="utf-8")
     return extras
 
 
