@@ -4,15 +4,43 @@
 #   2. 배포 직후 checkAll(target) == (true,"") (아니면 BAD TARGET DESIGN)
 #   3. Exploit 에 10 ETH 지급 후 run{value: 10 ether}(target)
 #   4. 재검사 — allHold==false 면 PROVEN
+#   5. profit oracle: 펀딩 이후·run 이후 잔액 Δ. 펀딩 자체는 수익이 아님.
 # 기본 검증기는 내장 EVM(solc 0.8.24 + eth-tester/py-evm)이라 forge 없이,
 # 네트워크 없이 오프라인으로 동작한다. TRUST404_VERIFIER=forge 로 두면
 # 참가 번들 하네스를 forge test 로 돌리는 경로를 쓴다(그 환경에 forge 필요).
+from __future__ import annotations
+
 import os
 import warnings
+from dataclasses import dataclass
+from typing import List, Optional
 
 warnings.filterwarnings("ignore")
 
 DEFAULT_EXPLOIT_FUNDING_WEI = 10 * 10**18  # 하네스 규약 DEFAULT_EXPLOIT_FUNDING_WEI
+
+try:
+    from pathlib import Path as _P
+    import sys as _s
+    _r = _P(__file__).resolve().parent.parent
+    if str(_r) not in _s.path:
+        _s.path.insert(0, str(_r))
+    from trust404.profit import ProfitReport, measure_evm, snapshot
+except Exception:  # package optional
+    ProfitReport = None
+    measure_evm = None
+    snapshot = None
+
+
+@dataclass
+class VerifyResult:
+    proven: bool
+    violated: str
+    detail: str
+    profit: object = None
+
+    def tuple(self):
+        return self.proven, self.violated, self.detail
 
 
 class VerifyUnavailable(Exception):
@@ -20,9 +48,17 @@ class VerifyUnavailable(Exception):
 
 
 def verify_candidate(target_name, target_src, invariants_src, exploit_src, manifest, seed):
+    return verify_full(
+        target_name, target_src, invariants_src, exploit_src, manifest, seed
+    ).tuple()
+
+
+def verify_full(target_name, target_src, invariants_src, exploit_src, manifest, seed=0):
     mode = os.environ.get("TRUST404_VERIFIER", "evm").lower()
     if mode == "forge":
-        return _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest)
+        proven, violated, detail = _verify_forge(
+            target_name, target_src, invariants_src, exploit_src, manifest)
+        return VerifyResult(proven, violated, detail, profit=None)
     return _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest)
 
 
@@ -83,7 +119,6 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest):
         r = w3.eth.wait_for_transaction_receipt(tx)
         return w3.eth.contract(address=r.contractAddress, abi=art["abi"]), r.contractAddress
 
-    # manifest constructor args + seed funding (Setup semantics: deploy{value:seed}(args))
     dep = manifest.get("deploy", {})
     cargs = _coerce_args(dep.get("constructor_args", []), Web3)
     seed_wei = _parse_decimal(str(dep.get("value_wei", "0")))
@@ -96,8 +131,12 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest):
         raise RuntimeError(f"BAD TARGET DESIGN: invariant already broken before exploit: {before[1]}")
 
     exp, eaddr = deploy(arts["Exploit"])
-    # vm.deal(exploit, 10 ether) 후 run{value: 10 ether}
     w3.eth.send_transaction({"from": acct, "to": eaddr, "value": DEFAULT_EXPLOIT_FUNDING_WEI, "gas": 1_000_000})
+
+    tokens: List[str] = list((manifest.get("profit") or {}).get("tokens") or [])
+    before_att = snapshot(w3, eaddr, tokens) if snapshot else None
+    before_tgt = snapshot(w3, taddr, tokens) if snapshot else None
+
     run_err = None
     try:
         tx = exp.functions.run(taddr).transact(
@@ -108,8 +147,29 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest):
 
     after = inv.functions.checkAll(taddr).call()
     proven = after[0] is False
-    detail = f"allHold={after[0]}" + (f" run_err={run_err}" if run_err else "")
-    return proven, (after[1] if proven else ""), detail
+    profit = None
+    if measure_evm and before_att is not None:
+        try:
+            profit = measure_evm(
+                w3, eaddr, taddr, tokens,
+                before_attacker=before_att, before_target=before_tgt,
+                invariant_broken=proven,
+            )
+        except Exception:
+            profit = None
+    cls = getattr(profit, "classification", "") if profit else ""
+    wei = getattr(profit, "extractable_wei", "") if profit else ""
+    detail = (
+        f"allHold={after[0]}"
+        + (f" run_err={run_err}" if run_err else "")
+        + (f" profit={cls}:{wei}" if cls else "")
+    )
+    return VerifyResult(
+        proven=proven,
+        violated=(after[1] if proven else ""),
+        detail=detail,
+        profit=profit,
+    )
 
 
 def _coerce_args(args, Web3):
@@ -163,15 +223,12 @@ def _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest
     (src / "Invariants.sol").write_text(invariants_src)
     (src / "Exploit.sol").write_text(exploit_src)
     shutil.copytree(Path(harness_dir) / "src", work / "harness_src")
-    # forge-std remap for the harness import
     (work / "foundry.toml").write_text(
         "[profile.default]\n"
         f"evm_version = \"{manifest['target'].get('evm_version','cancun')}\"\n"
         "src = 'src'\ntest = 'test'\n"
         "remappings = ['forge-std/=lib/forge-std/src/']\n"
     )
-    # A concrete harness test that deploys target{value:seed}(args) + inv + exploit.
-    # (constructor arg encoding kept simple: address-or-none, matching public set.)
     cargs = dep.get("constructor_args", [])
     ctor = ""
     if len(cargs) == 1 and isinstance(cargs[0], str) and cargs[0].startswith("0x"):
@@ -197,7 +254,6 @@ contract Run is Harness {{
 }}
 """
     (test / "Run.t.sol").write_text(test_src)
-    # needs forge-std; assume harness bundle provides it or forge installs
     proc = subprocess.run(
         ["forge", "test", "--match-contract", "Run", "-vv"],
         cwd=work, capture_output=True, text=True, timeout=180)

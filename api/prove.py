@@ -5220,6 +5220,13 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
             yield ("synth", label, ex)
     except Exception:
         pass
+    # 2d) 교차 컨트랙트 월드 모델 — 시퀀스를 run(address) 로 접음 (ReX 약점)
+    try:
+        from trust404.world import iter_world_candidates
+        for label, ex in iter_world_candidates(target_src, name, feats):
+            yield ("world", label, ex)
+    except Exception:
+        pass
     # 2b) 합성 단계 — 실행으로 소스를 확정하는 단일 결과형 생성기
     # 레벨 솔버는 계열 capability 로 게이트된다 (trust404.registry).
     # 피처가 없으면 전부 실행(폴백). 태그가 안 겹치면 컴파일/배포를 건너뛴다.
@@ -5235,9 +5242,14 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
                _synth_magic_carousel, _synth_commitment_collision)
     try:
         from trust404.registry import should_run as _should_run
+        from trust404.hkg import order_by_hkg as _hkg_order
     except Exception:
         _should_run = lambda _n, _f: True
-    for fn in _synth_fns:
+        _hkg_order = lambda ns, _f: list(ns)
+    _ordered = _hkg_order([fn.__name__ for fn in _synth_fns], feats)
+    _by = {fn.__name__: fn for fn in _synth_fns}
+    for fn_name in _ordered:
+        fn = _by[fn_name]
         if not _should_run(fn.__name__, feats):
             continue
         try:

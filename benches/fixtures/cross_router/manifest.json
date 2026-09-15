@@ -1,0 +1,17 @@
+{
+  "schema": "trust404.track04.manifest/0.1",
+  "target": {
+    "name": "CrossRouter",
+    "src": "src/CrossRouter.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+  },
+  "deploy": { "mode": "local", "constructor_args": [], "value_wei": "0" },
+  "determinism": { "block_number": 21000000, "block_timestamp": 1735689600, "seed": 4 },
+  "invariants": { "contract": "Invariants.sol", "predicates": [] },
+  "world": {
+    "contracts": ["ToyToken", "ToyPair", "CrossRouter"],
+    "steps": ["donate-to-pair", "swap-via-router"]
+  },
+  "frontier": { "expect": "none", "class": "cross-contract-shape", "why": "World planner must see pair+router+token in one compilation unit." }
+}

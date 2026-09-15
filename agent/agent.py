@@ -34,7 +34,7 @@ from pathlib import Path
 
 from scanner import scan_target
 from strategies import STRATEGY_ORDER, build_exploit, seeded_order
-from verify import verify_candidate, VerifyUnavailable
+from verify import verify_candidate, verify_full, VerifyUnavailable
 
 try:
     from pathlib import Path as _P
@@ -44,10 +44,14 @@ try:
         _s.path.insert(0, str(_r))
     from trust404.critique import Critique, format_for_llm
     from trust404.features import extract_features
+    from trust404.hkg import lift as hkg_lift
+    from trust404.world import plan_world
 except Exception:  # package optional at import time
     Critique = None
     format_for_llm = None
     extract_features = None
+    hkg_lift = None
+    plan_world = None
 
 
 def _load_engine():
@@ -145,6 +149,14 @@ def main(argv=None):
         try:
             feats = extract_features(contract_src, target_name)
             note("# features: " + ",".join(sorted(feats)[:40]))
+            if hkg_lift is not None:
+                hkg = hkg_lift(feats)
+                note("# hkg protocols: " + ",".join(hkg.protocols[:8]))
+                note("# hkg causes: " + ",".join(hkg.causes[:8]))
+                note("# hkg ranked: " + ",".join(hkg.ranked_primitives[:8]))
+            if plan_world is not None:
+                wp = plan_world(contract_src, target_name, feats)
+                note(f"# world cross={wp.cross_contract} reason={wp.reason[:160]}")
         except Exception as e:
             note(f"# feature extract failed: {str(e)[:80]}")
 
@@ -210,7 +222,7 @@ def main(argv=None):
         last_source = source
         # ① 검증(불변식 위반 여부) — 참가 하네스 _prove() 재현
         try:
-            proven, first_violated, detail = verify_candidate(
+            result = verify_full(
                 target_name=target_name,
                 target_src=contract_src,
                 invariants_src=invariants_src,
@@ -218,6 +230,7 @@ def main(argv=None):
                 manifest=manifest,
                 seed=args.seed,
             )
+            proven, first_violated, detail = result.tuple()
         except VerifyUnavailable as e:
             verifier_ok = False
             note(f"attempt {attempts} [{stage}/{label}]: verifier unavailable ({e}); emitting best candidate")
@@ -228,14 +241,21 @@ def main(argv=None):
 
         if proven:
             note(f"attempt {attempts} [{stage}/{label}]: PROVEN — invariant violated: {first_violated}")
+            if getattr(result, "profit", None) is not None:
+                note(f"# profit {result.profit.classification} extractable_wei={result.profit.extractable_wei}")
             write_exploit(out_dir, source)
-            _write_result(out_dir, {
+            payload = {
                 "proven": True, "target": target_name, "stage": stage, "strategy": label,
                 "invariant_violated": first_violated,
                 "how": _explain(label, first_violated),
                 "attempts": attempts, "stages": stages_seen,
                 "seed": args.seed, "elapsed_s": round(time.time() - started, 2),
-            })
+            }
+            if getattr(result, "profit", None) is not None:
+                payload["profit"] = result.profit.as_dict()
+                if result.profit.classification == "intended_path":
+                    payload["how"] += " [profit oracle: value extracted but invariants held — not theft]"
+            _write_result(out_dir, payload)
             write_log(out_dir, log)
             print(f"PROVEN target={target_name} strategy={label} violated={first_violated}")
             return EXIT_FOUND

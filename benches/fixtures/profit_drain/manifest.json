@@ -1,0 +1,13 @@
+{
+  "schema": "trust404.track04.manifest/0.1",
+  "target": {
+    "name": "ProfitVault",
+    "src": "src/ProfitVault.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+  },
+  "deploy": { "mode": "local", "constructor_args": [], "value_wei": "10000000000000000000" },
+  "determinism": { "block_number": 21000000, "block_timestamp": 1735689600, "seed": 1 },
+  "invariants": { "contract": "Invariants.sol", "predicates": ["vaultSolvent"] },
+  "frontier": { "expect": "theft", "class": "profit-and-break" }
+}
