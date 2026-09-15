@@ -1210,6 +1210,61 @@ def _default_manifest():
             "deploy": {"constructor_args": [], "value_wei": str(DEFAULT_SEED_WEI)},
             "invariants": {"predicates": []}}
 
+def _flatten_sources(main_src, sources):
+    """의존성 있는 컨트랙트를 단일 소스로 평탄화(flatten)한다. `sources` 는 {import경로:소스}
+    맵(클라이언트가 웹에서 해결했거나 사용자가 첨부한 의존성). import/pragma/SPDX 를 제거하고
+    의존성 → 메인 순서로 이어 붙이며, 최상위 정의(contract/interface/library/…)를 이름으로
+    중복 제거한다. 하나의 pragma·SPDX 만 남긴다."""
+    def _strip(s):
+        s = re.sub(r"//\s*SPDX-License-Identifier:[^\n]*", "", s)
+        s = re.sub(r"pragma\s+solidity[^;]*;", "", s)
+        s = re.sub(r"pragma\s+abicoder[^;]*;", "", s)
+        s = re.sub(r"pragma\s+experimental[^;]*;", "", s)
+        s = re.sub(r"\bimport\b[^;]*;", "", s)   # import 문 전부 제거(한 줄 여러 개·비선두 포함)
+        return s
+    pm = re.search(r"pragma\s+solidity[^;]*;", main_src or "")
+    pragma = pm.group(0) if pm else "pragma solidity ^0.8.20;"
+    seen = set(); defs = []; loose = []   # defs: list of {name, bases, text}
+    ordered = list((sources or {}).items()) + [("__main__", main_src)]
+    pat = re.compile(r"(abstract\s+contract|contract|interface|library)\s+(\w+)([^{]*)")
+    for _path, content in ordered:
+        body = _strip(content or "")
+        pos = 0
+        while True:
+            m = pat.search(body, pos)
+            if not m:
+                loose.append(body[pos:]); break
+            loose.append(body[pos:m.start()])   # 정의 사이 file-scope 코드
+            bi = body.find("{", m.end())
+            if bi == -1:
+                loose.append(body[m.start():]); break
+            block = _extract_block(body, bi)
+            full = body[m.start():bi] + "{" + block + "}"
+            nm = m.group(2)
+            # 상속 목록(is A, B(args), C) 에서 베이스 이름만 추출
+            bases = []
+            ism = re.search(r"\bis\b(.*)$", m.group(3), re.S)
+            if ism:
+                bases = re.findall(r"([A-Za-z_]\w*)\s*(?:\([^)]*\))?", ism.group(1))
+            if nm not in seen:
+                seen.add(nm); defs.append({"name": nm, "bases": bases, "text": full})
+            pos = bi + 1 + len(block) + 1
+    # 베이스가 파생보다 먼저 오도록 위상 정렬(solc: base must precede derived)
+    by_name = {d["name"]: d for d in defs}
+    out_order = []; done = set(); temp = set()
+    def visit(d):
+        if d["name"] in done or d["name"] in temp: return
+        temp.add(d["name"])
+        for b in d["bases"]:
+            if b in by_name and b != d["name"]:
+                visit(by_name[b])
+        temp.discard(d["name"]); done.add(d["name"]); out_order.append(d)
+    for d in defs:
+        visit(d)
+    header = "// SPDX-License-Identifier: MIT\n" + pragma + "\n\n"
+    loose_txt = "\n".join(x for x in loose if x.strip())
+    return header + (loose_txt + "\n\n" if loose_txt.strip() else "") + "\n\n".join(d["text"] for d in out_order) + "\n"
+
 def _mk_evm():
     from web3 import Web3
     from eth_tester import EthereumTester, PyEVMBackend
@@ -5125,9 +5180,22 @@ def _run_custom(body):
     invariants = (data.get("invariants") or "").strip()
     if not contract:
         return {"error":"'contract' source is required"}
-    if len(contract) > MAX_SRC or len(invariants) > MAX_SRC:
-        return {"error":f"source too large (max {MAX_SRC} bytes per field)"}
+    # 의존성(import) 있는 컨트랙트: 클라이언트가 웹 검색/첨부로 해결한 소스 맵을 받아 평탄화
     name = (data.get("targetName") or "").strip() or infer_target_name(contract)
+    srcs = data.get("sources")
+    flat_note = None
+    if isinstance(srcs, dict) and srcs:
+        try:
+            main_body = contract
+            deps = {k: v for k, v in srcs.items() if isinstance(v, str)}
+            flat = _flatten_sources(main_body, deps)
+            if len(flat) <= MAX_SRC * 6:
+                contract = flat
+                flat_note = f"의존성 {len(deps)}개를 평탄화해 단일 소스로 컴파일했습니다."
+        except Exception as e:
+            flat_note = "의존성 평탄화 실패: " + str(e)[:120]
+    if len(contract) > MAX_SRC * 6 or len(invariants) > MAX_SRC:
+        return {"error":f"source too large after flatten"}
     if not name:
         return {"error":"could not find a contract definition in 'contract'"}
     manifest = _default_manifest()
@@ -5175,6 +5243,7 @@ def _run_custom(body):
         res=prove_sources(name, contract, invariants or None, manifest,
                           do_verify=bool(invariants), extra_candidates=extra)
         if llm_note: res["llm_note"]=llm_note
+        if isinstance(res, dict) and flat_note: res["flatten_note"]=flat_note
         # 동적 미성립 시: 정적 휴리스틱 소견을 덧붙여 'NO PATTERN' 대신 근거 있는 경고를 준다
         if isinstance(res, dict) and not res.get("proven"):
             try:

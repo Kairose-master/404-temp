@@ -169,6 +169,17 @@
   details.io-d>summary{cursor:pointer;padding:9px 12px;font-size:12.5px;color:var(--tx2);font-family:var(--mono)}
   details.io-d .io-f{color:var(--tx3);font-size:11px}
   details.io-d>pre{margin:0;padding:12px 13px;border-top:1px solid var(--line);overflow-x:auto;font-family:var(--mono);font-size:11.5px;line-height:1.6;color:#c7cff0;white-space:pre}
+  .deps{margin-top:10px;border:1px solid var(--line2);background:#07090d;border-radius:10px;padding:12px}
+  .deps-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12.5px;color:var(--tx2)}
+  .deps-head b{color:var(--acc2)}
+  .btn.small{padding:5px 11px;font-size:12px;border-radius:8px;border:1px solid var(--acc);background:rgba(124,92,255,.12);color:#fff;cursor:pointer;font-family:var(--sans)}
+  .dep-ver{width:92px;background:#0b0e14;border:1px solid var(--line2);border-radius:7px;color:var(--tx);font-family:var(--mono);font-size:11px;padding:4px 7px}
+  .dep-item{margin-top:8px;font-family:var(--mono);font-size:11.5px;border:1px solid var(--line);border-radius:8px;padding:8px 10px;background:#080910}
+  .dep-item .dpath{color:var(--tx2);word-break:break-all}
+  .dep-pill{font-size:10px;font-weight:700;padding:2px 7px;border-radius:6px;margin-left:8px;white-space:nowrap}
+  .dep-pill.ok{color:var(--green);background:var(--green-bg);border:1px solid rgba(61,220,151,.35)}
+  .dep-pill.warn{color:var(--amber);background:var(--amber-bg);border:1px solid rgba(255,180,84,.4)}
+  .dep-item textarea{width:100%;margin-top:7px;min-height:80px;background:#0b0e14;border:1px solid var(--line2);border-radius:7px;color:#c7cff0;font-family:var(--mono);font-size:11px;padding:8px;resize:vertical}
 </style>
 <section id="deliverables"><div class="wrap">
   <div class="tag"><span class="dot"></span>SPEC I/O · 입력과 제출물</div>
@@ -283,6 +294,16 @@
       <details class="man"><summary>manifest (선택) — 생성자 인자 / 시드</summary>
         <textarea id="c-man" placeholder='{"deploy":{"constructor_args":["0x00000000000000000000000000000000000A11CE"],"value_wei":"10000000000000000000"}}'></textarea>
       </details>
+    </div>
+
+    <div class="deps" id="deps-panel" hidden>
+      <div class="deps-head">
+        <span>📦 감지된 import <b id="deps-count">0</b></span>
+        <button class="btn small" id="resolveDeps" type="button">웹에서 자동 해결 ↻</button>
+        <label style="font-size:11px;color:var(--tx3)">OZ/npm 버전 <input class="dep-ver" id="dep-ver" value="latest"></label>
+        <span class="apihint" id="deps-hint"></span>
+      </div>
+      <div id="deps-list"></div>
     </div>
 
     <div class="runall">
@@ -637,7 +658,20 @@ async function runCustom(){
   card.scrollIntoView({behavior:"smooth", block:"nearest"});
   let data;
   const cfg = currentLLM();
+  // 의존성 있으면 먼저 해결(자동), 미해결이 남으면 첨부 요청하고 중단
+  if (detectImports(contract).length){
+    document.getElementById('deps-panel').hidden = false;
+    document.getElementById('customhint').textContent = "의존성(import) 웹에서 해결 중…";
+    const left = await runResolve();
+    if (left > 0){
+      setVerdict("custom","idle","의존성 필요");
+      document.getElementById('customhint').textContent = `미해결 의존성 ${left}개 — 아래 패널에 소스를 첨부한 뒤 다시 실행하세요.`;
+      outEl.innerHTML = `<div class="err">import ${left}개를 웹에서 못 찾았습니다. 아래 "📦 감지된 import" 패널의 ⚠️ 항목에 해당 .sol 을 붙여넣고 다시 실행하세요.</div>`;
+      btn.disabled = false; return;
+    }
+  }
   let body = {contract, invariants, targetName, manifest};
+  if (Object.keys(_depSources).length) body.sources = _depSources;
   document.getElementById('cmode').textContent = (invariants?"verify":"effect")
     + (cfg.provider!=="off" ? " · LLM:"+cfg.provider : "") ;
   try{
@@ -684,6 +718,90 @@ async function runCustom(){
   }
   btn.disabled=false;
 }
+// ── 의존성(import) 자동 해결 + 첨부 UI ──
+const _attached = {};            // importPath -> pasted source
+let _depSources = {};            // key -> content (resolved + attached, sent to server)
+function detectImports(src){
+  const out = []; const s = src.replace(/\/\/[^\n]*/g,'').replace(/\/\*[\s\S]*?\*\//g,'');
+  const re = /import\s+(?:[^;"']*?\s+from\s+)?["']([^"']+)["']\s*;/g; let m;
+  while((m = re.exec(s))) out.push(m[1]);
+  return [...new Set(out)];
+}
+function depUrl(path, baseUrl, ver){
+  if(/^https?:\/\//.test(path)){
+    let u = path.replace('github.com/','raw.githubusercontent.com/').replace('/blob/','/');
+    return u;
+  }
+  if(path.startsWith('./') || path.startsWith('../')){
+    if(!baseUrl) return null;                     // 메인 파일의 상대 import → 첨부 필요
+    try { return new URL(path, baseUrl).href; } catch(e){ return null; }
+  }
+  // bare/scoped npm 패키지 → jsdelivr
+  const v = ver || 'latest';
+  let pkg, rest;
+  if(path.startsWith('@')){ const p = path.split('/'); pkg = p.slice(0,2).join('/'); rest = p.slice(2).join('/'); }
+  else { const p = path.split('/'); pkg = p[0]; rest = p.slice(1).join('/'); }
+  return `https://cdn.jsdelivr.net/npm/${pkg}@${v}/${rest}`;
+}
+async function resolveAllDeps(mainSrc, ver){
+  const sources = {}, unresolved = [], seen = new Set();
+  const q = detectImports(mainSrc).map(p => ({path:p, base:null}));
+  let guard = 0;
+  while(q.length && guard++ < 400){
+    const {path, base} = q.shift();
+    const url = depUrl(path, base, ver);
+    const key = url || path;
+    if(seen.has(key)) continue; seen.add(key);
+    if(url === null){                              // 자동 해결 불가
+      if(_attached[path] != null){
+        sources['attach:'+path] = _attached[path];
+        detectImports(_attached[path]).forEach(sub => q.push({path: sub, base:null}));
+      } else unresolved.push(path);
+      continue;
+    }
+    let txt = null;
+    try{ const r = await fetch(url); if(r.ok) txt = await r.text(); }catch(e){}
+    if(txt == null){ if(_attached[path] != null){ sources['attach:'+path]=_attached[path]; } else unresolved.push(path); continue; }
+    sources[key] = txt;
+    detectImports(txt).forEach(sub => q.push({path: sub, base: url}));
+  }
+  return {sources, unresolved:[...new Set(unresolved)]};
+}
+function refreshDepsPanel(){
+  const src = document.getElementById('c-contract').value;
+  const imps = detectImports(src);
+  const panel = document.getElementById('deps-panel');
+  document.getElementById('deps-count').textContent = imps.length;
+  panel.hidden = imps.length === 0;
+}
+async function runResolve(){
+  const src = document.getElementById('c-contract').value.trim();
+  const ver = (document.getElementById('dep-ver').value.trim() || 'latest');
+  const hint = document.getElementById('deps-hint'); const list = document.getElementById('deps-list');
+  hint.textContent = '웹에서 의존성 해결 중…';
+  const {sources, unresolved} = await resolveAllDeps(src, ver);
+  _depSources = sources;
+  const resolvedCount = Object.keys(sources).length;
+  hint.innerHTML = `✅ 자동 해결 <b>${resolvedCount}</b>` + (unresolved.length ? ` · ⚠️ 첨부 필요 <b>${unresolved.length}</b>` : ' · 준비 완료');
+  // 해결된 것 요약 + 미해결 첨부 입력
+  let html = '';
+  Object.keys(sources).slice(0,40).forEach(k=>{
+    const label = k.replace(/^attach:/,'(첨부) ').replace('https://cdn.jsdelivr.net/npm/','npm:');
+    html += `<div class="dep-item"><span class="dpath">${label.length>90?label.slice(0,90)+'…':label}</span><span class="dep-pill ok">해결됨</span></div>`;
+  });
+  unresolved.forEach(p=>{
+    html += `<div class="dep-item"><span class="dpath">${p}</span><span class="dep-pill warn">첨부 필요</span>`
+         +  `<textarea data-imp="${encodeURIComponent(p)}" placeholder="이 의존성(${p}) 의 .sol 소스를 붙여넣으세요">${_attached[p]||''}</textarea></div>`;
+  });
+  list.innerHTML = html;
+  list.querySelectorAll('textarea[data-imp]').forEach(ta=>{
+    ta.addEventListener('input', ()=>{ _attached[decodeURIComponent(ta.dataset.imp)] = ta.value; });
+  });
+  return unresolved.length;
+}
+document.getElementById('c-contract').addEventListener('input', refreshDepsPanel);
+document.getElementById('resolveDeps').onclick = runResolve;
+
 document.getElementById('runCustom').onclick = runCustom;
 
 // ── 제출물 B: METHOD.md 지연 로딩 ──
