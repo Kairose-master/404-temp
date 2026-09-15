@@ -17,7 +17,10 @@ RUN python -c "import solcx; solcx.install_solc('0.8.24')"
 
 COPY agent /work/agent
 COPY harness /work/harness
+COPY api /work/api
 
 ENV TRUST404_HARNESS_DIR=/work/harness
 
-ENTRYPOINT ["python", "/work/agent/agent.py"]
+# 기본: 트랙 CLI(agent.py). `audit <경로>` 서브커맨드로 실무 감사 CLI 실행.
+#   docker run --rm -v "$PWD:/scan" IMAGE audit /scan --out /scan/audit
+ENTRYPOINT ["/work/agent/docker-entry.sh"]

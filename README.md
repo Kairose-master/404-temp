@@ -80,14 +80,21 @@ python3 agent/agent.py --contract targets/ReentrantVault/src/ReentrantVault.sol 
 
 ```bash
 python3 agent/audit.py <파일|디렉터리> --out audit
-#   audit/report.md   사람용 리포트 (심각도·요약표·PoC 경로)
-#   audit/report.json 기계용 (CI 연동)
+#   audit/report.md    사람용 리포트 (심각도·SWC/CWE·요약표·수정 가이드·PoC 경로)
+#   audit/report.json  기계용
+#   audit/report.sarif SARIF 2.1.0 — GitHub code scanning / IDE 업로드용
 #   audit/exploits/<Contract>.sol  증명된 PoC
 # CI 게이트:  --fail-on critical   (발견 시 exit 3)
+
+# Docker (엔트리포인트 서브커맨드):
+docker build -t track04 -f agent/Dockerfile .
+docker run --rm -v "$PWD:/scan" track04 audit /scan --out /scan/audit
 ```
-엔진 전량(스캐너 7계열 템플릿 + 범용 퍼저: 호출 시퀀스 · 재진입 합성 · 다중 컨트랙트
-AMM 가격 조작(플래시론식) · 시스템 내부 플래시론 차용자)을 그대로 사용한다. 같은
-입력 + 같은 `--seed` → 같은 PoC(결정론).
+발견마다 **SWC/CWE 표준 분류 + 수정 가이드 + 소스 위치(파일:라인)**를 붙인다. 엔진
+전량(스캐너 7계열 템플릿 + 범용 퍼저: 호출 시퀀스 · 재진입 합성 · 다중 컨트랙트 AMM
+가격 조작(플래시론식) · 시스템 내부 플래시론 차용자)을 그대로 쓰며, 불변식 없이도
+자동 효과검사(자금 유출 / owner·admin 탈취 / 부채>담보)로 판정한다. 같은 입력 + 같은
+`--seed` → 같은 PoC(결정론).
 
 ## 리서치 & 대시보드
 - 취약점 분석 + 4대 공격 기법 + 최신 논문 정리: [`FINDINGS.md`](./FINDINGS.md)

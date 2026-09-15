@@ -123,6 +123,86 @@ FAMILY_KO = {
     "unprotected_init": "미보호 initializer",
 }
 
+# 계열 → 표준 분류(SWC/CWE) + 수정 가이드 + 코드 핫스팟 탐지용 토큰.
+CLASS = {
+    "reentrancy": {
+        "rule": "SWC-107", "cwe": "CWE-841", "title": "Reentrancy (재진입)",
+        "fix": "Checks-Effects-Interactions 순서 준수, nonReentrant 뮤텍스, pull-payment 패턴.",
+        "hot": r"\.call\s*\{\s*value"},
+    "access_control": {
+        "rule": "SWC-105", "cwe": "CWE-284", "title": "Missing / broken access control",
+        "fix": "특권 함수에 onlyOwner/role 접근 제어, 초기화 가드, 최소 권한, 타임락·다중서명.",
+        "hot": r"\bowner\s*=|\.call\s*\{\s*value"},
+    "integer_underflow": {
+        "rule": "SWC-101", "cwe": "CWE-191", "title": "Integer overflow / underflow",
+        "fix": "0.8+ 기본 오버플로 검사 유지, unchecked 블록은 사전 경계 검증 후에만 사용.",
+        "hot": r"unchecked"},
+    "oracle_manipulation": {
+        "rule": "TR404-ORACLE", "cwe": "CWE-345", "title": "Price oracle manipulation",
+        "fix": "TWAP·다중 오라클(Chainlink)·staleness/편차 상한·서킷 브레이커. 단일 블록 spot price 금지.",
+        "hot": r"spotPrice|getPrice|quote|reserve"},
+    "delegatecall_hijack": {
+        "rule": "SWC-112", "cwe": "CWE-829", "title": "Delegatecall to untrusted callee",
+        "fix": "신뢰된 고정 라이브러리에만 delegatecall, 프록시 저장소 레이아웃 정렬(EIP-1967).",
+        "hot": r"delegatecall"},
+    "weak_randomness": {
+        "rule": "SWC-120", "cwe": "CWE-330", "title": "Weak / predictable randomness",
+        "fix": "commit-reveal, Chainlink VRF, 미래 블록해시. 온체인 즉시 엔트로피 금지.",
+        "hot": r"block\.(timestamp|prevrandao|difficulty|number)|blockhash"},
+    "unprotected_init": {
+        "rule": "SWC-118", "cwe": "CWE-665", "title": "Unprotected initializer",
+        "fix": "initializer 가드(require(!initialized))/_disableInitializers(), 배포 즉시 초기화.",
+        "hot": r"initialize|\binit\b"},
+    "flashloan": {
+        "rule": "TR404-FLASHLOAN", "cwe": "CWE-841", "title": "Flash-loan-enabled privilege",
+        "fix": "지분/잔액 기반 권한은 스냅샷(과거 블록)·시간가중으로. 단일 트랜잭션 잔액 신뢰 금지.",
+        "hot": r"flash|balanceOf"},
+    "amm": {
+        "rule": "TR404-ORACLE", "cwe": "CWE-345", "title": "Multi-contract AMM price manipulation",
+        "fix": "TWAP·외부 오라클·거래 슬리피지/편차 상한. 얇은 풀의 즉시 준비금 신뢰 금지.",
+        "hot": r"swap|reserve|quote|spotPrice"},
+    "generic": {
+        "rule": "TR404-EXPLOIT", "cwe": "CWE-284", "title": "Exploitable asset loss / privilege change",
+        "fix": "관찰된 자산 손실·권한 변경 경로를 재현 PoC로 확인 후 근본 원인(접근제어/CEI/검증)을 수정.",
+        "hot": r"\.call\s*\{\s*value|\bowner\s*=|\badmin\s*="},
+}
+
+
+def classify(strategy, family_hint=None):
+    """전략/계열 라벨을 표준 분류로 매핑한다."""
+    s = strategy or ""
+    if s.startswith("amm-manip"):
+        return CLASS["amm"]
+    if s.startswith("flashloan"):
+        return CLASS["flashloan"]
+    if s.startswith("reentrancy"):
+        return CLASS["reentrancy"]
+    base = s.split(" ")[0].split(":")[0]
+    if base in CLASS:
+        return CLASS[base]
+    if family_hint in CLASS:
+        return CLASS[family_hint]
+    return CLASS["generic"]
+
+
+def find_location(eng, src, contract, cls):
+    """SARIF 위치용: 컨트랙트 선언 라인과, 계열 핫스팟 토큰이 처음 나오는 라인."""
+    lines = src.splitlines()
+    decl = 1
+    for i, ln in enumerate(lines, 1):
+        if re.search(r"\bcontract\s+" + re.escape(contract) + r"\b", ln):
+            decl = i
+            break
+    hot = decl
+    body_start = decl
+    pat = cls.get("hot")
+    if pat:
+        for i in range(body_start - 1, len(lines)):
+            if re.search(pat, lines[i]):
+                hot = i + 1
+                break
+    return decl, hot
+
 
 def analyze_source(eng, src, contract, invariants, seed_eth, seed):
     """한 컨트랙트를 분석한다. prove_sources 를 직접 호출(엔진 전량: 템플릿+퍼저)."""
@@ -171,12 +251,18 @@ def build_report(findings, args, total_analyzed=None):
     for f in findings:
         r = f["res"]
         scores = (r.get("steps") or [{}])[0].get("scores") or {}
+        cls = f.get("cls") or CLASS["generic"]
         report["findings"].append({
             "contract": f["contract"],
             "file": f["file"],
+            "line": f.get("line"),
             "severity": f["severity"],
             "proven": bool(r.get("proven")),
             "strategy": r.get("strategy"),
+            "rule": cls["rule"],
+            "cwe": cls["cwe"],
+            "title": cls["title"],
+            "remediation": cls["fix"],
             "broken": r.get("firstViolated") or "",
             "evidence": f["evidence"],
             "drained_eth": f.get("drained_eth"),
@@ -207,29 +293,31 @@ def render_md(report):
              f"(🟥 {cc['CRITICAL']} · 🟧 {cc['HIGH']})")
     L.append(f"- 휴리스틱 플래그(미증명): {s['heuristic_flags']} · 정상: {s['clean']}")
     L.append("")
-    L.append("| 컨트랙트 | 심각도 | 판정 | 계열/전략 | 근거 |")
-    L.append("|---|---|---|---|---|")
+    L.append("| 컨트랙트 | 심각도 | 판정 | 계열/전략 | SWC / CWE | 근거 |")
+    L.append("|---|---|---|---|---|---|")
     def sev_key(f): return (-SEV_ORDER.get(f["severity"], 0), not f["proven"])
     for f in sorted(report["findings"], key=sev_key):
         verdict = "PROVEN" if f["proven"] else ("휴리스틱" if f["severity"] == "MEDIUM" else "clean")
         strat = f["strategy"] or (", ".join(f["scanner_scores"].keys()) or "—")
         ev = (f["evidence"] or "").replace("|", "\\|")
-        L.append(f"| `{f['contract']}` | {badge.get(f['severity'],f['severity'])} | {verdict} | {strat} | {ev} |")
+        L.append(f"| `{f['contract']}` | {badge.get(f['severity'],f['severity'])} | {verdict} | {strat} | {f['rule']} · {f['cwe']} | {ev} |")
     L.append("")
     proven = [f for f in report["findings"] if f["proven"]]
     if proven:
         L.append("## 증명된 취약점 상세")
         L.append("")
         for i, f in enumerate(sorted(proven, key=sev_key), 1):
-            L.append(f"### {i}. `{f['contract']}` — {badge.get(f['severity'],f['severity'])}")
+            L.append(f"### {i}. `{f['contract']}` — {f['title']} — {badge.get(f['severity'],f['severity'])}")
             L.append("")
-            L.append(f"- 파일: `{f['file']}`")
+            L.append(f"- 위치: `{f['file']}:{f.get('line')}`")
+            L.append(f"- 분류: **{f['rule']} · {f['cwe']}**")
             L.append(f"- 전략: **{f['strategy']}** · 모드: {f['mode']}")
             L.append(f"- 깨진 속성/효과: **{f['broken']}**")
             if f.get("drained_eth") is not None:
                 L.append(f"- 관찰된 자금 이동: **{f['drained_eth']} ETH**")
             if f.get("poc_file"):
                 L.append(f"- PoC: `{f['poc_file']}`")
+            L.append(f"- 수정 가이드: {f['remediation']}")
             L.append("")
     heur = [f for f in report["findings"] if (not f["proven"]) and f["severity"] == "MEDIUM"]
     if heur:
@@ -242,6 +330,53 @@ def render_md(report):
     L.append("_모든 PoC는 격리된 in-memory EVM(네트워크 차단)에서 방어 연구·자동 검증"
              " 목적으로만 실행됩니다._")
     return "\n".join(L) + "\n"
+
+
+def render_sarif(report):
+    """SARIF 2.1.0 — GitHub code scanning / IDE 로 바로 업로드 가능."""
+    sev_level = {"CRITICAL": "error", "HIGH": "error", "MEDIUM": "warning", "LOW": "note", "INFO": "note"}
+    sec_sev = {"CRITICAL": "9.0", "HIGH": "7.5", "MEDIUM": "5.0", "LOW": "3.0", "INFO": "1.0"}
+    rules = {}
+    results = []
+    for f in report["findings"]:
+        rid = f["rule"]
+        if rid not in rules:
+            rules[rid] = {
+                "id": rid,
+                "name": f["title"].replace(" ", ""),
+                "shortDescription": {"text": f["title"]},
+                "fullDescription": {"text": f["title"] + " — " + f["remediation"]},
+                "helpUri": ("https://swcregistry.io/docs/" + rid) if rid.startswith("SWC-")
+                           else "https://cwe.mitre.org/data/definitions/" + f["cwe"].split("-")[-1] + ".html",
+                "help": {"text": f["remediation"]},
+                "properties": {"tags": ["security", f["cwe"]], "security-severity": sec_sev.get(f["severity"], "5.0")},
+            }
+        uri = f["file"].replace("\\", "/")
+        results.append({
+            "ruleId": rid,
+            "level": sev_level.get(f["severity"], "warning"),
+            "message": {"text": f"[{f['severity']}] {f['contract']}: {f['title']} — "
+                                + (f["evidence"] or f["broken"] or "")
+                                + (f"  (PoC: {f['poc_file']})" if f.get("poc_file") else "")},
+            "locations": [{"physicalLocation": {
+                "artifactLocation": {"uri": uri},
+                "region": {"startLine": max(1, int(f.get("line") or 1))}}}],
+            "properties": {"proven": f["proven"], "strategy": f["strategy"], "cwe": f["cwe"],
+                           "severity": f["severity"]},
+        })
+    return {
+        "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": {"driver": {
+                "name": "TRUST404-ExploitProver",
+                "informationUri": "https://trust404-prover.vercel.app",
+                "version": report["version"],
+                "rules": list(rules.values()),
+            }},
+            "results": results,
+        }],
+    }
 
 
 def gather_files(path):
@@ -302,9 +437,15 @@ def main(argv=None):
             if res.get("proven") and res.get("exploit_src"):
                 poc_file = str(outdir / "exploits" / f"{c}.sol")
                 Path(poc_file).write_text(res["exploit_src"], encoding="utf-8")
+            scores = (res.get("steps") or [{}])[0].get("scores") or {}
+            pos = {k: v for k, v in scores.items() if v > 0}
+            fam_hint = max(pos, key=pos.get) if pos else None
+            cls = classify(res.get("strategy"), fam_hint)
+            decl_ln, hot_ln = find_location(eng, src, c, cls)
             findings.append({"contract": c, "file": str(fp), "severity": sev,
                              "evidence": evidence, "res": res, "poc_file": poc_file,
-                             "drained_eth": drained})
+                             "drained_eth": drained, "cls": cls,
+                             "line": hot_ln, "decl_line": decl_ln})
 
     if not args.include_safe:
         findings_out = [f for f in findings if not (f["severity"] == "INFO" and not f["res"].get("proven"))]
@@ -315,6 +456,7 @@ def main(argv=None):
     report = build_report(shown, args, total_analyzed=len(findings))
     (outdir / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     (outdir / "report.md").write_text(render_md(report), encoding="utf-8")
+    (outdir / "report.sarif").write_text(json.dumps(render_sarif(report), ensure_ascii=False, indent=2), encoding="utf-8")
 
     s = report["summary"]
     print(f"analyzed={s['contracts_analyzed']} proven={s['proven_vulnerabilities']} "
