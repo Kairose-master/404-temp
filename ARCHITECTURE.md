@@ -1,5 +1,8 @@
 # TRUST404 엔진 아키텍처 강화안 (v0.3)
 
+> 트랙 제출 입구는 [`README.md`](./README.md) · [`METHOD.md`](./METHOD.md) 다.
+> 이 문서는 엔진 진화 로그다. 채점 칸이 아니다.
+
 이 문서는 `docs/references.md` · `FINDINGS.md` 에 모아 둔 도구/논문을 **직접 읽고**
 현재 코드에 대조해 내린 강화안이다. v0.2 는 레벨 솔버를 capability 로 일반화했다.
 v0.3 은 그 위에 **1 profit · 2 HKG · 3 공개벤치 · 4 월드 모델** 을 코드로 넣는다.

@@ -1,5 +1,8 @@
 # 아직 안 닫힌 프론티어
 
+> 트랙 제출 입구가 아니다. 채점은 [`README.md`](../README.md) · [`METHOD.md`](../METHOD.md).
+> 이 문서는 METHOD §6 한계의 확장 노트다.
+
 2025–2026 문헌(A1, PoCo, ReX, EvoPoC, Verite, SmartFuzz, EVMbench, SCONE/Mythos,
 软件学报 2026 DeFi 서베이, Smart-Target)이 **실행 익스플로잇**을 주전장으로
 옮겼다. 이 문서는 그 논문들이 *풀었다고 주장하는 것*과, 코드에 방금 넣은
@@ -14,8 +17,14 @@
 | 3 | 공개 벤치 | `trust404/benches.py` `benches/` | 어댑터 + 로컬 클래스 픽스처. 미첨부 데이터셋은 NOT_ATTACHED | VERITE/SCONE/EVMbench 점수 자체 (트리 없음) |
 | 4 | 월드 모델 | `trust404/world.py` | 한 컴파일 유닛의 N 컨트랙트를 시퀀스로 접어 `run(address)` 에 넣음 | 교차 프로토콜, 교차 체인, 피해자 선행 트랜잭션 |
 
-프론티어 픽스처는 `benches/fixtures/` 에 있다. `intended_arb` 가 이 문서의
-핵심 반례다.
+프론티어 픽스처는 `benches/fixtures/` 에 있다. `intended_arb` 가 순수 반례고,
+**한 프로토콜에 두 표면이 같이 있는 작업 예제**는
+[`examples/frontier/DualSurface.sol`](../examples/frontier/DualSurface.sol) 이다.
+
+```
+swap0to1()  INTENDED_PATH   불변식 유지, ETH 가 호출자에게 이동할 수 있음
+withdraw()  THEFT           CEI 재진입, vaultSolvent 깨짐
+```
 
 ---
 

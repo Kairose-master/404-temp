@@ -1,0 +1,18 @@
+{
+  "schema": "trust404.track04.manifest/0.1",
+  "target": {
+    "name": "DualSurface",
+    "src": "src/DualSurface.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+  },
+  "deploy": { "mode": "local", "constructor_args": [], "value_wei": "10000000000000000000" },
+  "determinism": { "block_number": 21000000, "block_timestamp": 1735689600, "seed": 7 },
+  "invariants": { "contract": "Invariants.sol", "predicates": ["vaultSolvent", "ammBacked"] },
+  "frontier": {
+    "expect": "theft",
+    "also": "intended_path",
+    "class": "dual-surface",
+    "why": "swap0to1 is the protocol; withdraw CEI is the bug. Same ETH pot."
+  }
+}

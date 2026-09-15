@@ -10,11 +10,9 @@
   0) llm      — (선택) 로컬/원격 LLM 초안 1개
   1) template — 정적 스코어 상위 계열부터 결정론 템플릿 PoC
   2) synth    — 재진입/AMM/플래시론/스토리지/프록시/다중블록/스토리지충돌/그리핑DoS/콜백
-                + **계열 게이트**(capability IR). Ethernaut/DVD 레벨 솔버는 이름이 아니라
-                `gasleft_modulo`·`unpermissioned_callback` 같은 태그로 발화한다.
-                실패 후보는 critique 로 LLM 재시도(PoCo/A1). 엔진 패키지: `trust404/`.
-                강화안: [`ARCHITECTURE.md`](./ARCHITECTURE.md)
-  3) fuzz     — 범용 호출 시퀀스 탐색(SliSE 류 슬라이싱 우선순위) — 미공개 타깃 일반화 축
+                + **계열 게이트**(capability IR). Ethernaut/DVD 솔버는 타깃 이름이
+                아니라 `gasleft_modulo`·`unpermissioned_callback` 같은 태그로 발화.
+  3) fuzz     — 범용 호출 시퀀스 탐색 — 미공개 타깃 일반화 축
 ```
 
 각 후보는 하네스 `_prove()` 를 재현한 검증기(`verify.py`)로 **실제 불변식이 깨지는지**
@@ -110,6 +108,8 @@ LLM 은 **선택적 가속**이다. 키가 있으면 `claude-sonnet-5`, `tempera
   (다른 슬롯의 권한 변수는 오프셋 조정 필요), 약한 난수는 소스의 엔트로피 식이
   블록/`msg` 글로벌만 참조할 때 복제가 유효하다(내부 상태를 섞으면 얕게만 시도).
   initializer는 무인자 또는 단일 address 인자 형태를 지원한다.
+- 트랙의 PROVEN 은 **불변식 위반**이다. 수익이 나와도 불변식이 유지되면 미증명.
+  (의도된 스왑 vs 도난 같은 라벨 문제는 채점 밖. 노트만: [`docs/FRONTIER.md`](./docs/FRONTIER.md))
 
 ---
 
