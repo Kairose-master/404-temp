@@ -131,5 +131,26 @@
     "feature": "metamorphic",
     "provider": "metamorphic",
     "origin": "CREATE2 + selfdestruct same address"
+  },
+  {
+    "file": "CommitReveal.sol",
+    "contract": "CommitReveal",
+    "feature": "commit_reveal",
+    "provider": "commit_reveal",
+    "origin": "commit then later block reveal"
+  },
+  {
+    "file": "ExternalErc.sol",
+    "contract": "ExternalDesk",
+    "feature": "external_erc",
+    "provider": "external_erc",
+    "origin": "IERC20/4626 + hardcoded Uni router, no sibling source"
+  },
+  {
+    "file": "MakeAddrVictim.sol",
+    "contract": "PullVault",
+    "feature": "make_addr_victim",
+    "provider": null,
+    "origin": "forge-std makeAddr — verifier derives keccak256(name)"
   }
 ]

@@ -159,6 +159,10 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
         _apply_world_txs(w3, arts, taddr, helpers_addr, manifest, acct)
     except Exception:
         pass
+    try:
+        _apply_derived_eoas(w3, et, taddr, target_src, extra_sources)
+    except Exception:
+        pass
 
     before = inv.functions.checkAll(taddr).call()
     if before[0] is not True:
@@ -346,6 +350,59 @@ def _apply_world_txs(w3, arts, taddr, helpers, manifest, acct0):
             "gas": 2_000_000,
         })
         w3.eth.wait_for_transaction_receipt(tx)
+
+
+def _apply_derived_eoas(w3, et, taddr, target_src, extra_sources):
+    """Register Foundry makeAddr keys and approve the target as those EOAs.
+
+    No cheatcode: a real signed tx from keccak256(name). Only works when
+    eth_account is installed (agent extras). Silent no-op in unit tests.
+    """
+    from trust404.eoa import derived_accounts, make_addr_names
+    blobs = [target_src or ""] + list((extra_sources or {}).values())
+    names = []
+    for b in blobs:
+        names.extend(make_addr_names(b))
+    if not names:
+        return
+    accts = derived_accounts(*blobs)
+    token_abi = [{
+        "type": "function", "name": "approve",
+        "inputs": [{"name": "s", "type": "address"}, {"name": "n", "type": "uint256"}],
+        "outputs": [{"type": "bool"}],
+    }, {
+        "type": "function", "name": "token",
+        "inputs": [], "outputs": [{"type": "address"}],
+        "stateMutability": "view",
+    }]
+    tok = taddr
+    try:
+        t = w3.eth.contract(address=taddr, abi=token_abi)
+        tok = t.functions.token().call()
+    except Exception:
+        tok = taddr
+    for _name, addr, key in accts:
+        try:
+            et.add_account(key)
+        except Exception:
+            try:
+                et.add_account(key[2:] if key.startswith("0x") else key)
+            except Exception:
+                continue
+        try:
+            w3.eth.send_transaction({
+                "from": w3.eth.accounts[0], "to": addr, "value": 10**18, "gas": 21000,
+            })
+        except Exception:
+            pass
+        try:
+            c = w3.eth.contract(address=tok, abi=token_abi)
+            tx = c.functions.approve(taddr, 2**256 - 1).transact({
+                "from": addr, "gas": 200_000,
+            })
+            w3.eth.wait_for_transaction_receipt(tx)
+        except Exception:
+            pass
 
 
 # ── forge 검증기(선택) ───────────────────────────────────────────────────────
