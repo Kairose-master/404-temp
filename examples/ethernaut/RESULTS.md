@@ -8,7 +8,7 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 
 멀티버전 solc(0.6/0.7/0.8) in-memory EVM에서 동적으로 증명한다.
 
-## 결과 (26 자동 증명)
+## 결과 (27 자동 증명)
 
 | 레벨 | 판정 | 전략 | 분류 | 근거 |
 |---|---|---|---|---|
@@ -38,9 +38,11 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 | Alien Codex | ✅ PROVEN | **array-underflow:revise** | SWC-136 | 동적배열 length 언더플로 → slot0(owner) 임의 기록 |
 | Dex | ✅ PROVEN | **dex-drain:swap** | TR404-ORACLE | 스팟가격 반올림 반복 스왑으로 풀 소진 |
 | Dex Two | ✅ PROVEN | **dex-drain:swap** | TR404-ORACLE | 토큰 미검증 swap 으로 풀 소진 |
+| Good Samaritan | ✅ PROVEN | **good-samaritan:requestDonation** | CWE-807 | 커스텀 에러 catch → transferRemainder 전액 인출 |
 
-Delegation 파일은 프록시 본체와 라이브러리 두 컨트랙트를 모두 증명해 총 17개 컨트랙트
-정탐(Preservation 의 LibraryContract 헬퍼만 단독으로는 비취약이라 제외).
+**공개 The Ethernaut 레벨 26종을 자동 증명**한다(위 표; Delegation 파일은 프록시 본체와
+라이브러리 두 컨트랙트를 모두 증명). 비취약 헬퍼(Preservation 의 LibraryContract,
+Dex/DexTwo 의 내부 Token ERC20)만 단독으로는 제외된다.
 
 이번에 추가된 것:
 - **콜백 반환 불일치(Elevator)**: 타깃이 외부 인터페이스(대개 `IName(msg.sender)`)의 bool
@@ -63,11 +65,10 @@ Delegation 파일은 프록시 본체와 라이브러리 두 컨트랙트를 모
   넘기며 매 블록 올바른 값으로 호출해 승리 카운터를 임계까지 올림(CoinFlip; Predict 계열 일반화).
 
 ## 아직 모델 밖 (정직한 경계)
-- **가스·바이트코드 퍼즐 / 사람 추론**: Gatekeeper 1/2/3, Magic Number, Recovery(주소 계산).
-- **그리핑/DoS·잔액증가**: Denial, Force. (King 은 이제 자동 증명 — 위 표 참조.)
-- **인터페이스/제어흐름 트릭**: Shop, Switch, GoodSamaritan. (Elevator 는 이제 자동 증명 — 위 표 참조.)
-- **더 깊은 다단계 프록시**: Puzzle Wallet, Motorbike.
-  (Preservation 은 이제 자동 증명 — 위 표 참조.)
+아래는 아직 자동 증명에 넣지 않은 레벨이다(작업 중):
+- **다단계 프록시/초기화**: Puzzle Wallet, Motorbike(Cancun 이후 selfdestruct 의미 변화로 벽돌화 부분적).
+- **서명/방어형**: Impersonator(ECDSA), DoubleEntryPoint(탐지 봇 구축형 — 익스플로잇이 아님).
+- **기타 다단계**: Gatekeeper Three, Stake, Magic Animal Carousel.
 
 판정 기준은 **온체인 관찰 효과**(자금 유출 / owner·admin 탈취 / 부채>담보 / 상태 플래그
 반전 / 토큰 잔액 인플레 / 예측 카운터 / 불변식 위반)다. 증명 가능한 것만 PROVEN 으로

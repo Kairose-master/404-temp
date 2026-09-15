@@ -322,6 +322,8 @@ def classify(strategy, family_hint=None):
         return CLASS["storage"]
     if s.startswith("dex-drain") or s.startswith("dex2-drain"):
         return CLASS["amm"]
+    if s.startswith("good-samaritan"):
+        return CLASS["callback_inconsistency"]
     if s.startswith("amm-manip"):
         return CLASS["amm"]
     if s.startswith("flashloan"):

