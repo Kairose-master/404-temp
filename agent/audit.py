@@ -318,6 +318,10 @@ def classify(strategy, family_hint=None):
         return CLASS["code_puzzle"]
     if s.startswith("higher-order") or s.startswith("switch"):
         return CLASS["access_gate_bypass"]
+    if s.startswith("array-underflow"):
+        return CLASS["storage"]
+    if s.startswith("dex-drain"):
+        return CLASS["amm"]
     if s.startswith("amm-manip"):
         return CLASS["amm"]
     if s.startswith("flashloan"):

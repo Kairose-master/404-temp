@@ -8,7 +8,7 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 
 멀티버전 solc(0.6/0.7/0.8) in-memory EVM에서 동적으로 증명한다.
 
-## 결과 (23 자동 증명)
+## 결과 (25 자동 증명)
 
 | 레벨 | 판정 | 전략 | 분류 | 근거 |
 |---|---|---|---|---|
@@ -35,6 +35,8 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 | Recovery | ✅ PROVEN | fuzz(destroy) | SWC-106 | 무방비 selfdestruct 로 잃어버린 컨트랙트 자금 탈취 |
 | Switch | ✅ PROVEN | **switch:flipSwitch** | SWC-105 | 고정 오프셋(68) 셀렉터 검사를 calldata 배치로 우회 |
 | HigherOrder | ✅ PROVEN | **higher-order:registerTreasury** | SWC-105 | uint8 파라미터를 원시 calldata 로 초과 기록 |
+| Alien Codex | ✅ PROVEN | **array-underflow:revise** | SWC-136 | 동적배열 length 언더플로 → slot0(owner) 임의 기록 |
+| Dex | ✅ PROVEN | **dex-drain:swap** | TR404-ORACLE | 스팟가격 반올림 반복 스왑으로 풀 소진 |
 
 Delegation 파일은 프록시 본체와 라이브러리 두 컨트랙트를 모두 증명해 총 17개 컨트랙트
 정탐(Preservation 의 LibraryContract 헬퍼만 단독으로는 비취약이라 제외).
