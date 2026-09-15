@@ -252,12 +252,12 @@ FIX_DIFF = {
 def classify(strategy, family_hint=None):
     """전략/계열 라벨을 표준 분류로 매핑한다."""
     s = strategy or ""
+    if s.startswith("proxy") or s.startswith("storage-collision"):
+        return CLASS["delegatecall_hijack"]
     if s.startswith("storage"):
         return CLASS["storage"]
     if s.startswith("multiblock"):
         return CLASS["weak_randomness"]
-    if s.startswith("proxy"):
-        return CLASS["delegatecall_hijack"]
     if s.startswith("amm-manip"):
         return CLASS["amm"]
     if s.startswith("flashloan"):

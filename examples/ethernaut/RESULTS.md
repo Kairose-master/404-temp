@@ -8,7 +8,7 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 
 멀티버전 solc(0.6/0.7/0.8) in-memory EVM에서 동적으로 증명한다.
 
-## 결과 (10 자동 증명, ~8초)
+## 결과 (11 자동 증명, ~9초)
 
 | 레벨 | 판정 | 전략 | 분류 | 근거 |
 |---|---|---|---|---|
@@ -22,10 +22,18 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 | Privacy | ✅ PROVEN | storage:unlock(bytes16) | SWC-136 | private 슬롯 key 읽어 잠금 해제 |
 | Token | ✅ PROVEN | fuzz(transfer) | SWC-101 | 정수 언더플로 토큰 잔액 인플레 |
 | CoinFlip | ✅ PROVEN | **multiblock:flip (다중 블록 러너)** | SWC-120 | 블록 엔트로피 예측 → 10연승 |
+| Preservation | ✅ PROVEN | **storage-collision:setFirstTime (2단계 delegatecall)** | SWC-112 | 라이브러리 포인터 덮어쓰기 → owner 탈취 |
 | King | ⛔ 모델 밖 | — | — | 재등극 차단(그리핑/DoS) |
 | Elevator | ⛔ 모델 밖 | — | — | 인터페이스 상태 트릭 |
 
+레벨 기준 10/12 자동 증명(King·Elevator만 모델 밖). Delegation 파일은 프록시 본체와
+라이브러리 두 컨트랙트를 모두 증명한다.
+
 이번에 추가된 것:
+- **delegatecall 스토리지 충돌 2단계(Preservation)**: 타깃이 상태변수에 저장된 라이브러리
+  주소로 `delegatecall(setTime(uint256))` 하는 구조를 탐지한다. 1단계로 공격 라이브러리를
+  가리키도록 라이브러리 포인터(슬롯)를 덮어쓰고, 2단계로 그 라이브러리가 특권 슬롯(owner)을
+  `msg.sender` 로 세팅한다. 타깃+공격 라이브러리를 함께 컴파일·배선해 owner 탈취를 관찰한다.
 - **2-컨트랙트 배선**: 타깃 생성자가 형제 컨트랙트 주소를 받으면(`Delegation(delegate)`),
   형제를 배포·배선한 뒤 fallback→delegatecall calldata 셀렉터로 성립(Delegation 프록시 본체).
 - **다중 블록 러너**: 블록 엔트로피 결과식을 복제한 공격 컨트랙트를 배포하고, 블록을
@@ -35,7 +43,8 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 - **가스·바이트코드 퍼즐 / 사람 추론**: Gatekeeper 1/2/3, Magic Number, Recovery(주소 계산).
 - **그리핑/DoS·잔액증가**: King, Denial, Force.
 - **인터페이스/제어흐름 트릭**: Elevator, Shop, Switch, GoodSamaritan.
-- **더 깊은 다단계 프록시**: Preservation(스토리지 충돌 2단계), Puzzle Wallet, Motorbike.
+- **더 깊은 다단계 프록시**: Puzzle Wallet, Motorbike.
+  (Preservation 은 이제 자동 증명 — 위 표 참조.)
 
 판정 기준은 **온체인 관찰 효과**(자금 유출 / owner·admin 탈취 / 부채>담보 / 상태 플래그
 반전 / 토큰 잔액 인플레 / 예측 카운터 / 불변식 위반)다. 증명 가능한 것만 PROVEN 으로
