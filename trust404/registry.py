@@ -124,9 +124,15 @@ PROVIDERS: List[Provider] = [
     Provider("twap_as_spot", "twap_as_spot", "synth",
              frozenset({"twap_oracle", "twap_falls_to_spot"}),
              "한 run() 안에서 스팟으로 붕괴하는 TWAP (Puppet v1/가짜 v3)"),
+    Provider("twap_window", "twap_window", "synth",
+             frozenset({"windowed_twap"}),
+             "Observation[] 윈도우: skew → warp → borrow (HEVM / phased)"),
     Provider("cross_getter_drain", "cross_getter_drain", "synth",
              frozenset({"sibling_getter", "multi_contract_unit", "address_ctor"}),
              "public getter 로 형제 컨트랙트 주소 회수 후 drain"),
+    Provider("victim_approve", "victim_approve", "synth",
+             frozenset({"victim_approve", "victim_getter"}),
+             "피해자 approve 선행 (prank / 두번째 EOA)"),
 ]
 
 _BY_FN = {p.fn_name: p for p in PROVIDERS}

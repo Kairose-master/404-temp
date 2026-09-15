@@ -17,6 +17,8 @@ from typing import Any, List, Optional, Sequence, Tuple
 
 def coerce(args: Sequence[Any], web3=None) -> list:
     """Recursively coerce manifest constructor_args to Python values."""
+    if isinstance(args, dict):
+        return args  # single struct; coerce_against_abi unpacks it
     out = []
     for a in args or []:
         out.append(_one(a, web3))
@@ -97,23 +99,6 @@ def _split_args(inner: str) -> List[str]:
     if buf:
         parts.append("".join(buf))
     return parts
-
-
-def forge_ctor(cargs: Sequence[Any]) -> Tuple[str, str]:
-    """Return (prelude solidity, argument list) for `new Target{value}(args)`.
-
-    Arrays become a local `memory` variable. Single address/uint/string
-    inline. Empty args → ("", "").
-    """
-    if not cargs:
-        return "", ""
-    prelude: List[str] = []
-    exprs: List[str] = []
-    for i, a in enumerate(cargs):
-        expr, extra = _forge_expr(a, f"_a{i}")
-        prelude.extend(extra)
-        exprs.append(expr)
-    return "\n".join(prelude), ", ".join(exprs)
 
 
 def _forge_expr(a: Any, ident: str) -> Tuple[str, List[str]]:
@@ -206,3 +191,113 @@ def load_extra_sources(manifest_path, contract_path, manifest) -> dict:
                 continue
             extras[f"src/{p.name}"] = p.read_text(encoding="utf-8")
     return extras
+
+
+def parse_structs(src: str) -> dict:
+    """Map struct name → [(type, field), ...]."""
+    s = re.sub(r"//[^\n]*", "", src or "")
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
+    out = {}
+    for m in re.finditer(r"\bstruct\s+(\w+)\s*\{([^}]*)\}", s):
+        fields = []
+        for line in m.group(2).split(";"):
+            line = re.sub(r"\b(memory|calldata|storage)\b", "", line).strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                fields.append((parts[0], parts[-1].rstrip(";")))
+        out[m.group(1)] = fields
+    return out
+
+
+def coerce_against_abi(args, abi, web3=None) -> list:
+    """Coerce JSON constructor_args using the *compiled* constructor ABI.
+
+    Tuples/structs become Python tuples (what eth_abi wants). A single
+    struct may be a JSON object or a positional list. Falls back to
+    untyped coerce if there is no constructor ABI.
+    """
+    ctor = next((e for e in (abi or []) if e.get("type") == "constructor"), None)
+    inputs = (ctor or {}).get("inputs") or []
+    if not inputs:
+        if isinstance(args, dict):
+            return [_one(v, web3) for v in args.values()]
+        return coerce(args, web3)
+    if isinstance(args, dict) and len(inputs) == 1:
+        args = [args]
+    args = list(args or [])
+    # pad / trim to ABI length
+    return [_coerce_spec(a, spec, web3) for a, spec in zip(args, inputs)]
+
+
+def _coerce_spec(val, spec, web3):
+    t = spec.get("type") or ""
+    comps = spec.get("components")
+    if t == "tuple" or (t.startswith("tuple") and not t.endswith("]") and comps):
+        return _tuple(val, comps, web3)
+    if t.endswith("[]"):
+        inner_type = t[:-2]
+        inner = {"type": inner_type, "components": comps}
+        if inner_type == "tuple" or inner_type.startswith("tuple"):
+            inner = {"type": "tuple", "components": comps}
+        return [_coerce_spec(x, inner, web3) for x in (val or [])]
+    if t.startswith("tuple[") and comps:
+        inner = {"type": "tuple", "components": comps}
+        return [_coerce_spec(x, inner, web3) for x in (val or [])]
+    return _one(val, web3)
+
+
+def _tuple(val, comps, web3):
+    comps = comps or []
+    if isinstance(val, dict):
+        vals = [val.get(c.get("name")) for c in comps]
+    else:
+        vals = list(val or [])
+    return tuple(_coerce_spec(v, c, web3) for v, c in zip(vals, comps))
+
+
+def forge_ctor(cargs: Sequence[Any], src: str = "", name: str = "") -> Tuple[str, str]:
+    """Return (prelude solidity, argument list) for `new Target{value}(args)`.
+
+    Arrays become a local `memory` variable. Structs use `Name(...)`
+    positional construction when `src` is given. Empty args → ("", "").
+    """
+    if isinstance(cargs, dict):
+        cargs = [cargs]
+    if not cargs:
+        return "", ""
+    types = parse_constructor_types(src, name) if src else []
+    structs = parse_structs(src) if src else {}
+    prelude: List[str] = []
+    exprs: List[str] = []
+    for i, a in enumerate(cargs):
+        tname = types[i] if i < len(types) else ""
+        if isinstance(a, dict) or (isinstance(a, (list, tuple)) and tname in structs):
+            expr, extra = _forge_struct(a, f"_a{i}", tname, structs)
+        else:
+            expr, extra = _forge_expr(a, f"_a{i}")
+        prelude.extend(extra)
+        exprs.append(expr)
+    return "\n".join(prelude), ", ".join(exprs)
+
+
+def _forge_struct(a, ident, tname, structs) -> Tuple[str, List[str]]:
+    fields = structs.get(tname) or []
+    if isinstance(a, dict):
+        if fields:
+            vals = [a.get(fn) for _ft, fn in fields]
+        else:
+            vals = list(a.values())
+    else:
+        vals = list(a)
+    extras: List[str] = []
+    parts: List[str] = []
+    for j, v in enumerate(vals):
+        e, x = _forge_expr(v, f"{ident}_{j}")
+        extras.extend(x)
+        parts.append(e)
+    tag = tname if tname and tname not in ("address", "uint256", "string", "bytes", "bool") else ""
+    if tag:
+        return f"{tag}({', '.join(parts)})", extras
+    return f"({', '.join(parts)})", extras

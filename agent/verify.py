@@ -142,12 +142,14 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
         _hc, haddr = deploy(arts[cname], hargs, value=_parse_decimal(str(h.get("value_wei", "0"))))
         helpers_addr[cname] = haddr
     raw_cargs = dep.get("constructor_args", [])
+    if isinstance(raw_cargs, dict):
+        raw_cargs = [raw_cargs]
     try:
-        from trust404.abi import resolve_placeholders
+        from trust404.abi import resolve_placeholders, coerce_against_abi
         raw_cargs = resolve_placeholders(raw_cargs, helpers_addr)
+        cargs = coerce_against_abi(raw_cargs, arts[target_name]["abi"], Web3)
     except Exception:
-        pass
-    cargs = _coerce_args(raw_cargs, Web3)
+        cargs = _coerce_args(raw_cargs, Web3)
     seed_wei = _parse_decimal(str(dep.get("value_wei", "0")))
 
     target, taddr = deploy(arts[target_name], cargs, value=seed_wei)
@@ -174,6 +176,14 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
 
     after = inv.functions.checkAll(taddr).call()
     proven = after[0] is False
+    if not proven:
+        try:
+            p2, a2, e2 = _phased_retry(w3, et, exp, taddr, inv, exploit_src)
+            if p2:
+                proven, after = True, a2
+                run_err = ((run_err or "") + f" phased=1 {e2}").strip()
+        except Exception as e:
+            run_err = ((run_err or "") + f" phase_err={str(e)[:80]}").strip()
     profit = None
     if measure_evm and before_att is not None:
         try:
@@ -235,6 +245,48 @@ def _parse_decimal(s):
     return int(s)
 
 
+def _phased_retry(w3, et, exp, taddr, inv, exploit_src):
+    """prepare → time_travel → finish. py-evm stand-in for HEVM warp/prank.
+
+    No-op if the exploit has no prepare(). Must not break the 12-target path.
+    """
+    fnames = {i.get("name") for i in (exp.abi or []) if i.get("type") == "function"}
+    if "prepare" not in fnames:
+        return False, None, "no-prepare"
+    acct = w3.eth.accounts[0]
+    tx = exp.functions.prepare(taddr).transact(
+        {"from": acct, "value": DEFAULT_EXPLOIT_FUNDING_WEI, "gas": 12_000_000})
+    w3.eth.wait_for_transaction_receipt(tx)
+    window = 3600
+    try:
+        from trust404.hevm import window_seconds
+        window = window_seconds(exploit_src)
+    except Exception:
+        pass
+    try:
+        latest = w3.eth.get_block("latest")
+        et.time_travel(int(latest["timestamp"]) + max(int(window), 1))
+    except Exception:
+        try:
+            et.time_travel(int(w3.eth.get_block("latest").timestamp) + max(int(window), 1))
+        except Exception:
+            pass
+    for _ in range(3):
+        try:
+            et.mine_block()
+        except Exception:
+            break
+    if "finish" in fnames:
+        tx = exp.functions.finish(taddr).transact(
+            {"from": acct, "value": DEFAULT_EXPLOIT_FUNDING_WEI, "gas": 12_000_000})
+    else:
+        tx = exp.functions.run(taddr).transact(
+            {"from": acct, "value": DEFAULT_EXPLOIT_FUNDING_WEI, "gas": 12_000_000})
+    w3.eth.wait_for_transaction_receipt(tx)
+    after = inv.functions.checkAll(taddr).call()
+    return after[0] is False, after, ""
+
+
 # ── forge 검증기(선택) ───────────────────────────────────────────────────────
 def _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest,
                   extra_sources=None):
@@ -278,7 +330,7 @@ def _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest
     cargs = dep.get("constructor_args", [])
     try:
         from trust404.abi import forge_ctor
-        prelude, ctor = forge_ctor(cargs)
+        prelude, ctor = forge_ctor(cargs, src=target_src, name=target_name)
     except Exception:
         prelude, ctor = "", ""
         if len(cargs) == 1 and isinstance(cargs[0], str) and cargs[0].startswith("0x"):

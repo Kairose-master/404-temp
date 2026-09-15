@@ -7,8 +7,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
-from trust404.abi import coerce, forge_ctor, parse_constructor_types, resolve_placeholders
+from trust404.abi import (
+    coerce, coerce_against_abi, forge_ctor, parse_constructor_types,
+    parse_structs, resolve_placeholders,
+)
 from trust404.features import extract_features
+from trust404.hevm import window_seconds
 from trust404.registry import should_run
 from trust404.synth_defi import iter_defi_families
 from trust404.world import plan_world
@@ -128,7 +132,117 @@ class SafeVaultUnchanged(unittest.TestCase):
         f = extract_features(src, "SafeVault")
         self.assertNotIn("twap_oracle", f)
         self.assertFalse(should_run("twap_as_spot", f))
+        self.assertFalse(should_run("twap_window", f))
+        self.assertFalse(should_run("victim_approve", f))
         self.assertFalse(should_run("_synth_gatekeeper_one", f))
+
+
+class StructCtor(unittest.TestCase):
+    SRC = """
+    struct Init { address owner; uint256 cap; address[] tokens; }
+    contract V {
+        constructor(Init memory cfg) payable {}
+    }
+    """
+    ABI = [{
+        "type": "constructor",
+        "inputs": [{
+            "name": "cfg", "type": "tuple",
+            "components": [
+                {"name": "owner", "type": "address"},
+                {"name": "cap", "type": "uint256"},
+                {"name": "tokens", "type": "address[]"},
+            ],
+        }],
+    }]
+
+    def test_named_object(self):
+        raw = [{
+            "owner": "0x00000000000000000000000000000000000a11ce",
+            "cap": "5",
+            "tokens": ["0x00000000000000000000000000000000000b0b00"],
+        }]
+        out = coerce_against_abi(raw, self.ABI)
+        self.assertIsInstance(out[0], tuple)
+        self.assertEqual(out[0][1], 5)
+        self.assertEqual(len(out[0][2]), 1)
+
+    def test_positional(self):
+        raw = [["0x00000000000000000000000000000000000a11ce", "5",
+                ["0x00000000000000000000000000000000000b0b00"]]]
+        out = coerce_against_abi(raw, self.ABI)
+        self.assertEqual(out[0][1], 5)
+
+    def test_parse_and_forge(self):
+        self.assertIn("Init", parse_structs(self.SRC))
+        self.assertEqual(parse_constructor_types(self.SRC, "V"), ["Init"])
+        prelude, args = forge_ctor(
+            [{"owner": "0x00000000000000000000000000000000000a11ce",
+              "cap": 5,
+              "tokens": ["0x00000000000000000000000000000000000b0b00"]}],
+            src=self.SRC, name="V")
+        self.assertIn("Init(", args)
+        self.assertIn("address[] memory", prelude)
+
+    def test_feature(self):
+        self.assertIn("struct_ctor", extract_features(self.SRC, "V"))
+
+
+class WindowedTwap(unittest.TestCase):
+    SRC = """
+    contract UniTwap {
+        struct Observation { uint32 ts; uint224 c; }
+        Observation[] public observations;
+        uint32 public period = 30 minutes;
+        function observe(uint32[] calldata secondsAgos) external view returns (int56[] memory) {}
+        function borrow(uint256 n) external {}
+        function update() external {}
+        function token() external view returns (address) { return address(0); }
+        function pool() external view returns (address) { return address(0); }
+    }
+    """
+
+    def test_feature_and_window(self):
+        f = extract_features(self.SRC, "UniTwap")
+        self.assertIn("windowed_twap", f)
+        self.assertNotIn("twap_falls_to_spot", f)
+        self.assertEqual(window_seconds(self.SRC), 30 * 60)
+        self.assertTrue(should_run("twap_window", f))
+
+    def test_synth_has_warp_and_phases(self):
+        srcs = dict(iter_defi_families(self.SRC, "UniTwap"))
+        key = next(k for k in srcs if k.startswith("twap-window"))
+        body = srcs[key]
+        self.assertIn("vm.warp", body)
+        self.assertIn("function prepare", body)
+        self.assertIn("function finish", body)
+
+
+class VictimApprove(unittest.TestCase):
+    SRC = """
+    contract Vault {
+        address public victim;
+        address public token;
+        function pull() external {
+            IERC20(token).transferFrom(victim, address(this), IERC20(token).allowance(victim, address(this)));
+        }
+    }
+    interface IERC20 {
+        function transferFrom(address,address,uint256) external returns (bool);
+        function allowance(address,address) external view returns (uint256);
+    }
+    """
+
+    def test_feature_and_synth(self):
+        f = extract_features(self.SRC, "Vault")
+        self.assertIn("victim_approve", f)
+        self.assertIn("victim_getter", f)
+        self.assertTrue(should_run("victim_approve", f))
+        labels = [l for l, _ in iter_defi_families(self.SRC, "Vault")]
+        self.assertTrue(any(l.startswith("victim-approve") for l in labels))
+        body = dict(iter_defi_families(self.SRC, "Vault"))
+        src = next(v for k, v in body.items() if k.startswith("victim-approve"))
+        self.assertIn("vm.prank", src)
 
 
 if __name__ == "__main__":
