@@ -353,6 +353,29 @@ def extract_features(src: str, name: str | None = None) -> Set[str]:
     if has(r"\.call\s*\{") and has(r"posted|pending|escrow"):
         feats.add("check_act_gap")
 
+    # ── hidden-set attack deepening (still one run()) ───────────────────
+    # Read-only reentrancy: a view reads this.balance / token.balanceOf(this)
+    # while a state-changing call is in-flight (Curve/Balancer family).
+    if (has(r"function\s+\w+\s*\([^)]*\)[^{;]*\bview\b")
+            and has(r"address\s*\(\s*this\s*\)\s*\.balance|balanceOf\s*\(\s*address\s*\(\s*this")
+            and has(r"\.call\s*\{")):
+        feats.add("readonly_reentrancy")
+        feats.add("cei_violation")
+    # ERC4626 first-depositor inflation: convertToShares uses totalAssets
+    if has(r"convertToShares|previewDeposit|totalAssets") and has(r"totalSupply"):
+        feats.add("vault_inflation")
+    # Token/NFT receiver hook used before balances are zeroed
+    if has(r"tokensReceived|onERC721Received|onERC1155Received") and has(
+            r"transfer\s*\(|safeTransfer|transferFrom"):
+        feats.add("hook_reentrancy")
+        feats.add("receiver_hook")
+    # ecrecover without nonce/deadline → replay
+    if "ecrecover" in feats and not has(r"nonce|deadline|usedHashes|played"):
+        feats.add("sig_replay")
+    # CREATE2 + selfdestruct in the same unit → metamorphic
+    if "create2_predict" in feats and "selfdestruct" in feats:
+        feats.add("metamorphic")
+
     return feats
 
 

