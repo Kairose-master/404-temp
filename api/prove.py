@@ -2052,13 +2052,31 @@ def _synth_storage_collision(name, target_src, invariants_src, manifest, scan_st
     if name not in bodies:
         return None
     tb = bodies[name]
-    # delegatecall 대상이 상태변수(slot0)이고 encodeWithSignature 로 g(uint256) 호출하는 함수 f(uint)
+    # delegatecall 대상이 상태변수(slot0)이고 g(uint256) 를 호출하는 함수 f(uint).
+    # 콜데이터 인코딩의 세 형태를 모두 지원한다:
+    #   abi.encodeWithSignature("setTime(uint256)", x)
+    #   abi.encodePacked(setTimeSignature, x)      (bytes4 constant setTimeSignature = bytes4(keccak256("setTime(uint256)")))
+    #   abi.encodeWithSelector(I.setTime.selector, x) / abi.encodeWithSelector(setTimeSignature, x)
+    def _gname_from(inner):
+        q = re.search(r'"(\w+)\s*\(', inner)          # 직접 시그니처 문자열
+        if q: return q.group(1)
+        sm = re.search(r'\.(\w+)\.selector', inner)    # I.setTime.selector
+        if sm: return sm.group(1)
+        idm = re.search(r'([A-Za-z_]\w*)', inner)      # 상수/변수 → 정의에서 해석
+        if idm:
+            sig = idm.group(1)
+            cm = re.search(re.escape(sig) + r'\s*=\s*bytes4\s*\(\s*keccak256\s*\(\s*"(\w+)\s*\(', tb)
+            if cm: return cm.group(1)
+        return None
     f = None; libvar = None; gname = None
     for fn in _functions(tb):
-        m = re.search(r"(\w+)\s*\.\s*delegatecall\s*\(\s*abi\.encodeWithSignature\s*\(\s*\"(\w+)\(", fn["body"])
+        m = re.search(r"(\w+)\s*\.\s*delegatecall\s*\(\s*abi\.encode(?:WithSignature|WithSelector|Packed)\s*\(([^;]*)",
+                      fn["body"])
         if m and any(a[0].startswith("uint") for a in fn["args"]):
-            f, libvar, gname = fn["name"], m.group(1), m.group(2)
-            break
+            g = _gname_from(m.group(2))
+            if g:
+                f, libvar, gname = fn["name"], m.group(1), g
+                break
     if not f:
         return None
     if _slot_index(tb, libvar) != 0:   # 라이브러리 포인터가 slot0 이어야 충돌 성립
