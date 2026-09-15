@@ -210,6 +210,14 @@ CLASS = {
         "rule": "SWC-105", "cwe": "CWE-284", "title": "Token lockup bypass via transferFrom",
         "fix": "락업/제한을 transfer 뿐 아니라 transferFrom(그리고 _update/_transfer 훅 등 모든 이전 경로)에 일관 적용.",
         "hot": r"transferFrom"},
+    "access_gate_bypass": {
+        "rule": "SWC-105", "cwe": "CWE-284", "title": "Access gate bypass (msg.sender/extcodesize/tx.origin)",
+        "fix": "extcodesize·tx.origin·msg.sender 기반 게이트는 우회 가능(생성자 호출·7702 등). 실제 권한/서명 기반 검증을 쓸 것.",
+        "hot": r"extcodesize|tx\.origin|keccak256"},
+    "code_puzzle": {
+        "rule": "TR404-CODEGEN", "cwe": "CWE-1188", "title": "Attacker-supplied code/solver accepted",
+        "fix": "외부에서 등록하는 코드/solver 의 동작·크기·불변식을 검증하거나 신뢰 경계를 명확히 할 것.",
+        "hot": r"solver|create\s*\("},
     "generic": {
         "rule": "TR404-EXPLOIT", "cwe": "CWE-284", "title": "Exploitable asset loss / privilege change",
         "fix": "관찰된 자산 손실·권한 변경 경로를 재현 PoC로 확인 후 근본 원인(접근제어/CEI/검증)을 수정.",
@@ -304,6 +312,10 @@ def classify(strategy, family_hint=None):
         return CLASS["lockup_bypass"]
     if s.startswith("gas-griefing"):
         return CLASS["griefing_dos"]
+    if s.startswith("gatekeeper"):
+        return CLASS["access_gate_bypass"]
+    if s.startswith("magic-number"):
+        return CLASS["code_puzzle"]
     if s.startswith("amm-manip"):
         return CLASS["amm"]
     if s.startswith("flashloan"):

