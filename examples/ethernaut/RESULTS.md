@@ -8,7 +8,7 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 
 멀티버전 solc(0.6/0.7/0.8) in-memory EVM에서 동적으로 증명한다.
 
-## 결과 (27 자동 증명)
+## 결과 (29 자동 증명)
 
 | 레벨 | 판정 | 전략 | 분류 | 근거 |
 |---|---|---|---|---|
@@ -39,8 +39,10 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 | Dex | ✅ PROVEN | **dex-drain:swap** | TR404-ORACLE | 스팟가격 반올림 반복 스왑으로 풀 소진 |
 | Dex Two | ✅ PROVEN | **dex-drain:swap** | TR404-ORACLE | 토큰 미검증 swap 으로 풀 소진 |
 | Good Samaritan | ✅ PROVEN | **good-samaritan:requestDonation** | CWE-807 | 커스텀 에러 catch → transferRemainder 전액 인출 |
+| Gatekeeper Three | ✅ PROVEN | **gatekeeper-three / unprotected_init** | SWC-105 | construct0r owner 선점 + 3게이트 우회 |
+| Stake | ✅ PROVEN | **stake-accounting:StakeWETH** | SWC-105 | 가짜 WETH 회계 버그로 실 ETH 인출 |
 
-**공개 The Ethernaut 레벨 26종을 자동 증명**한다(위 표; Delegation 파일은 프록시 본체와
+**공개 The Ethernaut 레벨 28종을 자동 증명**한다(위 표; Delegation 파일은 프록시 본체와
 라이브러리 두 컨트랙트를 모두 증명). 비취약 헬퍼(Preservation 의 LibraryContract,
 Dex/DexTwo 의 내부 Token ERC20)만 단독으로는 제외된다.
 
@@ -68,7 +70,7 @@ Dex/DexTwo 의 내부 Token ERC20)만 단독으로는 제외된다.
 아래는 아직 자동 증명에 넣지 않은 레벨이다(작업 중):
 - **다단계 프록시/초기화**: Puzzle Wallet, Motorbike(Cancun 이후 selfdestruct 의미 변화로 벽돌화 부분적).
 - **서명/방어형**: Impersonator(ECDSA), DoubleEntryPoint(탐지 봇 구축형 — 익스플로잇이 아님).
-- **기타 다단계**: Gatekeeper Three, Stake, Magic Animal Carousel.
+- **기타 다단계**: Magic Animal Carousel.
 
 판정 기준은 **온체인 관찰 효과**(자금 유출 / owner·admin 탈취 / 부채>담보 / 상태 플래그
 반전 / 토큰 잔액 인플레 / 예측 카운터 / 불변식 위반)다. 증명 가능한 것만 PROVEN 으로
