@@ -92,16 +92,17 @@ LLM 은 **선택적 가속**이다. 키가 있으면 `claude-sonnet-5`, `tempera
   함수라 실행마다 동일하다.
 
 ## 6. 한계
-- 오라클: 스팟 조작과 **같은 블록에서 스팟으로 붕괴하는 TWAP**(consult/twap 가
-  현재 준비금 비율)은 합성한다. 저장된 Observation[] 윈도우를 여러 블록에 걸쳐
-  채워야 하는 진짜 시간가중 TWAP 는 하네스가 `run(address)` 한 방이라 워프를
-  못 넣는다 — 그 경우만 미탐.
-- 생성자 인자는 JSON 배열·문자열·bytes·address[] 를 ABI 로 인코딩한다.
-  `$Token` 플레이스홀더는 `deploy.helpers` 로 먼저 배포한 주소를 끼운다.
-  Setup.s.sol 이 있으면 형제를 같이 컴파일한다. 이전의 "무인자/단일 address"
-  제한은 닫았다.
+- 오라클: 스팟 조작과 **같은 블록에서 스팟으로 붕괴하는 TWAP**은 합성한다.
+  저장된 Observation[] 윈도우는 `run()` 안에서 Foundry HEVM `warp` 로 채운다
+  (공식 하네스에서 치트코드 주소가 Setup과 같이 열린다). py-evm 는
+  `prepare → time_travel → finish` 로 같은 순서를 재현한다.
+- 생성자 인자는 JSON 배열·문자열·bytes·address[]·**struct/tuple** 을
+  컴파일된 constructor ABI 로 인코딩한다. `$Token` 플레이스홀더는
+  `deploy.helpers` 로 먼저 배포한 주소를 끼운다. Setup.s.sol 이 있으면
+  형제를 같이 컴파일한다.
 - 교차 컨트랙트: 같은 컴파일 유닛 + `token()`/`pool()`/`oracle()` 게터로 형제를
-  찾아 `run(address)` 안에 접는다. 피해자 선행 트랜잭션·교차 체인은 여전히 밖.
+  찾아 `run(address)` 안에 접는다. 피해자 `approve` 선행은 `vm.prank(victim)`
+  (forge) / 두번째 EOA (py-evm). 교차 체인·다른 키의 피해자 선행 트랜잭션은 밖.
 - 여러 취약점이 조합돼야 성립하는 공격, 다중 트랜잭션/다중 블록 상태가 필요한
   공격은 단일 `run()` 템플릿으로는 얕게만 시도한다.
 - 검증기는 하네스 `_prove` 의 단일 호출 의미를 재현한다. 하네스가 향후 다중 호출·

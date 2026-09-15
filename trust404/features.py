@@ -287,6 +287,19 @@ def extract_features(src: str, name: str | None = None) -> Set[str]:
         if not stored_window:
             feats.add("twap_falls_to_spot")
             feats.add("spot_price")
+        else:
+            feats.add("windowed_twap")
+
+    # Victim must approve first — only when a victim/user is named, not every ERC20.
+    if has(r"function\s+(victim|user|alice|holder|player)\s*\(") or has(
+            r"address\s+(public\s+)?(victim|user|alice|holder)\b"):
+        feats.add("victim_getter")
+        if has(r"transferFrom|allowance"):
+            feats.add("victim_approve")
+
+    # constructor(Struct memory x)
+    if has(r"\bstruct\s+\w+") and has(r"constructor\s*\(\s*\w+\s+(memory|calldata)"):
+        feats.add("struct_ctor")
 
     return feats
 

