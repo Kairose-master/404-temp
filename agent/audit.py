@@ -332,6 +332,8 @@ def classify(strategy, family_hint=None):
         return CLASS["access_control"]
     if s.startswith("magic-carousel"):
         return CLASS["storage"]
+    if s.startswith("commitment-collision"):
+        return CLASS["access_control"]
     if s.startswith("good-samaritan"):
         return CLASS["callback_inconsistency"]
     if s.startswith("eip7702"):

