@@ -97,26 +97,33 @@ def scan_target(contract_src, invariants_src, manifest):
     sig = {"functions": fns}
 
     # ── Reentrancy ────────────────────────────────────────────────────────────
-    # external call sending value, and state zeroed/decremented AFTER the call
-    # (CEI violation), without a reentrancy mutex.
+    # A function that sends value to the caller and does NOT clear the caller's
+    # ledger entry BEFORE the external call is a CEI violation — whether the
+    # zeroing happens after the call (classic) or in a separate function called
+    # afterwards (cross-function reentrancy). Any ledger name is accepted, not
+    # just `balance*`. A reentrancy mutex removes the score.
     has_mutex = bool(re.search(r"nonReentrant|locked\s*==\s*1|_status", src))
+    # match a caller-ledger clear like `credit[msg.sender] = 0` or `... -=`
+    _clear = r"\w+\[\s*msg\.sender\s*\]\s*(=\s*0|-=)"
     for fn in fns:
         b = fn["body"]
         call_m = re.search(r"\.call\s*\{\s*value\s*:", b)
         if not call_m:
             continue
-        after = b[call_m.end():]
-        zeroes_after = re.search(r"balance[sf]?\w*\[[^\]]+\]\s*(=\s*0|-=)", after)
-        pays_sender = re.search(r"call\s*\{\s*value\s*:\s*\w+\s*\}\s*\(\s*\"\"\s*\)", b) or "msg.sender.call" in b
-        if zeroes_after and pays_sender:
+        pays_sender = bool(re.search(r"call\s*\{\s*value\s*:\s*\w+\s*\}\s*\(\s*\"\"\s*\)", b)) or "msg.sender.call" in b
+        if not pays_sender:
+            continue
+        before = b[:call_m.start()]
+        cleared_before = re.search(_clear, before)
+        if not cleared_before:                 # CEI violated (classic or cross-function)
             scores[FAM_REENTRANCY] += 5
-            sig["reentrancy_withdraw"] = fn
+            sig.setdefault("reentrancy_withdraw", fn)
     if has_mutex:
         scores[FAM_REENTRANCY] -= 4  # guarded → likely safe
-    # a payable deposit that credits msg.sender is required for the classic PoC
+    # a payable deposit that credits msg.sender (any ledger name) — needed for the PoC
     for fn in fns:
-        if fn["payable"] and re.search(r"balance[sf]?\w*\[\s*msg\.sender\s*\]\s*\+=\s*msg\.value", fn["body"]):
-            sig["reentrancy_deposit"] = fn
+        if fn["payable"] and re.search(r"\w+\[\s*msg\.sender\s*\]\s*\+=\s*msg\.value", fn["body"]):
+            sig.setdefault("reentrancy_deposit", fn)
 
     # ── Access control ────────────────────────────────────────────────────────
     for fn in fns:
