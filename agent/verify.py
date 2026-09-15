@@ -47,23 +47,29 @@ class VerifyUnavailable(Exception):
     """검증 도구를 이 환경에서 사용할 수 없음."""
 
 
-def verify_candidate(target_name, target_src, invariants_src, exploit_src, manifest, seed):
+def verify_candidate(target_name, target_src, invariants_src, exploit_src, manifest, seed,
+                     extra_sources=None):
     return verify_full(
-        target_name, target_src, invariants_src, exploit_src, manifest, seed
+        target_name, target_src, invariants_src, exploit_src, manifest, seed,
+        extra_sources=extra_sources,
     ).tuple()
 
 
-def verify_full(target_name, target_src, invariants_src, exploit_src, manifest, seed=0):
+def verify_full(target_name, target_src, invariants_src, exploit_src, manifest, seed=0,
+                extra_sources=None):
     mode = os.environ.get("TRUST404_VERIFIER", "evm").lower()
     if mode == "forge":
         proven, violated, detail = _verify_forge(
-            target_name, target_src, invariants_src, exploit_src, manifest)
+            target_name, target_src, invariants_src, exploit_src, manifest,
+            extra_sources=extra_sources)
         return VerifyResult(proven, violated, detail, profit=None)
-    return _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest)
+    return _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
+                       extra_sources=extra_sources)
 
 
 # ── 내장 EVM 검증기 ──────────────────────────────────────────────────────────
-def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest):
+def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
+                extra_sources=None):
     try:
         import solcx
         from web3 import Web3
@@ -82,11 +88,18 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest):
         except Exception as e:
             raise VerifyUnavailable(f"solc {solc_version} unavailable: {e}")
 
+    src_key = (manifest.get("target") or {}).get("src") or f"{target_name}.sol"
+    inv_key = (manifest.get("invariants") or {}).get("contract") or "Invariants.sol"
     files = {
+        src_key: target_src,
         f"{target_name}.sol": target_src,
+        inv_key: invariants_src,
         "Invariants.sol": invariants_src,
         "Exploit.sol": exploit_src,
     }
+    for k, v in (extra_sources or {}).items():
+        if v:
+            files[k] = v
     std_in = {
         "language": "Solidity",
         "sources": {fn: {"content": s} for fn, s in files.items()},
@@ -120,7 +133,21 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest):
         return w3.eth.contract(address=r.contractAddress, abi=art["abi"]), r.contractAddress
 
     dep = manifest.get("deploy", {})
-    cargs = _coerce_args(dep.get("constructor_args", []), Web3)
+    helpers_addr = {}
+    for h in dep.get("helpers") or []:
+        cname = h.get("contract")
+        if not cname or cname not in arts:
+            continue
+        hargs = _coerce_args(h.get("args") or [], Web3)
+        _hc, haddr = deploy(arts[cname], hargs, value=_parse_decimal(str(h.get("value_wei", "0"))))
+        helpers_addr[cname] = haddr
+    raw_cargs = dep.get("constructor_args", [])
+    try:
+        from trust404.abi import resolve_placeholders
+        raw_cargs = resolve_placeholders(raw_cargs, helpers_addr)
+    except Exception:
+        pass
+    cargs = _coerce_args(raw_cargs, Web3)
     seed_wei = _parse_decimal(str(dep.get("value_wei", "0")))
 
     target, taddr = deploy(arts[target_name], cargs, value=seed_wei)
@@ -173,11 +200,23 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest):
 
 
 def _coerce_args(args, Web3):
+    try:
+        from trust404.abi import coerce
+        return coerce(args, Web3)
+    except Exception:
+        pass
     out = []
-    for a in args:
-        if isinstance(a, str):
+    for a in args or []:
+        if isinstance(a, (list, tuple)):
+            out.append(_coerce_args(a, Web3))
+        elif isinstance(a, str):
             if a.startswith("0x") and len(a) == 42:
                 out.append(Web3.to_checksum_address(a))
+            elif a.startswith("0x") and len(a) > 2 and len(a) % 2 == 0:
+                try:
+                    out.append(bytes.fromhex(a[2:]))
+                except ValueError:
+                    out.append(a)
             elif a.isdigit():
                 out.append(int(a))
             else:
@@ -197,7 +236,8 @@ def _parse_decimal(s):
 
 
 # ── forge 검증기(선택) ───────────────────────────────────────────────────────
-def _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest):
+def _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest,
+                  extra_sources=None):
     import shutil
     import subprocess
     import tempfile
@@ -222,6 +262,12 @@ def _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest
     (src / f"{target_name}.sol").write_text(target_src)
     (src / "Invariants.sol").write_text(invariants_src)
     (src / "Exploit.sol").write_text(exploit_src)
+    for rel, content in (extra_sources or {}).items():
+        p = work / rel if "/" in rel or rel.endswith(".sol") else src / rel
+        if not str(p).startswith(str(work)):
+            p = src / Path(rel).name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
     shutil.copytree(Path(harness_dir) / "src", work / "harness_src")
     (work / "foundry.toml").write_text(
         "[profile.default]\n"
@@ -230,9 +276,13 @@ def _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest
         "remappings = ['forge-std/=lib/forge-std/src/']\n"
     )
     cargs = dep.get("constructor_args", [])
-    ctor = ""
-    if len(cargs) == 1 and isinstance(cargs[0], str) and cargs[0].startswith("0x"):
-        ctor = f"address({cargs[0]})"
+    try:
+        from trust404.abi import forge_ctor
+        prelude, ctor = forge_ctor(cargs)
+    except Exception:
+        prelude, ctor = "", ""
+        if len(cargs) == 1 and isinstance(cargs[0], str) and cargs[0].startswith("0x"):
+            ctor = f"address({cargs[0]})"
     test_src = f"""// SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;
 import {{Harness}} from "../harness_src/Harness.sol";
@@ -242,6 +292,7 @@ import {{Exploit}} from "../src/Exploit.sol";
 contract Run is Harness {{
     function test_prove() public {{
         vm.deal(address(this), {seed_wei});
+{prelude}
         {target_name} target = new {target_name}{{value: {seed_wei}}}({ctor});
         Invariants inv = new Invariants();
         Exploit exp = new Exploit();

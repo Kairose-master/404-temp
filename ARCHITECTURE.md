@@ -181,7 +181,7 @@ Ethernaut 32는 이미 동적 증명된다. DVD v4 와 Paradigm CTF 는 **교차
 | Climber | `execute_before_schedule` | 템플릿 synth |
 | Naive receiver | `unpermissioned_flashloan` | 피처만 (P1 synth) |
 | Puppet v1/v2 | 기존 `_synth_amm` / `spot_price` | 있음 |
-| Puppet v3 TWAP | `twap_oracle` | P1 — 블록 워프 월드 |
+| Puppet v3 TWAP | `twap_oracle` / `twap_falls_to_spot` | 같은 블록에서 스팟으로 붕괴하면 synth. 윈도우 워프는 하네스 밖 |
 | Backdoor (Gnosis factory) | `gnosis_factory_callback` | 피처 |
 | Wallet mining CREATE2 | `create2_predict` | 피처 |
 | ABI smuggling | 기존 `selector_offset_check` | 있음 |

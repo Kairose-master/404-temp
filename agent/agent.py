@@ -132,6 +132,14 @@ def main(argv=None):
         die(f"failed to load inputs: {e}", out_dir, [f"# fatal: {e}"])
 
     target_name = manifest["target"]["name"]
+    extra_sources = {}
+    try:
+        from trust404.abi import load_extra_sources
+        extra_sources = load_extra_sources(args.manifest, args.contract, manifest)
+        if extra_sources:
+            note("# extra sources: " + ",".join(sorted(extra_sources)))
+    except Exception as e:
+        note(f"# extra sources skipped: {str(e)[:80]}")
     note(f"# TRUST404 Track04 agent | target={target_name} seed={args.seed} "
          f"max_attempts={args.max_attempts} timeout={args.timeout}s")
 
@@ -229,6 +237,7 @@ def main(argv=None):
                 exploit_src=source,
                 manifest=manifest,
                 seed=args.seed,
+                extra_sources=extra_sources or None,
             )
             proven, first_violated, detail = result.tuple()
         except VerifyUnavailable as e:
@@ -291,7 +300,8 @@ def main(argv=None):
                         proven2, fv2, d2 = verify_candidate(
                             target_name=target_name, target_src=contract_src,
                             invariants_src=invariants_src, exploit_src=draft,
-                            manifest=manifest, seed=args.seed)
+                            manifest=manifest, seed=args.seed,
+                            extra_sources=extra_sources or None)
                         if proven2:
                             note(f"attempt {attempts} [llm/critique]: PROVEN — {fv2}")
                             write_exploit(out_dir, draft)
