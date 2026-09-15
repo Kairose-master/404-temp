@@ -103,6 +103,7 @@ CI: [`.github/workflows/audit.yml`](./.github/workflows/audit.yml) 가 PR·푸�
 `--seed` → 같은 PoC(결정론).
 
 ## 리서치 & 대시보드
+- 참고자료·도구 비교(중국 区块链 연구·MVD-HG·Beosin VaaS·ChainMaker 등): [`docs/references.md`](./docs/references.md)
 - 취약점 분석 + 4대 공격 기법 + 최신 논문 정리: [`FINDINGS.md`](./FINDINGS.md)
 - 라이브 원버튼 콘솔(배포→생성→실행→증명): https://trust404-prover.vercel.app
 - 취약점 분석 대시보드: https://trust404-prover.vercel.app/analysis.html

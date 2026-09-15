@@ -86,8 +86,14 @@ def synth_ctor_args(eng, src, contract):
             args.append(10**18)
         elif t == "bool":
             args.append(False)
+        elif t == "bytes32":
+            args.append("0x" + "11" * 32)   # 알려진 값(자체 배포이므로 우리가 안다)
+        elif t == "string":
+            args.append("trust404")
+        elif t == "bytes":
+            args.append("0x")
         else:
-            return None  # string/bytes/array/struct → 안전하게 분석 스킵
+            return None  # 배열/구조체 등 → 안전하게 분석 스킵
     return args
 
 
