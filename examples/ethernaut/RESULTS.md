@@ -8,7 +8,7 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 
 멀티버전 solc(0.6/0.7/0.8) in-memory EVM에서 동적으로 증명한다.
 
-## 결과 (11 자동 증명, ~9초)
+## 결과 (12 자동 증명, ~10초)
 
 | 레벨 | 판정 | 전략 | 분류 | 근거 |
 |---|---|---|---|---|
@@ -23,13 +23,18 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 | Token | ✅ PROVEN | fuzz(transfer) | SWC-101 | 정수 언더플로 토큰 잔액 인플레 |
 | CoinFlip | ✅ PROVEN | **multiblock:flip (다중 블록 러너)** | SWC-120 | 블록 엔트로피 예측 → 10연승 |
 | Preservation | ✅ PROVEN | **storage-collision:setFirstTime (2단계 delegatecall)** | SWC-112 | 라이브러리 포인터 덮어쓰기 → owner 탈취 |
-| King | ⛔ 모델 밖 | — | — | 재등극 차단(그리핑/DoS) |
+| King | ✅ PROVEN | **king-dos:king (그리핑 DoS)** | SWC-113 | revert-receive 로 특권 역할 영구 락 |
 | Elevator | ⛔ 모델 밖 | — | — | 인터페이스 상태 트릭 |
 
-레벨 기준 10/12 자동 증명(King·Elevator만 모델 밖). Delegation 파일은 프록시 본체와
-라이브러리 두 컨트랙트를 모두 증명한다.
+레벨 기준 11/12 자동 증명(Elevator만 모델 밖). Delegation 파일은 프록시 본체와
+라이브러리 두 컨트랙트를 모두 증명해 총 12개 컨트랙트 정탐.
 
 이번에 추가된 것:
+- **그리핑 DoS(King)**: 특권 역할이 push 송금(`payable(role).transfer(...)`)으로 이전 보유자에게
+  환불하면서 `role = msg.sender` 로 갱신하는 구조를 탐지한다. revert 하는 `receive()` 를 가진
+  공격 컨트랙트가 역할을 차지하면 이후 정상 응찰의 환불 송금이 revert 해 역할이 영구 락된다.
+  베이스라인(EOA 순차 응찰)은 성공하지만 공격 후 동일 응찰이 revert(status 0)하는지로 DoS 를
+  증명한다(오탐 억제; pull-payment 안전본은 `.transfer` 미검출로 자동 제외).
 - **delegatecall 스토리지 충돌 2단계(Preservation)**: 타깃이 상태변수에 저장된 라이브러리
   주소로 `delegatecall(setTime(uint256))` 하는 구조를 탐지한다. 1단계로 공격 라이브러리를
   가리키도록 라이브러리 포인터(슬롯)를 덮어쓰고, 2단계로 그 라이브러리가 특권 슬롯(owner)을
@@ -41,7 +46,7 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 
 ## 아직 모델 밖 (정직한 경계)
 - **가스·바이트코드 퍼즐 / 사람 추론**: Gatekeeper 1/2/3, Magic Number, Recovery(주소 계산).
-- **그리핑/DoS·잔액증가**: King, Denial, Force.
+- **그리핑/DoS·잔액증가**: Denial, Force. (King 은 이제 자동 증명 — 위 표 참조.)
 - **인터페이스/제어흐름 트릭**: Elevator, Shop, Switch, GoodSamaritan.
 - **더 깊은 다단계 프록시**: Puzzle Wallet, Motorbike.
   (Preservation 은 이제 자동 증명 — 위 표 참조.)

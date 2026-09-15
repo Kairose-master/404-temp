@@ -98,9 +98,11 @@ CI: [`.github/workflows/audit.yml`](./.github/workflows/audit.yml) 가 PR·푸�
 쓰려면 워크플로의 `--fail-on critical` 스텝을 켠다.
 발견마다 **SWC/CWE 표준 분류 + 수정 가이드 + 소스 위치(파일:라인)**를 붙인다. 엔진
 전량(스캐너 7계열 템플릿 + 범용 퍼저: 호출 시퀀스 · 재진입 합성 · 다중 컨트랙트 AMM
-가격 조작(플래시론식) · 시스템 내부 플래시론 차용자)을 그대로 쓰며, 불변식 없이도
-자동 효과검사(자금 유출 / owner·admin 탈취 / 부채>담보)로 판정한다. 같은 입력 + 같은
-`--seed` → 같은 PoC(결정론).
+가격 조작(플래시론식) · 시스템 내부 플래시론 차용자 · 스토리지 보조(private 슬롯 읽기) ·
+2-컨트랙트 프록시 배선 · 다중 블록 러너 · delegatecall 스토리지 충돌 2단계 · 그리핑 DoS)를
+그대로 쓰며, 불변식 없이도 자동 효과검사(자금 유출 / owner·admin 탈취 / 부채>담보 / 토큰
+잔액 인플레 / 특권 역할 영구 락)로 판정한다. 같은 입력 + 같은 `--seed` → 같은 PoC(결정론).
+The Ethernaut 공개 레벨 11/12 자동 증명(총 12개 컨트랙트, Elevator만 모델 밖).
 
 ## 리서치 & 대시보드
 - 참고자료·도구 비교(중국 区块链 연구·MVD-HG·Beosin VaaS·ChainMaker 등): [`docs/references.md`](./docs/references.md)
