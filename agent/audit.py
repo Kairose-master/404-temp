@@ -254,6 +254,10 @@ def classify(strategy, family_hint=None):
     s = strategy or ""
     if s.startswith("storage"):
         return CLASS["storage"]
+    if s.startswith("multiblock"):
+        return CLASS["weak_randomness"]
+    if s.startswith("proxy"):
+        return CLASS["delegatecall_hijack"]
     if s.startswith("amm-manip"):
         return CLASS["amm"]
     if s.startswith("flashloan"):
