@@ -121,6 +121,12 @@ PROVIDERS: List[Provider] = [
     Provider("execute_before_schedule", "execute_before_schedule", "synth",
              frozenset({"execute_before_schedule"}),
              "execute 후 schedule 검사 (Climber timelock)"),
+    Provider("twap_as_spot", "twap_as_spot", "synth",
+             frozenset({"twap_oracle", "twap_falls_to_spot"}),
+             "한 run() 안에서 스팟으로 붕괴하는 TWAP (Puppet v1/가짜 v3)"),
+    Provider("cross_getter_drain", "cross_getter_drain", "synth",
+             frozenset({"sibling_getter", "multi_contract_unit", "address_ctor"}),
+             "public getter 로 형제 컨트랙트 주소 회수 후 drain"),
 ]
 
 _BY_FN = {p.fn_name: p for p in PROVIDERS}

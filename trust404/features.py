@@ -263,6 +263,31 @@ def extract_features(src: str, name: str | None = None) -> Set[str]:
     if has(r"\.send\s*\(") or has(r"\.transfer\s*\("):
         feats.add("push_send")
 
+    # ── hidden-set IR: constructor arrays, cross-contract, TWAP ───────────
+    if has(r"constructor\s*\([^)]*\[\]"):
+        feats.add("array_ctor")
+    if has(r"constructor\s*\([^)]*\baddress\b"):
+        feats.add("address_ctor")
+    if len(bodies) >= 2:
+        feats.add("multi_contract_unit")
+    # public address getters that name siblings (pool/oracle/token/router)
+    if has(r"function\s+(token0|token1|pair|pool|oracle|router|factory|token|asset|collateral)\s*\("):
+        feats.add("sibling_getter")
+        feats.add("multi_contract_unit")
+
+    # TWAP surface. A real time-window TWAP cannot move inside one run()
+    # (harness does not warp mid-call). Many "TWAP" desks still consult the
+    # current tick/reserves — that collapses to spot and is in-scope.
+    if has(r"\btwap\b|price0Cumulative|price1Cumulative|blockTimestampLast|"
+           r"function\s+(observe|consult)\s*\(|secondsAgos|observations\s*\["):
+        feats.add("twap_oracle")
+        feats.add("oracle")
+    if "twap_oracle" in feats:
+        stored_window = has(r"observations\s*\[") or has(r"secondsAgos") or has(r"Observation")
+        if not stored_window:
+            feats.add("twap_falls_to_spot")
+            feats.add("spot_price")
+
     return feats
 
 
