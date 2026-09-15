@@ -8,7 +8,7 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 
 멀티버전 solc(0.6/0.7/0.8) in-memory EVM에서 동적으로 증명한다.
 
-## 결과 (30 자동 증명)
+## 결과 (32 자동 증명)
 
 | 레벨 | 판정 | 전략 | 분류 | 근거 |
 |---|---|---|---|---|
@@ -42,8 +42,9 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 | Gatekeeper Three | ✅ PROVEN | **gatekeeper-three / unprotected_init** | SWC-105 | construct0r owner 선점 + 3게이트 우회 |
 | Stake | ✅ PROVEN | **stake-accounting:StakeWETH** | SWC-105 | 가짜 WETH 회계 버그로 실 ETH 인출 |
 | Motorbike | ✅ PROVEN | **uninitialized:initialize** | SWC-118 | 초기화 안 된 Engine 의 initialize() 로 upgrader 선점 |
+| Puzzle Wallet | ✅ PROVEN | **puzzle-wallet:setMaxBalance** | SWC-112 | 프록시 스토리지 충돌 + 중첩 multicall → admin 탈취 |
 
-**공개 The Ethernaut 레벨 29종을 자동 증명**한다(위 표; Delegation 파일은 프록시 본체와
+**공개 The Ethernaut 레벨 30종을 자동 증명**한다(위 표; Delegation 파일은 프록시 본체와
 라이브러리 두 컨트랙트를 모두 증명). 비취약 헬퍼(Preservation 의 LibraryContract,
 Dex/DexTwo 의 내부 Token ERC20)만 단독으로는 제외된다.
 
@@ -69,7 +70,7 @@ Dex/DexTwo 의 내부 Token ERC20)만 단독으로는 제외된다.
 
 ## 아직 모델 밖 (정직한 경계)
 아래는 아직 자동 증명에 넣지 않은 레벨이다(작업 중):
-- **다단계 프록시**: Puzzle Wallet. (Motorbike 는 초기화 탈취를 자동 증명 — 위 표. Cancun 이후 selfdestruct 벽돌화는 별개.)
+
 - **서명/방어형**: Impersonator(ECDSA), DoubleEntryPoint(탐지 봇 구축형 — 익스플로잇이 아님).
 - **기타 다단계**: Magic Animal Carousel.
 
