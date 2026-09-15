@@ -324,6 +324,8 @@ def classify(strategy, family_hint=None):
         return CLASS["amm"]
     if s.startswith("stake-accounting"):
         return CLASS["access_control"]
+    if s.startswith("uninitialized"):
+        return CLASS["unprotected_init"]
     if s.startswith("good-samaritan"):
         return CLASS["callback_inconsistency"]
     if s.startswith("eip7702"):

