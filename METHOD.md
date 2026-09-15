@@ -66,7 +66,7 @@ tie-break). 한 후보가 검증에 실패하면 같은 단계의 다음 후보�
 플래시론, private 슬롯 읽기, 프록시 calldata 배선, 다중 블록 러너, delegatecall 스토리지
 충돌, 그리핑 DoS, 콜백 불일치) → **fuzz**(호출 시퀀스 탐색: 단일 호출 → setup→drain
 2단계, raw 송금·셀렉터 calldata 포함, SliSE 류 데이터 의존 우선순위). 어느 단계에서든
-불변식을 깨는 후보가 나오면 즉시 종료(0)하고, `--max-attempts`/`--timeout` 을 소진하면
+실패하면 다음 단계로 격상하고, **퍼저 단계는 라운드마다 예산·시퀀스 깊이(단일→쌍→3단계)·입력 풀을 키워 점진 심화(progressive deepening)로 시간 예산(`TRUST404_MAX_SECONDS`)까지 끈질기게 재탐색**한다. 불변식을 깨는 후보가 나오면 즉시 종료(0)하고, `--max-attempts`/`--timeout` 을 소진하면
 마지막 후보를 남기고 1로 종료한다. 각 실패는 `attempts.log` 에 `[단계/전략] NOT PROVEN
 — invariants held (…)` 로 남아 루프가 왜·어떻게 재탐색했는지 보인다. 멀쩡 타깃은 모든
 단계를 다 돌아도 어떤 후보도 불변식을 깨지 못하므로 자연히 1(오탐 0).

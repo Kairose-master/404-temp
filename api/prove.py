@@ -1380,17 +1380,25 @@ def _fuzz_fns(abi):
     return out
 
 def _fuzz_pool(t, ctx):
-    if t.startswith("uint"): return [(1<<256)-1, ctx["seed"] or 10**19, 10**18, 1, 0]
+    lvl = ctx.get("pool_level", 0)
+    if t.startswith("uint") or t.startswith("int"):
+        base=[(1<<256)-1, ctx["seed"] or 10**19, 10**18, 1, 0]
+        if lvl >= 1: base += [(1<<255), (1<<64), 2, 255, 256, 10**6]
+        return base
     if t=="address":
         base=[_ATTACKER, ZERO_ADDR, _TARGET]
         if ctx.get("owner0"): base.append(ctx["owner0"])
         return base
     if t=="bool": return [True, False]
+    if re.fullmatch(r"bytes\d+", t):
+        n=int(t[5:]); v=("0x"+"ff"*n, "0x"+"00"*n)
+        return list(v) if lvl >= 1 else [v[0]]
     return []
 
 def _fuzz_calls(fn, ctx, cap=12):
     pools=[_fuzz_pool(t,ctx) for t in fn["types"]]
     if any(len(p)==0 for p in pools): return []
+    cap = cap if ctx.get("pool_level",0) == 0 else cap*3
     combos=[()] if not fn["types"] else list(_it.product(*pools))[:cap]
     # payable 은 0 / 1 wei(임계 미만 게이트 통과용) / 1 ether 를 시도한다.
     vals=[0]+([1, 10**18] if fn["payable"] else [])
@@ -1441,14 +1449,19 @@ def _rw_vars(body):
     return writes, reads
 
 
-def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=None):
-    """Deploy target once, snapshot, search single + (setup->drain) pairwise call
-    sequences that trip the invariant/effect. Returns (seq, payable_map, reason) or None."""
+def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=None,
+                 depth=2, pool_level=0, deadline=None):
+    """Deploy target once, snapshot, search call sequences (single → pair → triple,
+    depth-controlled) that trip the invariant/effect. pool_level enriches the input
+    pools; deadline (epoch secs) bounds wall-clock. Returns (seq, payable_map, reason) or None.
+    효과 판정은 배포 직후 건강 확인 기준의 실제 관찰이라 시퀀스를 더 깊이 파도 오탐이 없다."""
     import solcx
     from web3 import Web3
     if budget is None:
         try: budget = int(os.environ.get("TRUST404_FUZZ_BUDGET", "500"))
         except Exception: budget = 500
+    def _time_left():
+        return deadline is None or time.time() < deadline
     _solcv, _evm = _solc_for(target_src)
     files={f"{name}.sol":target_src}
     if do_verify and invariants_src: files["Invariants_src.sol"]=invariants_src
@@ -1513,7 +1526,7 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=N
             reasons.append("token balance inflated (overflow/underflow)")
         return (len(reasons)>0, "; ".join(reasons))
     tester=w3.provider.ethereum_tester; snap=tester.take_snapshot()
-    ctx={"seed":seed_wei,"attacker":acct,"target":taddr,"owner0":owner0}
+    ctx={"seed":seed_wei,"attacker":acct,"target":taddr,"owner0":owner0,"pool_level":pool_level}
     fns=_fuzz_fns(abi)
     payable_map={f["name"]:f["payable"] for f in fns}
     movers=_fuzz_value_movers(target_src)
@@ -1557,18 +1570,20 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=N
     b=0
     # phase 1: single calls
     for c in all_calls:
-        if b>=budget: break
+        if b>=budget or not _time_left(): break
         b+=1; tester.revert_to_snapshot(snap)
         try: do_call(c)
         except Exception: pass
         trip,reason=checker()
         if trip: return [c], payable_map, reason
+    if depth < 2:
+        return None
     # phase 2: setup(any) -> drain/hijack (value-mover 또는 raw send)
     seconds=[c for c in all_calls if c.get("raw") or c["name"] in movers] or all_calls
     for c1 in all_calls:
-        if b>=budget: break
+        if b>=budget or not _time_left(): break
         for c2 in seconds:
-            if b>=budget: break
+            if b>=budget or not _time_left(): break
             b+=1; tester.revert_to_snapshot(snap)
             try: do_call(c1)
             except Exception: continue
@@ -1576,6 +1591,25 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=N
             except Exception: pass
             trip,reason=checker()
             if trip: return [c1,c2], payable_map, reason
+    if depth < 3:
+        return None
+    # phase 3: setup -> setup -> drain/hijack (3단계 시퀀스; 우선순위 상위만)
+    firsts = all_calls[:max(8, len(all_calls)//3)]
+    for c1 in firsts:
+        if b>=budget or not _time_left(): break
+        for c2 in firsts:
+            if b>=budget or not _time_left(): break
+            for c3 in seconds:
+                if b>=budget or not _time_left(): break
+                b+=1; tester.revert_to_snapshot(snap)
+                try: do_call(c1)
+                except Exception: continue
+                try: do_call(c2)
+                except Exception: pass
+                try: do_call(c3)
+                except Exception: pass
+                trip,reason=checker()
+                if trip: return [c1,c2,c3], payable_map, reason
     return None
 
 def _synth_reentrancy(target_src):
@@ -4003,31 +4037,45 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
-    # 1) 호출 시퀀스 탐색
-    try:
-        found=_fuzz_search(name, target_src, invariants_src, manifest, do_verify)
-    except Exception:
-        return None
-    if not found: return None
-    seq, payable_map, reason = found
-    exploit_src=_fuzz_codegen(seq, payable_map)
-    gen={"step":"generate","title":"Exploit.sol 생성 (fuzz)","strategy":"fuzz","exploit_src":exploit_src}
-    try:
-        if do_verify and invariants_src:
-            proven,vsteps,meta=_verify_attempt(name,target_src,invariants_src,exploit_src,manifest)
-        else:
-            proven,vsteps,meta=_run_effect(name,target_src,exploit_src,manifest)
-    except Exception:
-        return None
-    if not proven: return None
-    return {"name":name,"proven":True,"firstViolated":meta.get("firstViolated",reason),
-            "strategy":"fuzz ("+" → ".join(c["name"] for c in seq)+")",
-            "steps":[scan_step,gen]+vsteps,"exploit_src":exploit_src,
-            "mode":("verify" if (do_verify and invariants_src) else "effect"),
-            "balance_before_wei":meta.get("balance_before_wei"),
-            "balance_after_wei":meta.get("balance_after_wei"),
-            "note":"템플릿 미매치 → 범용 퍼저가 호출 시퀀스를 탐색해 성립시켰습니다.",
-            "ms":int((time.time()-t0)*1000)}
+    # 1) 호출 시퀀스 탐색 — 점진 심화(progressive deepening) 루프.
+    #    라운드마다 예산·시퀀스 깊이·입력 풀을 키워 "끝까지 물어뜯되", 판정은 항상
+    #    배포직후 건강기준의 실제 효과 관찰이라 더 깊이 파도 오탐이 생기지 않는다.
+    try: _max_s = float(os.environ.get("TRUST404_MAX_SECONDS", "9"))
+    except Exception: _max_s = 9.0
+    deadline = t0 + _max_s
+    rounds = [(500, 2, 0), (1500, 2, 1), (4000, 3, 1)]
+    attempted = 0
+    for bud, dep, pool in rounds:
+        if time.time() >= deadline: break
+        attempted += 1
+        try:
+            found = _fuzz_search(name, target_src, invariants_src, manifest, do_verify,
+                                 budget=bud, depth=dep, pool_level=pool, deadline=deadline)
+        except Exception:
+            found = None
+        if not found:
+            continue
+        seq, payable_map, reason = found
+        exploit_src = _fuzz_codegen(seq, payable_map)
+        gen = {"step":"generate","title":f"Exploit.sol 생성 (fuzz · round {attempted})","strategy":"fuzz","exploit_src":exploit_src}
+        try:
+            if do_verify and invariants_src:
+                proven,vsteps,meta=_verify_attempt(name,target_src,invariants_src,exploit_src,manifest)
+            else:
+                proven,vsteps,meta=_run_effect(name,target_src,exploit_src,manifest)
+        except Exception:
+            continue
+        if not proven:
+            continue   # 검증 실패 → 다음(더 깊은) 라운드로 계속 물어뜯는다
+        return {"name":name,"proven":True,"firstViolated":meta.get("firstViolated",reason),
+                "strategy":"fuzz ("+" → ".join(c.get("name","raw") for c in seq)+")",
+                "steps":[scan_step,gen]+vsteps,"exploit_src":exploit_src,
+                "mode":("verify" if (do_verify and invariants_src) else "effect"),
+                "balance_before_wei":meta.get("balance_before_wei"),
+                "balance_after_wei":meta.get("balance_after_wei"),
+                "note":f"템플릿 미매치 → 범용 퍼저가 {attempted}라운드 점진 심화(깊이≤{dep}, 예산 {bud})로 시퀀스를 찾아 성립시켰습니다.",
+                "ms":int((time.time()-t0)*1000)}
+    return None
 
 def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify=True):
     """트랙 자기검증 루프(agent.py)용 후보 생성기.

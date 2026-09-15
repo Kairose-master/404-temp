@@ -594,6 +594,9 @@ def main(argv=None):
     eng = load_engine()
     if args.quick:
         os.environ["TRUST404_FUZZ_BUDGET"] = "120"
+        os.environ.setdefault("TRUST404_MAX_SECONDS", "4")   # 배치: 라운드 심화 시간 상한 축소
+    else:
+        os.environ.setdefault("TRUST404_MAX_SECONDS", "12")  # 단일 감사: 더 끈질기게
     inv_src = Path(args.invariants).read_text(encoding="utf-8") if args.invariants else None
     files = gather_files(args.path)
     outdir = Path(args.out)
