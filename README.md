@@ -91,6 +91,7 @@ test/         forge (Prove.t.sol)
 채점 입구가 아니다. 엔진 진화·한계 노트.
 
 - 한계절 확장: [`docs/FRONTIER.md`](./docs/FRONTIER.md) · 예제 [`examples/frontier/`](./examples/frontier/)
+- 계열별 취약 컨트랙트: [`examples/families/`](./examples/families/)
 - 엔진 로그: [`ARCHITECTURE.md`](./ARCHITECTURE.md)
 - 참고자료: [`docs/references.md`](./docs/references.md) · [`FINDINGS.md`](./FINDINGS.md)
 - 임의 `.sol` 감사 CLI: `python3 agent/audit.py <파일|디렉터리> --out audit`

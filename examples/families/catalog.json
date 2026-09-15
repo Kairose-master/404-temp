@@ -1,0 +1,79 @@
+[
+  {
+    "file": "UnpermissionedCallback.sol",
+    "contract": "FlashPool",
+    "feature": "unpermissioned_callback",
+    "provider": "unpermissioned_callback",
+    "origin": "Damn Vulnerable DeFi Truster / AtomicQueue 2026-09"
+  },
+  {
+    "file": "DonationDoS.sol",
+    "contract": "AccountedPool",
+    "feature": "donation_accounting_dos",
+    "provider": "donation_accounting_dos",
+    "origin": "Damn Vulnerable DeFi Unstoppable"
+  },
+  {
+    "file": "GovernanceFlash.sol",
+    "contract": "GovPool",
+    "feature": "governance_flashloan",
+    "provider": "governance_flashloan",
+    "origin": "Damn Vulnerable DeFi Selfie"
+  },
+  {
+    "file": "ExecuteBeforeSchedule.sol",
+    "contract": "Timelock",
+    "feature": "execute_before_schedule",
+    "provider": "execute_before_schedule",
+    "origin": "Damn Vulnerable DeFi Climber"
+  },
+  {
+    "file": "TwapAsSpot.sol",
+    "contract": "SpotTwapDesk",
+    "feature": "twap_falls_to_spot",
+    "provider": "twap_as_spot",
+    "origin": "Damn Vulnerable DeFi Puppet v1 (spot that calls itself TWAP)"
+  },
+  {
+    "file": "WindowedTwap.sol",
+    "contract": "WindowTwapDesk",
+    "feature": "windowed_twap",
+    "provider": "twap_window",
+    "origin": "Uniswap V3 Observation[] window"
+  },
+  {
+    "file": "CrossGetter.sol",
+    "contract": "LendingDesk",
+    "feature": "sibling_getter",
+    "provider": "cross_getter_drain",
+    "origin": "hidden-set sibling getter + constructor address"
+  },
+  {
+    "file": "VictimApprove.sol",
+    "contract": "PullVault",
+    "feature": "victim_approve",
+    "provider": "victim_approve",
+    "origin": "victim must approve first (prank or world.txs)"
+  },
+  {
+    "file": "SeededAllowance.sol",
+    "contract": "PullVault",
+    "feature": "setup_seeded_allowance",
+    "provider": "seeded_allowance_drain",
+    "origin": "Setup already approved; drain leftover allowance, no cheatcode"
+  },
+  {
+    "file": "CrossChainBridge.sol",
+    "contract": "MiniMessenger",
+    "feature": "cross_chain_bridge",
+    "provider": "cross_chain_bridge",
+    "origin": "LayerZero lzReceive / OP relayMessage (same-EVM mock)"
+  },
+  {
+    "file": "StructCtor.sol",
+    "contract": "ConfiguredVault",
+    "feature": "struct_ctor",
+    "provider": null,
+    "origin": "constructor(Init memory) — ABI tuple encoding"
+  }
+]

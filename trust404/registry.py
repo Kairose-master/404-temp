@@ -133,6 +133,12 @@ PROVIDERS: List[Provider] = [
     Provider("victim_approve", "victim_approve", "synth",
              frozenset({"victim_approve", "victim_getter"}),
              "피해자 approve 선행 (prank / 두번째 EOA)"),
+    Provider("seeded_allowance_drain", "seeded_allowance_drain", "synth",
+             frozenset({"setup_seeded_allowance", "victim_getter"}),
+             "Setup/world.txs 가 이미 approve 한 잔여 승인 drain (치트코드 없음)"),
+    Provider("cross_chain_bridge", "cross_chain_bridge", "synth",
+             frozenset({"cross_chain_bridge"}),
+             "같은 EVM 안의 메신저/LZ/OP relay 콜백"),
 ]
 
 _BY_FN = {p.fn_name: p for p in PROVIDERS}

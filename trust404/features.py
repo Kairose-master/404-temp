@@ -301,6 +301,16 @@ def extract_features(src: str, name: str | None = None) -> Set[str]:
     if has(r"\bstruct\s+\w+") and has(r"constructor\s*\(\s*\w+\s+(memory|calldata)"):
         feats.add("struct_ctor")
 
+    # Cross-chain (same-EVM mock of a messenger / LZ / OP relay)
+    if has(
+        r"lzReceive|ICrossDomainMessenger|relayMessage|xDomainMessageSender|"
+        r"finalizeWithdrawal|finalizeBridge|onMessageReceived|"
+        r"AddressAliasHelper|l2Sender|handleNonfungible"
+    ) or has(r"function\s+handle\s*\(") and has(r"chainId|srcChain|origin"):
+        feats.add("cross_chain_bridge")
+    if has(r"approve\s*\(") and has(r"prank|makeAddr|victim|user"):
+        feats.add("setup_seeded_allowance")
+
     return feats
 
 
