@@ -90,6 +90,9 @@ python3 agent/audit.py <파일|디렉터리> --out audit
 docker build -t track04 -f agent/Dockerfile .
 docker run --rm -v "$PWD:/scan" track04 audit /scan --out /scan/audit
 ```
+CI: [`.github/workflows/audit.yml`](./.github/workflows/audit.yml) 가 PR·푸시마다 감사를
+돌려 `report.sarif` 를 GitHub code scanning 에 업로드한다(리포트는 아티팩트로 보관). 게이트로
+쓰려면 워크플로의 `--fail-on critical` 스텝을 켠다.
 발견마다 **SWC/CWE 표준 분류 + 수정 가이드 + 소스 위치(파일:라인)**를 붙인다. 엔진
 전량(스캐너 7계열 템플릿 + 범용 퍼저: 호출 시퀀스 · 재진입 합성 · 다중 컨트랙트 AMM
 가격 조작(플래시론식) · 시스템 내부 플래시론 차용자)을 그대로 쓰며, 불변식 없이도

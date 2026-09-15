@@ -157,6 +157,22 @@ DeFi, Capture the Ether)이 가르치는 계열 3종을 스캐너·전략·타�
 - Olympia: Fuzzer Benchmarking for Solidity (ASE 2024) — https://mariachris.github.io/Pubs/ASE-2024-Olympia.pdf
 - Foundry Invariant Testing (Cyfrin) — https://www.cyfrin.io/blog/smart-contract-fuzzing-and-invariants-testing-foundry
 
+**중국 区块链(블록체인) 스마트컨트랙트 보안 연구**
+국내(한국)·영미권 외에 중국 학계의 축적이 크다. 이들 서베이는 취약점을 Solidity 코드층
+· EVM 실행층 · 블록체인 시스템층의 3계층으로 나누고, 탐지 기법을 형식검증 · 심볼릭 실행
+· 퍼징 · 중간표현 · 딥러닝의 5류로 분류한다(국내 중국 연구는 퍼징·ML에 집중, 심볼릭·형식
+검증은 상대적으로 적다고 지적). 우리 도구의 "생성-검증(동적 증명)" 접근은 이 분류의
+퍼징 + 동적 검증에 해당하며, "위험 신호"가 아니라 실행 PoC로 확증한다는 점이 차별점이다.
+- 智能合约安全漏洞检测技术研究综述 (스마트컨트랙트 보안 취약점 탐지 기술 연구 종합), 软件学报(Journal of Software) — https://www.jos.org.cn/jos/article/abstract/6375
+- 智能合约漏洞检测技术综述 (스마트컨트랙트 취약점 탐지 기술 종합), 软件学报 2024 — https://www.jos.org.cn/html/2024/1/6810.htm
+- 智能合约安全漏洞检测研究进展 (스마트컨트랙트 보안 취약점 탐지 연구 진전), 软件学报 — https://www.jos.org.cn/jos/article/abstract/7046
+- 区块链智能合约漏洞检测与自动化修复综述 (블록체인 스마트컨트랙트 취약점 탐지·자동수정 종합), 计算机应用(Journal of Computer Applications) — https://www.joca.cn/CN/10.11772/j.issn.1001-9081.2022020179
+- 基于深度学习的智能合约漏洞检测方法综述 (딥러닝 기반 스마트컨트랙트 취약점 탐지 방법 종합), 四川大学学报 2023 — http://science.scu.edu.cn/zh/article/doi/10.19907/j.0490-6756.2023.020001/
+- BCodeVis：面向区块链智能合约的漏洞检测可视分析方法 (블록체인 스마트컨트랙트 취약점 탐지 시각분석), 计算机辅助设计与图形学学报 2024 — https://www.jcad.cn/cn/article/pdf/preview/10.3724/SP.J.1089.2024-00496.pdf
+- SliSE — Efficiently Detecting Reentrancy Vulnerabilities in Complex Smart Contracts (프로그램 슬라이싱 + 심볼릭 실행, 복합 컨트랙트 재진입), Zexu Wang·Jiachi Chen·Yanlin Wang·Yu Zhang·Weizhe Zhang·Zibin Zheng (中山大学·哈尔滨工业大学), FSE 2024 — https://arxiv.org/abs/2403.11254
+- A Comparative Evaluation of Automated Analysis Tools for Solidity Smart Contracts, Zhiyuan Wei 등, 2023 — https://arxiv.org/abs/2310.20212
+- Unity is Strength: Enhancing Precision in Reentrancy Vulnerability Detection — https://arxiv.org/abs/2402.09094
+
 **컨트랙트 워게임 (신규 계열의 출처 · 벤치마크)**
 - Ethernaut (OpenZeppelin) — https://ethernaut.openzeppelin.com
   · Delegation / Preservation(delegatecall 하이재킹), CoinFlip(약한 난수),

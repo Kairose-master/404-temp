@@ -1,0 +1,54 @@
+# TRUST404 Track04 — 스마트컨트랙트 자동 감사 (증명 기반)
+# PR/푸시마다 audit.py 를 돌려 동적으로 증명된 취약점을 찾아 SARIF 를 GitHub
+# code scanning 에 업로드한다. 기본은 저장소의 targets/ 를 스캔 — 실제 사용 시
+# `paths` 를 감사 대상 컨트랙트 디렉터리로 바꾼다.
+name: contract-audit
+on:
+  push:
+    branches: [ main, "claude/**" ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      path:
+        description: "스캔 경로 (파일 또는 디렉터리)"
+        default: "targets"
+permissions:
+  contents: read
+  security-events: write   # SARIF 업로드에 필요
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install engine deps + solc
+        run: |
+          pip install -r agent/requirements.txt
+          python -c "import solcx; solcx.install_solc('0.8.24')"
+      - name: Run exploit-prover audit
+        run: |
+          python3 agent/audit.py "${{ github.event.inputs.path || 'targets' }}" \
+            --out audit --seed 42 --fail-on none
+          echo "----- report.md -----"
+          cat audit/report.md
+      - name: Upload SARIF to code scanning
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: audit/report.sarif
+          category: trust404-exploit-prover
+      - name: Archive report artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-audit-report
+          path: |
+            audit/report.md
+            audit/report.json
+            audit/report.sarif
+            audit/exploits/
+      # 게이트로 쓰려면 아래 주석 해제: 증명된 CRITICAL 발견 시 빌드 실패
+      # - name: Fail on proven critical
+      #   run: python3 agent/audit.py "${{ github.event.inputs.path || 'targets' }}" --out audit --fail-on critical
