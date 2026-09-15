@@ -567,6 +567,38 @@ def static_findings(contract_src):
                     "(_safeMint 는 mint 뒤 콜백), 모든 mint 경로에 nonReentrant 적용. "
                     "tx.origin==msg.sender 를 EOA 판별로 쓰지 말 것(EIP-7702 로 무력화)."),
         })
+    # ── 계열: 커밋먼트 해시 루프의 off-by-one (마지막 원소 미포함) ──
+    # keccak 누산 루프가 `i < arr.length - 1` 로 돌면 배열의 '마지막' 원소가 커밋 해시에
+    # 포함되지 않는다. 이 해시가 리플레이 키/메시지 슬롯으로 쓰이면, 실제 실행되는(전체
+    # 배열) 내용과 커밋된 내용이 어긋나 위·변조/리플레이가 가능하다(브리지 포털 류).
+    for fn in _functions(src):
+        b = fn["body"]
+        for lm in re.finditer(r"for\s*\([^;]*;\s*\w+\s*<\s*(\w+)\s*\.\s*length\s*-\s*1\s*;", b):
+            arr = lm.group(1)
+            after = b[lm.end():]
+            seg = after[:after.find("}") + 1] if "}" in after else after
+            # 루프 본문이 그 배열 원소를 keccak 누산에 쓰는가
+            if re.search(r"keccak256\s*\([^)]*" + re.escape(arr) + r"\s*\[", seg) or \
+               (re.search(r"keccak256", seg) and re.search(re.escape(arr) + r"\s*\[\s*\w+\s*\]", seg)):
+                # 그 해시가 커밋/슬롯/리플레이 키로 쓰이는 정황(같은 함수가 keccak 을 반환/키로)
+                looks_commit = bool(re.search(r"return\s+keccak256|Slot|withdrawalHash|messageHash|commit", fn["body"], re.I)) \
+                               or "return" in fn["body"]
+                if looks_commit:
+                    out.append({
+                        "rule": "TR404-COMMIT", "cwe": "CWE-670",
+                        "title": "Off-by-one commitment: last array element not bound to the hash",
+                        "severity": "HIGH", "family": "commitment_mismatch",
+                        "function": fn["name"], "core": fn["name"], "eip7702": False,
+                        "why": (f"`{fn['name']}` 의 커밋 해시 루프가 `{arr}.length - 1` 까지만 돌아 "
+                                f"`{arr}` 의 **마지막 원소(및 대응 데이터)** 를 해시에 포함하지 않습니다. "
+                                "이 해시가 리플레이 키/메시지 슬롯으로 쓰이면, 실제로 실행·소비되는 전체 "
+                                "배열과 커밋된 내용이 어긋나 서명/증명된 것과 다른 마지막 연산을 끼워 넣거나 "
+                                "(길이 1이면 전부) 위·변조·리플레이할 수 있습니다."),
+                        "fix": (f"루프 상한을 `{arr}.length`(마지막 원소 포함)로 고치고, 커밋 해시가 실제 "
+                                "실행에 쓰이는 모든 배열 원소를 빠짐없이 바인딩하도록 하십시오. 커밋과 실행이 "
+                                "같은 데이터를 쓰는지 불변식으로 검증."),
+                    })
+                    break
     return out
 
 
