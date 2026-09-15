@@ -8,7 +8,7 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 
 멀티버전 solc(0.6/0.7/0.8) in-memory EVM에서 동적으로 증명한다.
 
-## 결과 (32 자동 증명)
+## 결과 (33 자동 증명)
 
 | 레벨 | 판정 | 전략 | 분류 | 근거 |
 |---|---|---|---|---|
@@ -43,8 +43,9 @@ python3 agent/audit.py examples/ethernaut --out audit --quick --include-safe
 | Stake | ✅ PROVEN | **stake-accounting:StakeWETH** | SWC-105 | 가짜 WETH 회계 버그로 실 ETH 인출 |
 | Motorbike | ✅ PROVEN | **uninitialized:initialize** | SWC-118 | 초기화 안 된 Engine 의 initialize() 로 upgrader 선점 |
 | Puzzle Wallet | ✅ PROVEN | **puzzle-wallet:setMaxBalance** | SWC-112 | 프록시 스토리지 충돌 + 중첩 multicall → admin 탈취 |
+| Impersonator | ✅ PROVEN | **ecdsa-malleability:changeController** | SWC-117 | 대칭 서명(v^1,r,N-s)으로 controller 탈취 |
 
-**공개 The Ethernaut 레벨 30종을 자동 증명**한다(위 표; Delegation 파일은 프록시 본체와
+**공개 The Ethernaut 레벨 31종을 자동 증명**한다(위 표; Delegation 파일은 프록시 본체와
 라이브러리 두 컨트랙트를 모두 증명). 비취약 헬퍼(Preservation 의 LibraryContract,
 Dex/DexTwo 의 내부 Token ERC20)만 단독으로는 제외된다.
 
@@ -71,8 +72,8 @@ Dex/DexTwo 의 내부 Token ERC20)만 단독으로는 제외된다.
 ## 아직 모델 밖 (정직한 경계)
 아래는 아직 자동 증명에 넣지 않은 레벨이다(작업 중):
 
-- **서명/방어형**: Impersonator(ECDSA), DoubleEntryPoint(탐지 봇 구축형 — 익스플로잇이 아님).
-- **기타 다단계**: Magic Animal Carousel.
+- **방어형**: DoubleEntryPoint — Forta 탐지 봇을 "구축"하는 레벨로, 공격을 수행하는 익스플로잇이 아니라 방어기를 짜는 문제라 exploit-prover 모델 밖(정직한 경계).
+- **초복잡 다단계**: Magic Animal Carousel — 패킹된 캐러셀 스토리지 오버런. 정식 소스를 주시면 Preservation/UniqueNFT 처럼 정확히 재현해 넣겠습니다.
 
 판정 기준은 **온체인 관찰 효과**(자금 유출 / owner·admin 탈취 / 부채>담보 / 상태 플래그
 반전 / 토큰 잔액 인플레 / 예측 카운터 / 불변식 위반)다. 증명 가능한 것만 PROVEN 으로

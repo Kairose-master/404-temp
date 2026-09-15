@@ -328,6 +328,8 @@ def classify(strategy, family_hint=None):
         return CLASS["unprotected_init"]
     if s.startswith("puzzle-wallet"):
         return CLASS["delegatecall_hijack"]
+    if s.startswith("ecdsa-malleability"):
+        return CLASS["access_control"]
     if s.startswith("good-samaritan"):
         return CLASS["callback_inconsistency"]
     if s.startswith("eip7702"):
