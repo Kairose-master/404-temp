@@ -324,6 +324,43 @@ class HandselNoKey(unittest.TestCase):
         self.assertTrue(should_run("not_a_real_fn", f))
 
 
+class HiddenSetDeep(unittest.TestCase):
+    def _src(self, name):
+        return (ROOT / "examples/families" / name).read_text(encoding="utf-8")
+
+    def test_readonly(self):
+        src = self._src("ReadOnlyReentrancy.sol")
+        f = extract_features(src, "CurveLike")
+        self.assertIn("readonly_reentrancy", f)
+        self.assertTrue(should_run("readonly_reentrancy", f))
+        labels = [l for l, _ in iter_defi_families(src, "CurveLike")]
+        self.assertIn("readonly-reentrancy", labels)
+
+    def test_inflation(self):
+        src = self._src("VaultInflation.sol")
+        f = extract_features(src, "InflatingVault")
+        self.assertIn("vault_inflation", f)
+        self.assertTrue(any(l == "vault-inflation" for l, _ in iter_defi_families(src, "InflatingVault")))
+
+    def test_hook(self):
+        src = self._src("HookReentrancy.sol")
+        f = extract_features(src, "HookVault")
+        self.assertIn("hook_reentrancy", f)
+
+    def test_sig_replay(self):
+        src = self._src("SigReplay.sol")
+        f = extract_features(src, "ReplayDesk")
+        self.assertIn("sig_replay", f)
+        self.assertNotIn("opaque_ir", f)
+
+    def test_metamorphic(self):
+        src = self._src("Metamorphic.sol")
+        f = extract_features(src, "MetamorphicFactory")
+        self.assertIn("metamorphic", f)
+        self.assertIn("selfdestruct", f)
+        self.assertTrue(should_run("metamorphic", f))
+
+
 
 if __name__ == "__main__":
     unittest.main()

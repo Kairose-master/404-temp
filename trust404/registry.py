@@ -145,6 +145,21 @@ PROVIDERS: List[Provider] = [
     Provider("imported_protocol", "imported_protocol", "synth",
              frozenset({"imported_amm", "imported_lending"}),
              "import 된 Uni/Aave 인터페이스 — 게터로 접음"),
+    Provider("readonly_reentrancy", "readonly_reentrancy", "synth",
+             frozenset({"readonly_reentrancy"}),
+             "뷰가 this.balance를 읽는 동안 콜백 (Curve read-only)"),
+    Provider("vault_inflation", "vault_inflation", "synth",
+             frozenset({"vault_inflation"}),
+             "ERC4626 첫 입금 인플레이션"),
+    Provider("hook_reentrancy", "hook_reentrancy", "synth",
+             frozenset({"hook_reentrancy", "receiver_hook"}),
+             "ERC777/721 tokensReceived 훅 재진입"),
+    Provider("sig_replay", "sig_replay", "synth",
+             frozenset({"sig_replay"}),
+             "nonce/deadline 없는 ecrecover 재사용"),
+    Provider("metamorphic", "metamorphic", "synth",
+             frozenset({"metamorphic"}),
+             "CREATE2 + selfdestruct 같은 주소 교체"),
 ]
 
 _BY_FN = {p.fn_name: p for p in PROVIDERS}

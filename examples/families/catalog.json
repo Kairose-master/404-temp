@@ -96,5 +96,40 @@
     "feature": "opaque_ir",
     "provider": null,
     "origin": "pure Yul — specialized synths skip, fuzz remains"
+  },
+  {
+    "file": "ReadOnlyReentrancy.sol",
+    "contract": "CurveLike",
+    "feature": "readonly_reentrancy",
+    "provider": "readonly_reentrancy",
+    "origin": "Curve/Balancer view reads this.balance mid-callback"
+  },
+  {
+    "file": "VaultInflation.sol",
+    "contract": "InflatingVault",
+    "feature": "vault_inflation",
+    "provider": "vault_inflation",
+    "origin": "ERC4626 first-depositor inflation"
+  },
+  {
+    "file": "HookReentrancy.sol",
+    "contract": "HookVault",
+    "feature": "hook_reentrancy",
+    "provider": "hook_reentrancy",
+    "origin": "ERC777 tokensReceived before CEI"
+  },
+  {
+    "file": "SigReplay.sol",
+    "contract": "ReplayDesk",
+    "feature": "sig_replay",
+    "provider": "sig_replay",
+    "origin": "ecrecover without nonce/deadline"
+  },
+  {
+    "file": "Metamorphic.sol",
+    "contract": "MetamorphicFactory",
+    "feature": "metamorphic",
+    "provider": "metamorphic",
+    "origin": "CREATE2 + selfdestruct same address"
   }
 ]
