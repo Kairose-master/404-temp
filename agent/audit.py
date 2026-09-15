@@ -320,7 +320,7 @@ def classify(strategy, family_hint=None):
         return CLASS["access_gate_bypass"]
     if s.startswith("array-underflow"):
         return CLASS["storage"]
-    if s.startswith("dex-drain"):
+    if s.startswith("dex-drain") or s.startswith("dex2-drain"):
         return CLASS["amm"]
     if s.startswith("amm-manip"):
         return CLASS["amm"]

