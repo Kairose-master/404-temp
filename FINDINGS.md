@@ -78,6 +78,45 @@ owner 권한이 `onlyOwner` + 2일 타임락 + 잔액 10% 상한으로 통제됩
 
 ---
 
+## 2.5 컨트랙트 워게임 유도 계열 (신규 3종)
+
+공개셋 4대 계열 위에, 잘 알려진 스마트컨트랙트 워게임(Ethernaut, Damn Vulnerable
+DeFi, Capture the Ether)이 가르치는 계열 3종을 스캐너·전략·타깃에 추가했다. 각
+계열마다 **취약 타깃 1개 + 같은 표면을 가진 안전 타깃 1개**를 넣어, 스캐너가
+취약본만 스코어링하고 안전본은 gated(오탐 없음)되는지 검증한다. 세 계열 모두
+에이전트가 오프라인 내장 EVM으로 자동 증명한다.
+
+### delegatecall 하이재킹 (Ethernaut Delegation / Preservation, Parity)
+- **취약(DelegateVault):** `execute(address module, bytes data)`가 호출자가 준
+  모듈을 `delegatecall` 한다. 모듈 코드가 타깃 저장소 컨텍스트에서 돌아 슬롯 0
+  (`owner`)을 덮어쓴다. 에이전트는 슬롯 0을 `msg.sender`로 쓰는 `Pwn` 모듈을
+  배포해 소유권을 탈취 → `ownerUnchanged` 위반.
+- **안전(LibraryVault):** delegatecall 대상이 생성자에서 고정한 `immutable` 모듈
+  뿐이고 함수 인자로 주소를 받지 않는다. 스캐너 판별자: delegatecall 수신자가
+  **함수 파라미터**일 때만 스코어링. 고정 모듈은 무점수 → 오탐 없음.
+- **방어:** 신뢰된 라이브러리만 delegatecall, 프록시 저장소 레이아웃 정렬, EIP-1967.
+
+### 약한/예측 가능한 난수 (Ethernaut CoinFlip, Capture the Ether "Predict the Future")
+- **취약(PredictableLottery):** 당첨값을 `keccak256(block.timestamp, prevrandao,
+  number) % 100`으로 정한다. 호출자가 같은 트랜잭션에서 동일 값을 계산할 수 있다.
+  에이전트는 소스의 엔트로피 식을 그대로 복제해 항상 맞는 값을 제출, 하우스 float를
+  솔벤시 하한 밑으로 드레인 → `houseSolvent` 위반.
+- **안전(CommitLottery):** 당첨 조건이 블록 변수가 아니라 사전 커밋된 해시(commit-
+  reveal)다. 스캐너 판별자: 블록 엔트로피 소스 **AND** (keccak256/모듈로 혼합)
+  **AND** 값 이전이 같은 함수에 있을 때만 스코어링. `block.timestamp` 데드라인
+  체크만으로는 트리거되지 않는다 → 오탐 없음.
+- **방어:** commit-reveal, Chainlink VRF, 미래 블록해시, 온체인 즉시 엔트로피 금지.
+
+### 미보호 initializer (Ethernaut Motorbike, 초기화 안 된 프록시)
+- **취약(OpenInitializer):** `initialize()`에 `initialized` 가드도 접근 제어도 없어
+  누구나 첫 호출로 admin 슬롯을 차지한다. 에이전트가 initializer를 호출해 탈취 →
+  `adminUninitialized` 위반.
+- **안전(GuardedInitializer):** `require(!initialized)` 가드가 있고 생성자에서 이미
+  초기화됨. 스캐너 판별자: `require(!initialized)`/`initializer` modifier/
+  `_disableInitializers`/owner 가드가 있으면 무점수 → 오탐 없음.
+- **방어:** OpenZeppelin `initializer`/`_disableInitializers()`, 배포 즉시 초기화,
+  생성자 로직 이전.
+
 ## 3. 에이전트 아키텍처 — 생성-검증 루프
 
 1. **Scan** — 소스 파싱: external call 위치, 상태 변경 순서(CEI), 접근 제어자, `unchecked`, 가격원.
@@ -117,3 +156,21 @@ owner 권한이 `onlyOwner` + 2일 타임락 + 잔액 10% 상한으로 통제됩
 - ItyFuzz: Snapshot-Based Fuzzer for Smart Contract — https://arxiv.org/pdf/2306.17135
 - Olympia: Fuzzer Benchmarking for Solidity (ASE 2024) — https://mariachris.github.io/Pubs/ASE-2024-Olympia.pdf
 - Foundry Invariant Testing (Cyfrin) — https://www.cyfrin.io/blog/smart-contract-fuzzing-and-invariants-testing-foundry
+
+**컨트랙트 워게임 (신규 계열의 출처 · 벤치마크)**
+- Ethernaut (OpenZeppelin) — https://ethernaut.openzeppelin.com
+  · Delegation / Preservation(delegatecall 하이재킹), CoinFlip(약한 난수),
+  Motorbike(미보호 initializer), Reentrancy, Token(언더플로)
+- Damn Vulnerable DeFi — https://www.damnvulnerabledefi.xyz
+  · Puppet/Compromised(오라클 조작), Selfie(거버넌스 플래시론), Climber(delegatecall)
+- Capture the Ether — https://capturetheether.com
+  · Predict the Future / Guess the Random Number(약한 난수), Token Sale/Whale(오버·언더플로)
+- Ethernaut/CTF 자동 풀이 · LLM 벤치마크
+  - Can LLMs Solve Ethernaut? / SC-Bench 계열 SC 취약점 벤치마크 — https://arxiv.org/abs/2410.11550
+  - CTF 자동 해결 에이전트(NYU CTF Bench) — https://arxiv.org/abs/2406.05590
+- delegatecall / 프록시 초기화 취약 정리
+  - SoK: Delegatecall & Proxy Upgrade 패턴 위험 (USENIX/ARES 계열) — https://arxiv.org/abs/2403.00758
+  - "Do not initialize your logic contract" — OpenZeppelin UUPS/Initializable 가이드
+    https://docs.openzeppelin.com/contracts/5.x/api/proxy#Initializable
+- 온체인 난수 위험 (Chainlink VRF, commit-reveal)
+  - Chainlink VRF: Verifiable Random Function — https://docs.chain.link/vrf

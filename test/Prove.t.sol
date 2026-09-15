@@ -28,6 +28,28 @@ import {Invariants as InvSafe} from "../targets/SafeVault/Invariants.sol";
 import {BoundedOwner} from "../targets/BoundedOwner/src/BoundedOwner.sol";
 import {Invariants as InvBounded} from "../targets/BoundedOwner/Invariants.sol";
 
+// ── wargame-derived families (Ethernaut / Damn Vulnerable DeFi / Capture the Ether) ──
+import {DelegateVault} from "../targets/DelegateVault/src/DelegateVault.sol";
+import {Invariants as InvDelegate} from "../targets/DelegateVault/Invariants.sol";
+import {Exploit as ExpDelegate} from "../exploits/DelegateVault/Exploit.sol";
+
+import {PredictableLottery} from "../targets/PredictableLottery/src/PredictableLottery.sol";
+import {Invariants as InvLottery} from "../targets/PredictableLottery/Invariants.sol";
+import {Exploit as ExpLottery} from "../exploits/PredictableLottery/Exploit.sol";
+
+import {OpenInitializer} from "../targets/OpenInitializer/src/OpenInitializer.sol";
+import {Invariants as InvInit} from "../targets/OpenInitializer/Invariants.sol";
+import {Exploit as ExpInit} from "../exploits/OpenInitializer/Exploit.sol";
+
+import {LibraryVault} from "../targets/LibraryVault/src/LibraryVault.sol";
+import {Invariants as InvLibrary} from "../targets/LibraryVault/Invariants.sol";
+
+import {CommitLottery} from "../targets/CommitLottery/src/CommitLottery.sol";
+import {Invariants as InvCommit} from "../targets/CommitLottery/Invariants.sol";
+
+import {GuardedInitializer} from "../targets/GuardedInitializer/src/GuardedInitializer.sol";
+import {Invariants as InvGuarded} from "../targets/GuardedInitializer/Invariants.sol";
+
 contract ProveTest is Harness {
     uint256 constant BN = 21_000_000;
     uint256 constant TS = 1_735_689_600;
@@ -90,6 +112,59 @@ contract ProveTest is Harness {
             _prove(address(t), address(new InvBounded()), address(new BoundedOwnerAttempt()), BN, TS, FUND);
         assertFalse(proven, "BoundedOwner must NOT be proven");
     }
+
+    // ── wargame families: vulnerable → must be PROVEN ───────────────────────
+    function test_DelegateVault_PROVEN() public {
+        vm.deal(address(this), 1000 ether);
+        DelegateVault t = new DelegateVault{value: 1 ether}();
+        (bool proven, string memory v) =
+            _prove(address(t), address(new InvDelegate()), address(new ExpDelegate()), BN, TS, FUND);
+        assertTrue(proven, "DelegateVault should be PROVEN");
+        assertEq(v, "ownerUnchanged");
+    }
+
+    function test_PredictableLottery_PROVEN() public {
+        vm.deal(address(this), 1000 ether);
+        PredictableLottery t = new PredictableLottery{value: 20 ether}();
+        (bool proven, string memory v) =
+            _prove(address(t), address(new InvLottery()), address(new ExpLottery()), BN, TS, FUND);
+        assertTrue(proven, "PredictableLottery should be PROVEN");
+        assertEq(v, "houseSolvent");
+    }
+
+    function test_OpenInitializer_PROVEN() public {
+        vm.deal(address(this), 1000 ether);
+        OpenInitializer t = new OpenInitializer{value: 1 ether}();
+        (bool proven, string memory v) =
+            _prove(address(t), address(new InvInit()), address(new ExpInit()), BN, TS, FUND);
+        assertTrue(proven, "OpenInitializer should be PROVEN");
+        assertEq(v, "adminUninitialized");
+    }
+
+    // ── wargame families: safe counterpart → must stay NOT PROVEN ───────────
+    function test_LibraryVault_NOT_PROVEN() public {
+        vm.deal(address(this), 1000 ether);
+        LibraryVault t = new LibraryVault{value: 1 ether}();
+        (bool proven,) =
+            _prove(address(t), address(new InvLibrary()), address(new LibraryVaultAttempt()), BN, TS, FUND);
+        assertFalse(proven, "LibraryVault must NOT be proven");
+    }
+
+    function test_CommitLottery_NOT_PROVEN() public {
+        vm.deal(address(this), 1000 ether);
+        CommitLottery t = new CommitLottery{value: 20 ether}();
+        (bool proven,) =
+            _prove(address(t), address(new InvCommit()), address(new CommitLotteryAttempt()), BN, TS, FUND);
+        assertFalse(proven, "CommitLottery must NOT be proven");
+    }
+
+    function test_GuardedInitializer_NOT_PROVEN() public {
+        vm.deal(address(this), 1000 ether);
+        GuardedInitializer t = new GuardedInitializer{value: 1 ether}();
+        (bool proven,) =
+            _prove(address(t), address(new InvGuarded()), address(new GuardedInitializerAttempt()), BN, TS, FUND);
+        assertFalse(proven, "GuardedInitializer must NOT be proven");
+    }
 }
 
 // Best-effort attacks the agent would attempt on the safe targets; they must fail.
@@ -106,6 +181,39 @@ contract BoundedOwnerAttempt {
         try IBounded(a).propose(address(this), address(a).balance) returns (uint256 id) {
             IBounded(a).execute(id);
         } catch {}
+    }
+    receive() external payable {}
+}
+
+// Best-effort attacks the agent would attempt on the new safe targets; each is
+// wrapped so it fails without reverting the proof pipeline.
+interface ILibrarySafe { function run(bytes calldata data) external; }
+contract LibraryVaultAttempt {
+    // delegatecall target is fixed, so a hijack() payload hits the benign
+    // module and the owner slot is never written.
+    function run(address a) external payable {
+        try ILibrarySafe(a).run(abi.encodeWithSignature("hijack()")) {} catch {}
+    }
+    receive() external payable {}
+}
+
+interface ICommitSafe { function claim(uint256 secret) external; }
+contract CommitLotteryAttempt {
+    // No block entropy gates the payout; a computed "guess" is not the secret.
+    function run(address a) external payable {
+        uint256 g = uint256(
+            keccak256(abi.encodePacked(block.timestamp, block.prevrandao, block.number))
+        ) % 100;
+        try ICommitSafe(a).claim(g) {} catch {}
+    }
+    receive() external payable {}
+}
+
+interface IGuardedSafe { function initialize(address who) external; }
+contract GuardedInitializerAttempt {
+    // initialize() is locked by the initialized guard; re-init reverts.
+    function run(address a) external payable {
+        try IGuardedSafe(a).initialize(address(this)) {} catch {}
     }
     receive() external payable {}
 }

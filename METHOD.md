@@ -11,12 +11,16 @@
 동작한다.
 
 ## 2. 에이전트 아키텍처
-- `scanner.py` — 소스에서 주석을 제거하고 함수 시그니처를 파싱한다. 4대 유형별
+- `scanner.py` — 소스에서 주석을 제거하고 함수 시그니처를 파싱한다. 7대 유형별
   신호를 추출·스코어링한다: 재진입(외부 `call{value:}` 이후에 잔액을 0/감소시키는
   CEI 위반, `nonReentrant` 가드 있으면 감점), 접근 제어(권한 검사 없는 자금 이동·
   `owner=` 대입), 정수 언더플로(`unchecked` 블록 안의 잔액 `-=`), 오라클
-  (`spotPrice`/`reserve` + `borrow` + `faucet`/`swap`). 특정 타깃 이름을
-  하드코딩하지 않는다.
+  (`spotPrice`/`reserve` + `borrow` + `faucet`/`swap`)에 더해, 컨트랙트 워게임
+  유도 3종: **delegatecall 하이재킹**(delegatecall 수신자가 함수 파라미터일 때만
+  스코어링 — 고정 immutable 모듈은 무점수), **약한 난수**(블록 엔트로피 소스 +
+  keccak/모듈로 혼합 + 값 이전이 한 함수에 공존 — 데드라인 체크만으로는 미발화),
+  **미보호 initializer**(`owner`/`admin`을 설정하되 `initialized`/`initializer`/
+  owner 가드가 없는 initializer). 특정 타깃 이름을 하드코딩하지 않는다.
 - `strategies.py` — 유형별 `Exploit.sol` 템플릿. 스캐너가 뽑은 실제 함수 이름을
   채워 넣고, 못 찾으면 공개셋 관례명으로 폴백한다. `--seed` 기반 PRNG로 동점 유형의
   순서를 결정론적으로 tie-break 한다.
@@ -68,29 +72,44 @@ LLM 은 **선택적 가속**이다. 키가 있으면 `claude-sonnet-5`, `tempera
   다중 액터로 확장되면 검증기도 맞춰 갱신해야 한다.
 - 하드코딩한 정답은 없다. 스캐너 점수가 0 이하인 유형은 생성 자체를 건너뛰므로,
   공개셋에 없는 완전히 새로운 유형(비공개 타깃)은 가장 가까운 템플릿으로만 접근한다.
+- 워게임 유도 3종(delegatecall/난수/initializer)도 단일 `run()` 안에서 성립하는
+  형태만 다룬다. delegatecall 하이재킹은 슬롯 0 = owner/admin 레이아웃을 가정하며
+  (다른 슬롯의 권한 변수는 오프셋 조정 필요), 약한 난수는 소스의 엔트로피 식이
+  블록/`msg` 글로벌만 참조할 때 복제가 유효하다(내부 상태를 섞으면 얕게만 시도).
+  initializer는 무인자 또는 단일 address 인자 형태를 지원한다.
 
 ---
 
-## 재현 (공개셋 6개)
+## 재현 (타깃 12개: 공개셋 6 + 워게임 유도 6)
 ```bash
 # 내장 EVM 검증기(기본, forge 불필요)
-for t in ReentrantVault OpenVault BadAccounting NaiveOracle SafeVault BoundedOwner; do
+for t in ReentrantVault OpenVault BadAccounting NaiveOracle DelegateVault \
+         PredictableLottery OpenInitializer SafeVault BoundedOwner LibraryVault \
+         CommitLottery GuardedInitializer; do
   python3 agent/agent.py \
     --contract targets/$t/src/$t.sol \
     --invariants targets/$t/Invariants.sol \
     --manifest  targets/$t/manifest.json \
-    --out out/$t --timeout 300 --seed 42 --max-attempts 5
+    --out out/$t --timeout 300 --seed 42 --max-attempts 8
   echo "$t -> exit $?"
 done
-# 기대: 취약 4개 exit 0(PROVEN), 멀쩡 2개 exit 1
+# 기대: 취약 7개 exit 0(PROVEN), 멀쩡 5개 exit 1
 ```
 검증 결과 요약:
 
-| 타깃 | 판정 | 깨진 술어 | exit |
-| --- | --- | --- | --- |
-| ReentrantVault | PROVEN | vaultSolvent | 0 |
-| OpenVault | PROVEN | ownerUnchanged | 0 |
-| BadAccounting | PROVEN | vaultSolvent | 0 |
-| NaiveOracle | PROVEN | protocolSolvent | 0 |
-| SafeVault | NOT PROVEN | — | 1 |
-| BoundedOwner | NOT PROVEN | — | 1 |
+| 타깃 | 계열 | 판정 | 깨진 술어 | exit |
+| --- | --- | --- | --- | --- |
+| ReentrantVault | 재진입 | PROVEN | vaultSolvent | 0 |
+| OpenVault | 접근 제어 | PROVEN | ownerUnchanged | 0 |
+| BadAccounting | 정수 언더플로 | PROVEN | vaultSolvent | 0 |
+| NaiveOracle | 오라클 조작 | PROVEN | protocolSolvent | 0 |
+| DelegateVault | delegatecall 하이재킹 | PROVEN | ownerUnchanged | 0 |
+| PredictableLottery | 약한 난수 | PROVEN | houseSolvent | 0 |
+| OpenInitializer | 미보호 initializer | PROVEN | adminUninitialized | 0 |
+| SafeVault | (안전) | NOT PROVEN | — | 1 |
+| BoundedOwner | (안전) | NOT PROVEN | — | 1 |
+| LibraryVault | (안전) | NOT PROVEN | — | 1 |
+| CommitLottery | (안전) | NOT PROVEN | — | 1 |
+| GuardedInitializer | (안전) | NOT PROVEN | — | 1 |
+
+`forge test`(`test/Prove.t.sol`)로도 12개 타깃 전부 같은 판정을 검증한다.
