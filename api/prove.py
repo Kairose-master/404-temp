@@ -1188,6 +1188,51 @@ def infer_target_name(src):
     matches = re.findall(r"\bcontract\s+(\w+)", s)
     return matches[-1] if matches else None
 
+_SKIP_TARGET_NAMES = {"Setup", "Invariants", "Test", "Script"}
+
+def concrete_targets(src):
+    """소스에 정의된, 분석 대상이 되는 구체 컨트랙트 이름들을 '취약해 보이는 순서'로 돌려준다.
+    - 인터페이스/라이브러리/추상/스크립트 제외.
+    - delegatecall/selfdestruct/.call{value}/receive/fallback 같은 위험 프리미티브가 많고,
+      상태변경 external 함수가 많은 컨트랙트를 앞에 둔다(취약본을 먼저 시도해 빠르게 성립).
+    라이브 콘솔이 '마지막 컨트랙트' 하나만 찍어 무해한 라이브러리를 겨냥하던 버그를 없앤다."""
+    s = _strip_comments(src)
+    try:
+        bodies = _contract_bodies(s)
+    except Exception:
+        bodies = {}
+    # 모든 구체 컨트랙트 이름을 먼저 모은다(참조 관계 판정용)
+    all_names = [m.group(3) for m in re.finditer(r"(abstract\s+)?(contract|interface|library)\s+(\w+)", s)
+                 if m.group(2) == "contract" and not m.group(1) and m.group(3) not in _SKIP_TARGET_NAMES]
+    scored = []
+    for m in re.finditer(r"(abstract\s+)?(contract|interface|library)\s+(\w+)", s):
+        is_abstract, kind, name = m.group(1), m.group(2), m.group(3)
+        if kind != "contract" or is_abstract or name in _SKIP_TARGET_NAMES:
+            continue
+        body = bodies.get(name, "")
+        try:
+            fns = _functions(body)
+        except Exception:
+            fns = []
+        has_mut = any(f.get("external") and "view" not in f.get("head","") and "pure" not in f.get("head","") for f in fns)
+        interesting = bool(re.search(r"\breceive\s*\(|\bfallback\s*\(|delegatecall|selfdestruct|\.call\s*\{\s*value", body))
+        inert = (not fns) and (not re.search(r"\b(receive|fallback|payable)\b", body))
+        if not (has_mut or interesting or inert):
+            continue
+        # 순위(높을수록 먼저): 위험 프리미티브 + 상태변경 함수 수 + '오케스트레이터' 보너스
+        # (본문이 다른 후보를 참조하면 레벨 본체일 가능성이 높다 — Dex>Token, PuzzleWallet>proxy 등)
+        danger = len(re.findall(r"delegatecall|selfdestruct|\.call\s*\{\s*value|\bcall\s*\(", body))
+        mut_n = sum(1 for f in fns if f.get("external") and "view" not in f.get("head","") and "pure" not in f.get("head",""))
+        orch = sum(1 for other in all_names if other != name and re.search(r"\b"+re.escape(other)+r"\b", body))
+        idx = m.start()
+        scored.append((-(danger*10 + mut_n + orch*20), idx, name))
+    scored.sort()
+    out = []
+    for _rank, _idx, name in scored:
+        if name not in out:
+            out.append(name)
+    return out
+
 def infer_invariants_name(src):
     s = _strip(src)
     for m in re.finditer(r"\bcontract\s+(\w+)\s*(is[^\{]*)?\{", s):
@@ -1970,6 +2015,14 @@ def _default_for_type(t, dummy="0x000000000000000000000000000000000000dEaD"):
     if re.fullmatch(r"bytes\d+", t): return bytes([0x11]) * int(t[5:])
     if t == "bytes": return b""
     if t == "string": return "t404"
+    # 배열: 고정크기 T[N] 은 N개, 동적 T[] 은 빈 배열. (Privacy 의 bytes32[3] 등)
+    am = re.fullmatch(r"(.+)\[(\d*)\]", t)
+    if am:
+        elem = _default_for_type(am.group(1), dummy)
+        if elem is None:
+            return None
+        n = int(am.group(2)) if am.group(2) else 0
+        return [elem] * n
     return None
 
 def _abi_ctor_types(abi):
@@ -5181,7 +5234,8 @@ def _run_custom(body):
     if not contract:
         return {"error":"'contract' source is required"}
     # 의존성(import) 있는 컨트랙트: 클라이언트가 웹 검색/첨부로 해결한 소스 맵을 받아 평탄화
-    name = (data.get("targetName") or "").strip() or infer_target_name(contract)
+    explicit_name = (data.get("targetName") or "").strip()
+    name = explicit_name or infer_target_name(contract)
     srcs = data.get("sources")
     flat_note = None
     if isinstance(srcs, dict) and srcs:
@@ -5207,56 +5261,112 @@ def _run_custom(body):
         for k,v in um.items():
             if isinstance(v,dict): manifest.setdefault(k,{}).update(v)
             else: manifest[k]=v
-    # 사용자가 생성자 인자를 안 줬고 타깃 생성자가 인자를 요구하면 자동 합성한다
-    # (라이브 콘솔이 CLI(audit.py)와 동등하게 생성자 있는 실제 컨트랙트를 배포하도록).
-    dep = manifest.setdefault("deploy", {})
-    if not dep.get("constructor_args"):
-        try:
-            cargs, _cpay = _synth_ctor_args(name, contract)
-            if cargs:
-                dep["constructor_args"] = cargs
-                manifest.setdefault("_synth", {})["constructor_args"] = True
-                # 비-payable 생성자 시드는 downstream(_ctor_payable 게이트)에서 0 처리됨
-        except Exception:
-            pass
+    _user_gave_ctor = bool(manifest.get("deploy", {}).get("constructor_args"))
+    def _manifest_for(cand_name):
+        # 후보마다 생성자 인자를 새로 합성한다(라이브 콘솔이 CLI(audit.py)와 동등하게
+        # 생성자 있는 실제 컨트랙트를 배포하도록). 사용자가 직접 준 인자는 그대로 둔다.
+        import copy as _copy
+        m = _copy.deepcopy(manifest)
+        d = m.setdefault("deploy", {})
+        if not _user_gave_ctor:
+            try:
+                cargs, _cpay = _synth_ctor_args(cand_name, contract)
+                if cargs:
+                    d["constructor_args"] = cargs
+                    m.setdefault("_synth", {})["constructor_args"] = True
+                    # 비-payable 생성자 시드는 downstream(_ctor_payable 게이트)에서 0 처리됨
+            except Exception:
+                pass
+        return m
     import time as _t; t0=_t.time()
     # 1) user/LLM-provided exploit -> verify only
     override=(data.get("exploitOverride") or "").strip()
     if override:
         if len(override)>MAX_SRC: return {"error":"exploit too large"}
+        man1 = _manifest_for(name)
         try:
-            return _attach_inputs(_run_override(name, contract, invariants or None, manifest, override, t0),
-                                  contract, invariants or None, manifest)
+            return _attach_inputs(_run_override(name, contract, invariants or None, man1, override, t0),
+                                  contract, invariants or None, man1)
         except Exception as e:
             return {"name":name,"error":str(e)[:400],"trace":traceback.format_exc()[-700:]}
     # 2) optional server-side LLM draft as first candidate (falls back to templates+fuzzer)
-    extra=None; llm_note=None
+    llm_note=None
     cfg=data.get("llm")
-    if isinstance(cfg,dict) and (cfg.get("provider") or cfg.get("base") or cfg.get("key")):
+    def _llm_extra(cand_name, man):
+        if not (isinstance(cfg,dict) and (cfg.get("provider") or cfg.get("base") or cfg.get("key"))):
+            return None
         try:
-            findings=scan_target(contract, invariants or "", manifest)
+            findings=scan_target(contract, invariants or "", man)
             draft=_llm_generate(contract, invariants or "", findings, cfg)
-            if draft: extra=[("llm", draft)]
+            if draft: return [("llm", draft)]
         except Exception as e:
+            nonlocal llm_note
             llm_note="LLM 사용 실패 → 템플릿/퍼저로 진행: "+str(e)[:140]
+        return None
+
+    # 후보 타깃 목록: 사용자가 targetName 을 명시하면 그것만, 아니면 소스 안의 모든 구체
+    # 컨트랙트를 '취약해 보이는 순서'로 순회한다. (파일에 라이브러리/헬퍼가 섞여 있어도
+    # 취약본을 찾을 때까지 루프로 물어뜯는다 — '마지막 컨트랙트'만 찍던 버그 제거.)
+    if explicit_name:
+        candidates = [explicit_name]
+    else:
+        candidates = concrete_targets(contract) or ([name] if name else [])
+        if name and name not in candidates:
+            candidates.append(name)
+    if not candidates:
+        return {"error":"could not find a contract definition in 'contract'"}
+    # 다중 후보면 후보당 퍼징 예산을 줄여 전체 시간이 폭주하지 않게 한다(Vercel maxDuration).
+    _budget_saved = os.environ.get("TRUST404_MAX_SECONDS")
+    if len(candidates) > 1:
+        try:
+            total = float(_budget_saved) if _budget_saved else 9.0
+        except Exception:
+            total = 9.0
+        per = max(3.0, min(total, 45.0 / len(candidates)))
+        os.environ["TRUST404_MAX_SECONDS"] = str(per)
+    last = None; tried = []
     try:
-        res=prove_sources(name, contract, invariants or None, manifest,
-                          do_verify=bool(invariants), extra_candidates=extra)
-        if llm_note: res["llm_note"]=llm_note
-        if isinstance(res, dict) and flat_note: res["flatten_note"]=flat_note
-        # 동적 미성립 시: 정적 휴리스틱 소견을 덧붙여 'NO PATTERN' 대신 근거 있는 경고를 준다
-        if isinstance(res, dict) and not res.get("proven"):
+        for cand in candidates:
+            tried.append(cand)
+            man = _manifest_for(cand)
+            extra = _llm_extra(cand, man)
             try:
-                h = static_findings(contract)
-            except Exception:
-                h = []
-            if h:
-                res["heuristics"] = h
-                res["note"] = (res.get("note") or "") + \
-                    f" · 동적 증명은 미성립이나 정적 휴리스틱 {len(h)}건 발견(예: {h[0]['title']})."
-        return _attach_inputs(res, contract, invariants or None, manifest)
-    except Exception as e:
-        return {"name":name,"error":str(e)[:400],"trace":traceback.format_exc()[-700:]}
+                res = prove_sources(cand, contract, invariants or None, man,
+                                    do_verify=bool(invariants), extra_candidates=extra)
+            except Exception as e:
+                last = {"name":cand,"error":str(e)[:400],"trace":traceback.format_exc()[-700:]}
+                continue
+            if isinstance(res, dict) and res.get("proven"):
+                if llm_note: res["llm_note"]=llm_note
+                if flat_note: res["flatten_note"]=flat_note
+                if len(tried) > 1:
+                    res["note"] = (res.get("note") or "") + \
+                        f" · 소스 내 {len(candidates)}개 컨트랙트를 순회해 취약 컨트랙트 '{cand}' 를 찾아 증명했습니다."
+                return _attach_inputs(res, contract, invariants or None, man)
+            last = res
+    finally:
+        if len(candidates) > 1:
+            if _budget_saved is None:
+                os.environ.pop("TRUST404_MAX_SECONDS", None)
+            else:
+                os.environ["TRUST404_MAX_SECONDS"] = _budget_saved
+    # 아무 후보도 성립 못함 → 마지막 결과 + 정적 휴리스틱으로 'NO PATTERN' 대신 근거 있는 경고
+    res = last or {"name":name,"proven":False,"strategy":None,"note":"공격 패턴 미검출"}
+    if llm_note: res["llm_note"]=llm_note
+    if flat_note: res["flatten_note"]=flat_note
+    if len(candidates) > 1:
+        res["note"] = (res.get("note") or "") + \
+            f" · 소스 내 {len(candidates)}개 컨트랙트({', '.join(candidates[:6])})를 모두 순회했으나 미성립."
+    if isinstance(res, dict) and not res.get("proven") and "error" not in res:
+        try:
+            h = static_findings(contract)
+        except Exception:
+            h = []
+        if h:
+            res["heuristics"] = h
+            res["note"] = (res.get("note") or "") + \
+                f" · 동적 증명은 미성립이나 정적 휴리스틱 {len(h)}건 발견(예: {h[0]['title']})."
+    return _attach_inputs(res, contract, invariants or None, _manifest_for(name))
 
 import urllib.request as _ureq
 
