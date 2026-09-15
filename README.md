@@ -85,6 +85,9 @@ python3 agent/audit.py <파일|디렉터리> --out audit
 #   audit/report.sarif SARIF 2.1.0 — GitHub code scanning / IDE 업로드용
 #   audit/exploits/<Contract>.sol  증명된 PoC
 # CI 게이트:  --fail-on critical   (발견 시 exit 3)
+# 대규모:     --quick (퍼저 예산 축소) · --max-contracts N (우선순위 상위 N개만)
+# 리포트엔 SWC/CWE·소스 위치·수정 코드 diff 가 포함된다.
+# The Ethernaut 벤치마크 결과: examples/ethernaut/RESULTS.md
 
 # Docker (엔트리포인트 서브커맨드):
 docker build -t track04 -f agent/Dockerfile .

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import re
 import sys
 import time
@@ -168,6 +169,52 @@ CLASS = {
 }
 
 
+# 규칙별 수정 코드 스니펫(제안 diff). 실제 코드에 맞춘 것은 아니고 패턴 가이드.
+FIX_DIFF = {
+    "SWC-107": (
+        "-        (bool ok,) = msg.sender.call{value: amount}(\"\");\n"
+        "-        balances[msg.sender] -= amount;   // 상태 갱신이 call 뒤 → 재진입\n"
+        "+        balances[msg.sender] -= amount;   // Checks-Effects-Interactions\n"
+        "+        (bool ok,) = msg.sender.call{value: amount}(\"\");\n"
+        "+        // 또는 함수에 nonReentrant 뮤텍스 적용"),
+    "SWC-105": (
+        "-    function adminWithdraw(address to, uint256 amt) external {\n"
+        "+    function adminWithdraw(address to, uint256 amt) external onlyOwner {\n"
+        "         (bool ok,) = to.call{value: amt}(\"\"); require(ok);\n"
+        "     }"),
+    "SWC-101": (
+        "-        unchecked { balanceOf[msg.sender] -= amount; }  // 언더플로\n"
+        "+        require(balanceOf[msg.sender] >= amount, \"insufficient\");\n"
+        "+        balanceOf[msg.sender] -= amount;  // 0.8 기본 검사 유지"),
+    "TR404-ORACLE": (
+        "-        uint256 price = pool.spotPrice();   // 단일 블록 조작 가능\n"
+        "+        uint256 price = oracle.consult(TWAP_WINDOW);  // 시간가중 평균\n"
+        "+        require(block.timestamp - oracle.updatedAt() < MAX_STALE, \"stale\");"),
+    "SWC-112": (
+        "-        (bool ok,) = module.delegatecall(data);  // module 이 인자(임의)\n"
+        "+        require(module == TRUSTED_LIB, \"untrusted module\");\n"
+        "+        (bool ok,) = TRUSTED_LIB.delegatecall(data);"),
+    "SWC-120": (
+        "-        uint256 r = uint256(keccak256(abi.encodePacked(\n"
+        "-            block.timestamp, block.prevrandao))) % N;  // 예측 가능\n"
+        "+        uint256 r = vrf.randomWord(requestId) % N;  // Chainlink VRF / commit-reveal"),
+    "SWC-118": (
+        "-    function initialize() external { admin = msg.sender; }  // 무방비\n"
+        "+    bool private _initialized;\n"
+        "+    function initialize() external {\n"
+        "+        require(!_initialized, \"already initialized\"); _initialized = true;\n"
+        "+        admin = msg.sender;\n"
+        "+    }   // 또는 생성자에서 _disableInitializers()"),
+    "TR404-FLASHLOAN": (
+        "-        require(gov.balanceOf(msg.sender) * 2 > gov.totalSupply());  // 순간 잔액\n"
+        "+        require(gov.getPastVotes(msg.sender, block.number - 1) * 2\n"
+        "+                > gov.totalSupply(), \"snapshot\");  // 과거 블록 스냅샷"),
+    "TR404-EXPLOIT": (
+        "// 관찰된 자산 손실/권한 변경 경로에 접근 제어·CEI·입력 검증을 적용하고\n"
+        "// 재현 PoC 로 재검증하십시오."),
+}
+
+
 def classify(strategy, family_hint=None):
     """전략/계열 라벨을 표준 분류로 매핑한다."""
     s = strategy or ""
@@ -263,6 +310,7 @@ def build_report(findings, args, total_analyzed=None):
             "cwe": cls["cwe"],
             "title": cls["title"],
             "remediation": cls["fix"],
+            "fix_diff": FIX_DIFF.get(cls["rule"], ""),
             "broken": r.get("firstViolated") or "",
             "evidence": f["evidence"],
             "drained_eth": f.get("drained_eth"),
@@ -318,6 +366,11 @@ def render_md(report):
             if f.get("poc_file"):
                 L.append(f"- PoC: `{f['poc_file']}`")
             L.append(f"- 수정 가이드: {f['remediation']}")
+            if f.get("fix_diff"):
+                L.append("")
+                L.append("```diff")
+                L.append(f["fix_diff"])
+                L.append("```")
             L.append("")
     heur = [f for f in report["findings"] if (not f["proven"]) and f["severity"] == "MEDIUM"]
     if heur:
@@ -379,6 +432,20 @@ def render_sarif(report):
     }
 
 
+def contract_priority(eng, src, contract):
+    """대규모 프로젝트 타깃 선별용 우선순위 — 값을 보유/이동하거나 권한·위험
+    프리미티브를 쓰는 컨트랙트를 먼저 분석한다."""
+    body = eng._contract_bodies(eng._strip_comments(src)).get(contract, "")
+    score = 0
+    if re.search(r"\.call\s*\{\s*value", body): score += 3
+    if "delegatecall" in body: score += 3
+    if re.search(r"\bpayable\b", body): score += 2
+    if re.search(r"\b(owner|admin)\b", body): score += 2
+    if "selfdestruct" in body: score += 2
+    if "transferFrom" in body and "balanceOf" in body: score += 1
+    return score
+
+
 def gather_files(path):
     p = Path(path)
     if p.is_file():
@@ -398,12 +465,17 @@ def main(argv=None):
     ap.add_argument("--seed-eth", type=float, default=10.0, help="ETH seeded into each target (effect mode)")
     ap.add_argument("--invariants", help="optional Invariants.sol to prove custom properties")
     ap.add_argument("--only", help="only analyze this contract name")
+    ap.add_argument("--quick", action="store_true", help="빠른 스캔 — 퍼저 예산 축소")
+    ap.add_argument("--max-contracts", type=int, default=0,
+                    help="분석할 최대 컨트랙트 수(0=무제한, 우선순위 높은 순)")
     ap.add_argument("--fail-on", choices=["none", "proven", "high", "critical"], default="none")
     ap.add_argument("--include-safe", action="store_true", help="also list clean contracts in JSON")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv if argv is not None else sys.argv[1:])
 
     eng = load_engine()
+    if args.quick:
+        os.environ["TRUST404_FUZZ_BUDGET"] = "120"
     inv_src = Path(args.invariants).read_text(encoding="utf-8") if args.invariants else None
     files = gather_files(args.path)
     outdir = Path(args.out)
@@ -413,16 +485,24 @@ def main(argv=None):
         if not args.quiet:
             print(*a, file=sys.stderr)
 
-    findings = []
+    # 후보 수집 → 우선순위 정렬 → (선택) 상한 → 분석
+    cands = []
     for fp in files:
         try:
             src = fp.read_text(encoding="utf-8")
         except Exception as e:
             log(f"skip {fp}: {e}"); continue
-        targets = concrete_contracts(src, eng)
-        if args.only:
-            targets = [t for t in targets if t == args.only]
-        for c in targets:
+        for c in concrete_contracts(src, eng):
+            if args.only and c != args.only:
+                continue
+            cands.append((fp, src, c))
+    cands.sort(key=lambda t: contract_priority(eng, t[1], t[2]), reverse=True)
+    if args.max_contracts > 0:
+        cands = cands[:args.max_contracts]
+
+    findings = []
+    if True:
+        for fp, src, c in cands:
             log(f"analyzing {fp}:{c} …")
             res = analyze_source(eng, src, c, inv_src, args.seed_eth, args.seed)
             sev, evidence, is_finding = severity_for(res)
