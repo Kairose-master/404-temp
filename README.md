@@ -72,6 +72,23 @@ python3 agent/agent.py --contract targets/ReentrantVault/src/ReentrantVault.sol 
   --timeout 300 --seed 42 --max-attempts 5
 ```
 
+## 실무 감사 CLI — `agent/audit.py`
+트랙 하네스(수기 Invariants)가 없어도, **임의의 `.sol` 파일이나 디렉터리**를 그대로
+감사해 **동적으로 증명된 취약점 리포트**(JSON + Markdown + PoC)를 뽑는다. 불변식을
+안 주면 자동 효과검사(자금 유출 / owner·admin 탈취 / 부채>담보)로 판정하고, 주면 그
+불변식으로 증명한다. 생성자 인자는 시그니처에서 자동 합성한다.
+
+```bash
+python3 agent/audit.py <파일|디렉터리> --out audit
+#   audit/report.md   사람용 리포트 (심각도·요약표·PoC 경로)
+#   audit/report.json 기계용 (CI 연동)
+#   audit/exploits/<Contract>.sol  증명된 PoC
+# CI 게이트:  --fail-on critical   (발견 시 exit 3)
+```
+엔진 전량(스캐너 7계열 템플릿 + 범용 퍼저: 호출 시퀀스 · 재진입 합성 · 다중 컨트랙트
+AMM 가격 조작(플래시론식) · 시스템 내부 플래시론 차용자)을 그대로 사용한다. 같은
+입력 + 같은 `--seed` → 같은 PoC(결정론).
+
 ## 리서치 & 대시보드
 - 취약점 분석 + 4대 공격 기법 + 최신 논문 정리: [`FINDINGS.md`](./FINDINGS.md)
 - 라이브 원버튼 콘솔(배포→생성→실행→증명): https://trust404-prover.vercel.app
@@ -80,7 +97,7 @@ python3 agent/agent.py --contract targets/ReentrantVault/src/ReentrantVault.sol 
 
 ## 레이아웃
 ```
-agent/       에이전트 (agent.py, scanner, strategies, verify, llm, Dockerfile)
+agent/       에이전트 (agent.py=트랙 CLI, audit.py=실무 감사 CLI, scanner, strategies, verify, llm, Dockerfile)
 exploits/    타깃별 생성된 Exploit.sol + attempts.log (제출물 C)
 harness/     참가 번들 하네스 사본 (forge 검증 경로용)
 targets/     타깃 12개 (공개셋 6 + 워게임 유도 6: 취약 7 / 안전 5)

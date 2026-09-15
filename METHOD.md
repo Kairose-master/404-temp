@@ -30,8 +30,11 @@
   `run{value: 10 ether}(target)` → 재검사. `TRUST404_VERIFIER=forge` 면 참가 번들
   `harness/src/Harness.sol` 의 `_prove()` 를 임시 Foundry 프로젝트로 엮어
   `forge test` 로 검증한다.
-- `agent.py` — CLI/오케스트레이션. `--out/Exploit.sol`(최선 후보)과
+- `agent.py` — 트랙 표준 CLI/오케스트레이션. `--out/Exploit.sol`(최선 후보)과
   `--out/attempts.log`(시도별 번호·전략·결과·깨진 술어)를 남긴다.
+- `audit.py` — 실무 감사 CLI. 임의 `.sol`/디렉터리를 받아 불변식 없이도(자동 효과검사)
+  엔진 전량을 돌려 심각도별 리포트(JSON/Markdown)와 PoC를 산출한다. 생성자 인자는
+  시그니처에서 자동 합성하고, 스크립트/인터페이스/라이브러리는 건너뛴다.
 - `llm.py` — 선택적 LLM 제안기. urllib 만 사용, `temperature=0`. 실패 시 예외를
   던져 휴리스틱으로 degrade.
 
