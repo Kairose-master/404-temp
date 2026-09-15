@@ -50,16 +50,42 @@ TRUST404 Track 04(Autonomous Exploit Prover)를 만들며 참고한 자료 모�
 - BCodeVis：面向区块链智能合约的漏洞检测可视分析方法, 计算机辅助设计与图形学学报 2024 — https://www.jcad.cn/cn/article/pdf/preview/10.3724/SP.J.1089.2024-00496.pdf
 - SliSE — FSE 2024, 中山大学·哈尔滨工业大学 — https://arxiv.org/abs/2403.11254
   I-PDG 슬라이싱 + 심볼릭. 복잡 컨트랙트 F1 78.65% (비교도구 ≤9.26%).
+- **揭晚晴 등, 智能合约与DeFi协议漏洞检测技术综述, 软件学报 2026, 37(1):344–377**
+  http://www.jos.org.cn/1000-9825/7413.htm
+  계약층 vs **DeFi 프로토콜층**. 계약층 LLM(주엔진 / 전통결합). 기존 서베이의 DeFi 공백.
+- **Smart-Target, 基于目标制导符号执行的智能合约安全漏洞检测, 软件学报 2025(12)**
+  목표 문 기준 CFG 가지치기. Mythril 대비 탐지 −60.8% 시간, 재현 −92.2%, 재현 테스트케이스 출력.
+- 罗一帆 등, 基于人工智能的智能合约漏洞检测研究综述, 网络空间安全科学学报 2025, 3(3):25–37
+- 应用科学学报 2025 opcode-bigram+RF (정확도 93.6%) — 탐지, 증명 아님
+- 计算机工程 2025 AST-embed BiGRU-ATT (5종, micro-F1 +13pt)
+- 通信学报 2025 双模态交叉注意力 (소스+바이트코드)
+- Knowdit — agentic 탐지 + 감사지식 요약, arXiv:2603.26270
+- Chiral Analysis — 경로 간 관계 불일치, arXiv:2607.17987
 - A Comparative Evaluation of Automated Analysis Tools for Solidity, Zhiyuan Wei 등, 2023 — https://arxiv.org/abs/2310.20212
 
-## 4. 자동 익스플로잇 생성 · 벤치마크
-- A1: AI Agent Smart Contract Exploit Generation — https://arxiv.org/pdf/2507.05558
-  도구 6개(소스·ctor·상태·sanitizer·concrete exec·수익). 실패 PoC 히스토리.
-- PoCo: Agentic Proof-of-Concept Exploit Generation (ACM TOSEM) — https://doi.org/10.1145/3816704 · https://arxiv.org/abs/2511.02780
-  ReAct + forge compile/test. 잘 만들어진 PoC 50/50, 논리 정확 32/50.
-  데이터셋 https://github.com/ASSERT-KTH/Proof-of-Patch/
-- AI agents find smart contract exploits (Anthropic) — https://red.anthropic.com/2025/smart-contracts/
-- SoK: Root Causes of $1 Billion Loss in SC Attacks — https://arxiv.org/html/2507.20175
+## 4. 자동 익스플로잇 생성 · 벤치마크 (2025–2026)
+- **A1** Gervais/Zhou — https://arxiv.org/abs/2507.05558
+  VERITE 63%, $9.33M. 도구 6개, 5 round. 즉시탐지 86–89% vs 일주일 6–21%.
+- **PoCo** Andersson et al., ACM TOSEM — https://arxiv.org/abs/2511.02780
+  ReAct + Foundry. 잘 만든 PoC 50/50, 논리 32/50. Proof-of-Patch 23건.
+- **ReX** Prompt to Pwn — https://arxiv.org/abs/2508.01371
+  5 LLM × 8부류. Gemini 2.5 Pro 67%. **교차 컨트랙트에서 약함.**
+- **EvoPoC** Hierarchical Knowledge Graph — https://arxiv.org/abs/2605.02868
+  88사고 96.6% ESR, $116M 재현, A1 대비 2×/8.5×, 0-day 16. SMT 도달 + 자산 시뮬.
+- **Verite** profit-guided fuzz — https://arxiv.org/abs/2501.08834
+  29건 구체 익스플로잇, FP 0, $18M+.
+- **SmartFuzz** CRP+RCC — https://arxiv.org/abs/2511.12164
+  30분 +5.8–74.7% 탐지, FN −80%.
+- **EVMbench** OpenAI+Paradigm+OtterSec — https://arxiv.org/abs/2603.04915
+  117취약. GPT-5.3-Codex Exploit 71% / Patch 42%.
+- **SCONE-bench** Anthropic 2025-12 — https://www.anthropic.com/research/smart-contracts
+  cutoff 이후 $4.6M. 0-day 2건. Mythos 2026-05 $35M:
+  https://www.anthropic.com/research/exploit-evals
+- PropertyGPT NDSS'25 Distinguished Paper (Certora 속성 RAG)
+- iAudit ICSE'25 (263건 F1 91%, 원인 설명 일치 38%)
+- LLM4Vuln — https://arxiv.org/abs/2401.16185
+- Ultrafuzz (Monad, 2026-09) — https://github.com/monad-developers/ultrafuzz
+- SoK: Root Causes of $1 Billion Loss — https://arxiv.org/html/2507.20175
 
 ## 5. 컨트랙트 워게임 · 실사고 (벤치마크, 레벨 솔버 아님)
 - The Ethernaut — https://ethernaut.openzeppelin.com (`examples/ethernaut/RESULTS.md`, 32 자동 증명)
@@ -73,6 +99,12 @@ TRUST404 Track 04(Autonomous Exploit Prover)를 만들며 참고한 자료 모�
 - 실사고 2026-09 Ether.fi AtomicQueue (SlowMist): `solve()` 의 solver 인자
   접근제어 없음 → Truster 와 **같은 계열**. https://x.com/SlowMist_Team/status/2098344499923784048
 - 인브라우저 EVM 재실행 플레이그라운드 (24건 Aug–Sep 2026): https://crypto.training/hacks/
+  Sep 목록에 EtherFi Veda AtomicQueue 포함.
+- Aegis 워게임 완주 보고: Ethernaut 40/40 · DVD 18/18 (카탈로그 스윕이지 일반화 증명이 아님)
+- EVMbench 공개 반응 (2026-09): 최고 에이전트 exploit 72.2%, 6개월 전 <20%
+  https://x.com/RaZiaH_Q/status/2095880613530161641
+- 복잡 공격 학습 세트: Kyberswap, 1inch Yul calldata, GMX, Euler
+  https://x.com/arsen_bt/status/2002772053800411542
 
 ## 6. 접근 비교 (요약)
 | 도구/연구 | 방법 | 산출 | 확증 방식 |
@@ -83,4 +115,8 @@ TRUST404 Track 04(Autonomous Exploit Prover)를 만들며 참고한 자료 모�
 | SliSE | 슬라이싱+심볼릭 | 재진입 경보 | 도달성 검증 |
 | EthPloit / teEther | 퍼징+오염 / 심볼릭 페이로드 | 익스플로잇 시드 | 부분 실행 |
 | PoCo / A1 | LLM ReAct + Foundry | PoC 초안 | forge test · 역사 상태 |
+| EvoPoC | 계층지식그래프 + SMT + 자산시뮬 | 실행 PoC + 수익 | 도달+경제 2단 |
+| Verite | profit-guided 퍼징 | 구체 익스플로잇 | 추출 가치, FP 0 |
+| EVMbench / SCONE | 에이전트 eval | exploit/patch/USD | 로컬 EVM · 역사 상태 |
+| Aegis | 카탈로그 스윕 | 워게임 완주 + fork 재현 | Foundry PoC |
 | **본 도구** | 스캐너+계열 synth+퍼저 **생성-검증** | 실행 PoC + SWC/CWE + 수정 diff | **내장 EVM 동적 증명** |

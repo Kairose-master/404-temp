@@ -240,13 +240,17 @@ Backends      py-evm (기본) | anvil+forge (교차검증)
 | P1 | 템플릿 관례명 폴백 삭제, 스캔 시그니처만 | METHOD 한계절 | S |
 | P1 | Setup.s.sol 을 py-evm 정본 배포기 | Harness 주석, A1 ctor 도구 | S |
 | P1 | 효과 오라클 플러그인 (DoS/공급량/권한락) | fuzz checker 4종뿐 | M |
+| P1 | **profit oracle** (extractable ETH) | Verite / A1 / SCONE 2025–26 | M |
+| P1 | capability → 계층 지식(의미/원인/프리미티브) | EvoPoC HKG | M |
 | P2 | py-evm vs forge 교차검증 | PoCo 논리 정확성 | S |
-| P2 | Proof-of-Patch 23건 벤치 | 워게임 바이어스 제거 | M |
+| P2 | Proof-of-Patch 23건 + VERITE/SCONE/EVMbench 부분집합 | 워게임 바이어스 제거 | M |
+| P2 | Aegis식 카탈로그 스윕을 synth 앞단으로 | Ethernaut 40/40는 카탈로그 완주 | S |
 | P2 | 퍼저 progressive deepening 을 루프가 명시 구동 | METHOD 에만 존재 | S |
 | P2 | `index.html`/`web/`/`analysis.html`/`track04.html` 1개로 | 표면 부채 | S |
 | P2 | Vercel job+poll (60s 컷 회피) | prove.py maxDuration 60 | M |
 | P3 | default branch `main` | CI 가 main+claude/** | S |
-| P3 | hevm/Halmos 심볼릭 백엔드 (선택) | SliSE Stage II | L |
+| P3 | 교차 컨트랙트 월드 모델 | ReX 약점, JOS 2026 DeFi층, Euler/Kyberswap | L |
+| P3 | hevm/Halmos 심볼릭 백엔드 (선택) | SliSE Stage II, Smart-Target | L |
 
 트랙 12/12 와 Ethernaut 32 증명은 **회귀 게이트**로 유지한다. 일반화 패치가
 정탐을 떨어뜨리면 피처 태그를 느슨하게 (OR) 되돌린다 — `should_run` 의 기본이
@@ -257,7 +261,64 @@ Backends      py-evm (기본) | anvil+forge (교차검증)
 
 ---
 
-## 4. 결정론 · 오탐 계약 (바꾸지 말 것)
+## 5. 2025–2026 최신 문헌 (이번 보강)
+
+워게임 솔버를 더 넣는 대신, **측정 벤치 · 수익 오라클 · 교차컨트랙트 · 지식그래프**
+네 축이 문헌에서 반복된다. 우리 엔진이 비워 둔 칸과 1:1이다.
+
+### 5.1 미국 · 국제 — 생성-검증이 주류가 됨
+
+| 연구 | 연 | 숫자 | 우리 엔진에 넣을 것 |
+|---|---|---|---|
+| **A1** Gervais/Zhou [2507.05558](https://arxiv.org/abs/2507.05558) | 2025–26 | VERITE 63%, $9.33M, 5 round 안에 대부분 | 이미 도구 6개·실패 히스토리. **수익 정규화**는 아직 없음 |
+| **PoCo** KTH [2511.02780](https://arxiv.org/abs/2511.02780) | 2025–26 | 잘 만든 PoC 50/50, 논리 32/50 | critique 루프 착수. 패치 후 실패로 논리 정확성 검사 = P2 |
+| **ReX** Prompt to Pwn [2508.01371](https://arxiv.org/abs/2508.01371) | 2025–26 | Gemini 2.5 Pro 평균 67%, 산술 93%. **교차 컨트랙트는 약함** | 월드 모델(멀티 tx)이 단일 `run(address)` 보다 급하다 |
+| **Verite** [2501.08834](https://arxiv.org/abs/2501.08834) | 2025 | 29건 구체 익스플로잇, $18M+, FP 0, 12건은 실공격보다 많이 뽑음 | **profit-guided fuzz**: checker 를 잔액 감소만이 아니라 extractable USD/ETH 로 |
+| **EvoPoC** [2605.02868](https://arxiv.org/abs/2605.02868) | 2026-05 | 88 사고 96.6% ESR, $116M 재현, A1 대비 ESR 2× · 가치 8.5×, 0-day 16 | capability registry 를 **계층 지식그래프**(프로토콜 의미 → 실패원인 → 프리미티브)로 승격. 검증을 SMT 도달 + 자산 시뮬 2단 |
+| **SmartFuzz** [2511.12164](https://arxiv.org/abs/2511.12164) | 2025-11 | 30분에 +5.8–74.7% 탐지, FN −80% | CRP(연속 반성) = 우리 critique. RCC(의존 체인) = 호출 시퀀스를 전역/로컬 에이전트로 쪼갬 |
+| **EVMbench** OpenAI+Paradigm+OtterSec [2603.04915](https://arxiv.org/abs/2603.04915) | 2026-03 | 117취약/40레포. GPT-5.3-Codex Exploit **71%**, Patch 42%. X 보고 6개월 전 <20% → 72% | 트랙 12 + Ethernaut 만으로 일반화를 주장하지 말 것. 공개 eval 에 올려라 |
+| **SCONE-bench** Anthropic [2025-12](https://www.anthropic.com/research/smart-contracts) · [Mythos 2026-05](https://www.anthropic.com/research/exploit-evals) | 2025–26 | cutoff 이후 $4.6M / Mythos $35M, 2849 신규에서 0-day 2건($3.7k, API $3.5k) | **수익(USD)이 채점 단위**. 발견 ≠ 증명 ≠ 수익 |
+| **PropertyGPT** NDSS'25 Distinguished | 2025 | Certora 속성을 RAG 로 새 컨트랙트에 이전 | 불변식 합성: 사람 속성 코퍼스에서 retrieve |
+| **iAudit** ICSE'25 | 2025 | 263건 F1 91%. 원인 설명은 GT와 38%만 일치 | LLM 설명은 채점하지 말 것. EVM만 |
+| **Ultrafuzz** Monad [2026-09](https://monad.xyz/blog/open-sourcing-ultrafuzz) | 2026-09 | 수백 전문화 에이전트, Solidity+Vyper | 단일 루프 유지하되 **전략 병렬**(템플릿/synth/fuzz/llm)은 예산만 나누면 됨 |
+| **Aegis** catalog-driven | 2026 | Ethernaut **40/40**, DVD **18/18**, fork 재현 4건(Socket/Audius/DAO Maker/Beanstalk) | 카탈로그 스윕 + 우리 합성. 워게임 완주는 "카탈로그가 그 패턴을 가졌다"는 뜻이지 일반화가 아님 |
+
+ReX의 한 줄: *frontier LLM은 단일 컨트랙트 PoC는 잘 만들고, 교차 컨트랙트에서 무너진다.*
+EvoPoC의 한 줄: *익스플로잇 합성은 코드생성이 아니라 프로토콜 의미 위 구조적 추론이다.*
+SCONE의 한 줄: *즉시 탐지 성공확률 86–89%, 일주일 늦으면 6–21% (A1 Monte Carlo).*
+
+### 5.2 중국 — 탐지에서 재현·DeFi 층으로
+
+| 연구 | 연 | 요지 | 엔진 |
+|---|---|---|---|
+| **揭晚晴 등, 智能合约与DeFi协议漏洞检测技术综述**, 软件学报 2026, 37(1):344–377, [jos.007413](http://www.jos.org.cn/1000-9825/7413.htm) | 2026 | 계약을 **스마트컨트랙트 층 vs DeFi 프로토콜 층**으로 분리. 계약층은 LLM이 주엔진 또는 전통방법과 결합. 프로토콜층은 공격 전/후 탐지. 기존 서베이의 DeFi 공백을 메움 | 우리 7계열은 계약층. DVD 계열(donation/unpermissioned callback/governance flashloan)이 프로토콜층 진입점. **프로토콜층 없이 Ethernaut만 돌리면 서베이가 지적한 공백을 그대로 재현** |
+| **Smart-Target**, 基于目标制导符号执行, 软件学报 2025(12) | 2025 | 정적/주석 취약 문을 목표로 CFG 가지치기. SB Curated에서 Mythril 대비 탐지 시간 −60.8%, 재현 −92.2%, **재현 가능한 테스트케이스 출력** | P1 슬라이스의 중국 대응물. 스캐너가 찍은 sink를 심볼릭/퍼저 시드로 |
+| 罗一帆 등, 基于人工智能的智能合约漏洞检测研究综述, 网络空间安全科学学报 2025 | 2025 | 2020–25 NLP/GNN/LLM. 데이터 질·설명가능성·확장성이 한계 | DL은 랭킹만 (MVD-HG와 동일 자리) |
+| 应用科学学报 2025 opcode bigram+RF | 2025 | 정확도 93.6% Macro-F1 93.9% | 탐지. 증명 아님 |
+| 计算机工程 2025 AST-embed BiGRU-ATT | 2025 | 5종(재진입·반환미검사·타임스탬프·접근·DoS), 시퀀스 대비 micro-F1 +13pt | AST 임베딩은 P1 파서와 맞닿음 |
+| 通信学报 2025 双模态交叉注意力 | 2025 | 단일 모달 대비 +2%p | 소스+바이트코드 이중 모달 — 우리는 소스만 |
+| **Knowdit** [2603.26270](https://arxiv.org/abs/2603.26270) | 2026 | 감사 지식 요약 + agentic 탐지 | 카탈로그를 프롬프트가 아니라 IR 태그로 |
+| **Chiral Analysis** [2607.17987](https://arxiv.org/abs/2607.17987) | 2026 | 비즈니스 경로 간 관계 불일치 | view-callback 불일치(Elevator/Shop)의 일반형 |
+
+중국 2024 서베이(董)는 "탐지의 exploitability가 낮다"고 했고, 2025 Smart-Target / 2026 JOS DeFi 서베이는 **재현 테스트케이스**와 **프로토콜층**으로 그 문장을 실행한다. 우리 자리는 그대로다.
+
+### 5.3 X · 워게임 · 실사고 (2026-08–09)
+
+- EVMbench 공개 직후: "best agent exploits **72.2%**. six months ago under 20%." ([@RaZiaH_Q](https://x.com/RaZiaH_Q/status/2095880613530161641))
+- [crypto.training/hacks](https://crypto.training/hacks/) 24건 Aug–Sep 인브라우저 재실행. Sep 목록에 **EtherFi Veda AtomicQueue** — 우리가 Truster 계열로 묶은 바로 그 사고.
+- 복잡한 공격 학습 세트 (Kyberswap, 1inch Yul calldata, GMX, VTHO, Euler) — calldata 폭/셀렉터 오프셋은 이미 `calldata_width_confusion`·`selector_offset_check`. Euler·Kyberswap은 **교차 컨트랙트 가격/청산**이라 월드 모델 없이는 안 된다.
+- "에이전트가 감사를 하게 둘 수는 있어도, 감사가 *끝났다*고 스스로 판정하게 두면 안 된다." — 우리 exit 1(미발견)을 성공으로 포장하지 말 것.
+
+### 5.4 백로그에 추가되는 항목
+
+| # | 항목 | 근거 | 크기 |
+|---|---|---|---|
+| P1 | **profit oracle** (잔액만이 아니라 extractable ETH/USD) | Verite, A1, SCONE | M |
+| P1 | capability registry → **HKG 한 단계**(프로토콜 의미 / 원인 / 프리미티브) | EvoPoC | M |
+| P2 | 공개 벤치: VERITE + SCONE-bench 부분집합 + EVMbench exploit split | 워게임 바이어스 | M |
+| P2 | Aegis식 **카탈로그 스윕을 synth 앞에** (히트만 검증) | Ethernaut 40/40는 카탈로그 완주 | S |
+| P2 | Smart-Target식 sink 가지치기를 퍼저 시드로 | 软件学报 2025(12) | M |
+| P3 | 교차 컨트랙트 월드 모델 (ReX가 깨진 지점) | ReX, JOS 2026 DeFi층, Euler/Kyberswap | L |
 
 - 같은 입력 + 같은 `--seed` → 같은 `Exploit.sol`
 - 안전 페어(SafeVault 등)는 전 단계 소진 후 exit 1
