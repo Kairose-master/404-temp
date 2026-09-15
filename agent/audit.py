@@ -147,6 +147,7 @@ FAMILY_KO = {
     "weak_randomness": "약한 난수",
     "unprotected_init": "미보호 initializer",
     "griefing_dos": "그리핑 DoS (예상치 못한 revert)",
+    "callback_inconsistency": "신뢰 못 할 콜백 반환 신뢰",
 }
 
 # 계열 → 표준 분류(SWC/CWE) + 수정 가이드 + 코드 핫스팟 탐지용 토큰.
@@ -195,6 +196,10 @@ CLASS = {
         "rule": "SWC-113", "cwe": "CWE-703", "title": "DoS via unexpected revert (griefing)",
         "fix": "push 송금(transfer/send) 대신 pull-payment(withdraw 패턴). 외부 호출 실패가 핵심 상태 전이를 막지 않게 분리.",
         "hot": r"\.transfer\s*\(|\.send\s*\("},
+    "callback_inconsistency": {
+        "rule": "TR404-CALLBACK", "cwe": "CWE-807", "title": "Trusting an untrusted callback's return",
+        "fix": "외부(특히 msg.sender) 콜백 반환을 신뢰해 분기·상태전이하지 말 것. 같은 값을 재호출로 두 번 믿지 말고, 결과를 캐시·검증하거나 신뢰 경계를 명확히.",
+        "hot": r"\)\s*\.\s*\w+\s*\("},
     "generic": {
         "rule": "TR404-EXPLOIT", "cwe": "CWE-284", "title": "Exploitable asset loss / privilege change",
         "fix": "관찰된 자산 손실·권한 변경 경로를 재현 PoC로 확인 후 근본 원인(접근제어/CEI/검증)을 수정.",
@@ -251,6 +256,13 @@ FIX_DIFF = {
         "+    function unlock(bytes32 s) external {\n"
         "+        require(keccak256(abi.encode(s)) == passwordHash);\n"
         "+    }"),
+    "TR404-CALLBACK": (
+        "-        if (!b.isLastFloor(_floor)) {         // 콜백을 두 번 신뢰\n"
+        "-            floor = _floor; top = b.isLastFloor(floor);\n"
+        "-        }\n"
+        "+        bool last = b.isLastFloor(_floor);    // 한 번만 호출해 캐시\n"
+        "+        require(!last, \"already last\");       // 신뢰 경계 명확화\n"
+        "+        floor = _floor; top = last;           // 재호출로 재신뢰 금지"),
     "SWC-113": (
         "-        payable(king).transfer(msg.value);  // king 이 revert 하면 영구 락(DoS)\n"
         "-        king = msg.sender;\n"
@@ -274,6 +286,8 @@ def classify(strategy, family_hint=None):
         return CLASS["weak_randomness"]
     if s.startswith("king-dos") or s.startswith("griefing"):
         return CLASS["griefing_dos"]
+    if s.startswith("callback"):
+        return CLASS["callback_inconsistency"]
     if s.startswith("amm-manip"):
         return CLASS["amm"]
     if s.startswith("flashloan"):
