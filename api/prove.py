@@ -1792,6 +1792,28 @@ def _abi_ctor_types(abi):
     return []
 
 
+def _synth_ctor_args(name, contract_src):
+    """타깃 생성자 인자를 시그니처에서 자동 합성한다(라이브 콘솔·매니페스트 미제공용).
+    반환: (args_list, ctor_payable). 컴파일 실패/타깃 부재 시 ([], False)."""
+    try:
+        import solcx
+        _solcv, _evm = _solc_for(contract_src)
+        std = {"language":"Solidity","sources":{f"{name}.sol":{"content":contract_src}},
+               "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi"]}}}}
+        compiled = solcx.compile_standard(std, allow_empty=True)
+    except Exception:
+        return [], False
+    abi = None
+    for _fl, cs in compiled.get("contracts", {}).items():
+        for cn, c in cs.items():
+            if cn == name:
+                abi = c["abi"]
+    if abi is None:
+        return [], False
+    types = _abi_ctor_types(abi)
+    return [_default_for_type(t) for t in types], _ctor_payable(abi)
+
+
 def _proxy_attempt(name, target_src, invariants_src, manifest, scan_step, t0):
     """2-컨트랙트 배선: 타깃 생성자가 형제 컨트랙트 주소를 받는 시스템을 실제로
     배선해 배포하고(예: Delegation(delegate)), fallback→delegatecall 을 노리는
@@ -2854,6 +2876,18 @@ def _run_custom(body):
         for k,v in um.items():
             if isinstance(v,dict): manifest.setdefault(k,{}).update(v)
             else: manifest[k]=v
+    # 사용자가 생성자 인자를 안 줬고 타깃 생성자가 인자를 요구하면 자동 합성한다
+    # (라이브 콘솔이 CLI(audit.py)와 동등하게 생성자 있는 실제 컨트랙트를 배포하도록).
+    dep = manifest.setdefault("deploy", {})
+    if not dep.get("constructor_args"):
+        try:
+            cargs, _cpay = _synth_ctor_args(name, contract)
+            if cargs:
+                dep["constructor_args"] = cargs
+                manifest.setdefault("_synth", {})["constructor_args"] = True
+                # 비-payable 생성자 시드는 downstream(_ctor_payable 게이트)에서 0 처리됨
+        except Exception:
+            pass
     import time as _t; t0=_t.time()
     # 1) user/LLM-provided exploit -> verify only
     override=(data.get("exploitOverride") or "").strip()
