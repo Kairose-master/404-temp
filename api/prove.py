@@ -1450,9 +1450,23 @@ def prove_sources(name, target_src, invariants_src, manifest, do_verify=True, ex
     if fz: return fz
     return last
 
+def _attach_inputs(res, target_src, invariants_src, manifest):
+    """스펙상 '입력 세트'(타깃 소스·불변식·매니페스트)를 응답에 실어, UI가 제출물
+    옆에 입력까지 함께 보여줄 수 있게 한다."""
+    if isinstance(res, dict) and "error" not in res:
+        res.setdefault("target_src", target_src)
+        res.setdefault("invariants_src", invariants_src or "")
+        try:
+            res.setdefault("manifest_json", json.dumps(manifest, indent=2, ensure_ascii=False))
+        except Exception:
+            pass
+    return res
+
+
 def prove(name):
     d = TARGETS[name]
-    return prove_sources(name, d["src"], d["inv"], d["manifest"], do_verify=True)
+    res = prove_sources(name, d["src"], d["inv"], d["manifest"], do_verify=True)
+    return _attach_inputs(res, d["src"], d["inv"], d["manifest"])
 
 def _run(name):
     if name not in TARGETS:
@@ -1491,7 +1505,8 @@ def _run_custom(body):
     if override:
         if len(override)>MAX_SRC: return {"error":"exploit too large"}
         try:
-            return _run_override(name, contract, invariants or None, manifest, override, t0)
+            return _attach_inputs(_run_override(name, contract, invariants or None, manifest, override, t0),
+                                  contract, invariants or None, manifest)
         except Exception as e:
             return {"name":name,"error":str(e)[:400],"trace":traceback.format_exc()[-700:]}
     # 2) optional server-side LLM draft as first candidate (falls back to templates+fuzzer)
@@ -1508,7 +1523,7 @@ def _run_custom(body):
         res=prove_sources(name, contract, invariants or None, manifest,
                           do_verify=bool(invariants), extra_candidates=extra)
         if llm_note: res["llm_note"]=llm_note
-        return res
+        return _attach_inputs(res, contract, invariants or None, manifest)
     except Exception as e:
         return {"name":name,"error":str(e)[:400],"trace":traceback.format_exc()[-700:]}
 

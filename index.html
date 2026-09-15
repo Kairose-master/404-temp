@@ -137,6 +137,73 @@
      실제 배포된 컨트랙트나 온체인 자금 대상이 아닙니다.</div>
 </div></header>
 
+<style>
+  .subgrid{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-top:8px}
+  @media(max-width:900px){.subgrid{grid-template-columns:1fr 1fr}}
+  @media(max-width:560px){.subgrid{grid-template-columns:1fr}}
+  .subcard{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px 17px;display:flex;flex-direction:column;gap:11px}
+  .subhd{font-size:14.5px;font-weight:700;color:var(--tx);line-height:1.4}
+  .pill{display:inline-block;font-family:var(--mono);font-size:10px;letter-spacing:.5px;padding:2px 8px;border-radius:6px;margin-right:7px;vertical-align:middle}
+  .pill.in{color:var(--acc2);background:rgba(34,211,238,.10);border:1px solid rgba(34,211,238,.28)}
+  .pill.out{color:var(--acc);background:rgba(124,92,255,.12);border:1px solid rgba(124,92,255,.30)}
+  .iolist{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:7px}
+  .iolist li{font-size:13px;color:var(--tx2)}
+  .iolist li b{color:var(--tx);font-weight:600}
+  .iolist code,.subnote code{font-family:var(--mono);font-size:11.5px;color:var(--acc2);background:#0a0c14;border:1px solid var(--line);border-radius:5px;padding:1px 6px}
+  .subnote{font-size:12px;color:var(--tx3);margin:0;line-height:1.55}
+  .subnote a{color:var(--acc2)}
+  .mini-code{background:#07090d;border:1px solid var(--line);border-radius:9px;overflow:auto}
+  .mini-code pre{margin:0;padding:11px 12px;font-family:var(--mono);font-size:11px;line-height:1.65;color:#c7cff0;white-space:pre;overflow-x:auto}
+  .mini-code .cm{color:var(--tx3)} .mini-code .fl{color:var(--acc)}
+  details.mdwrap{background:#07090d;border:1px solid var(--line);border-radius:9px}
+  details.mdwrap>summary{cursor:pointer;padding:9px 12px;font-family:var(--mono);font-size:12px;color:var(--tx2)}
+  .md{max-height:340px;overflow:auto;border-top:1px solid var(--line)}
+  .md pre{margin:0;padding:12px 13px;font-family:var(--mono);font-size:11.4px;line-height:1.6;color:#c7cff0;white-space:pre-wrap;word-break:break-word}
+  details.io-d{background:#080910;border:1px solid var(--line);border-radius:9px;margin-top:8px}
+  details.io-d>summary{cursor:pointer;padding:9px 12px;font-size:12.5px;color:var(--tx2);font-family:var(--mono)}
+  details.io-d .io-f{color:var(--tx3);font-size:11px}
+  details.io-d>pre{margin:0;padding:12px 13px;border-top:1px solid var(--line);overflow-x:auto;font-family:var(--mono);font-size:11.5px;line-height:1.6;color:#c7cff0;white-space:pre}
+</style>
+<section id="deliverables"><div class="wrap">
+  <div class="tag"><span class="dot"></span>SPEC I/O · 입력과 제출물</div>
+  <h1 style="font-size:clamp(22px,3.4vw,30px)">주최 제공 <span class="grad">입력</span> → 에이전트 <span class="grad">제출물</span></h1>
+  <p class="lede" style="font-size:15px">Track 04 규약의 <b>입력 3종</b>과 <b>제출물 3종</b>을 이 콘솔에서 그대로 확인합니다.
+     아래 각 타깃의 <b>Run</b>은 입력 세트·계열 점수·파이프라인 로그와 함께 <b>제출물 C(Exploit.sol)</b>를 라이브로 출력합니다.</p>
+  <div class="subgrid">
+    <div class="subcard">
+      <div class="subhd"><span class="pill in">입력</span>타깃 &amp; 규약</div>
+      <ul class="iolist">
+        <li><b>타깃 컨트랙트</b><br><code>src/&lt;Name&gt;.sol</code></li>
+        <li><b>불변식 세트</b><br><code>Invariants.sol · checkAll()</code></li>
+        <li><b>실행 매니페스트</b><br><code>manifest.json</code></li>
+      </ul>
+      <p class="subnote">모두 주최 측 제공. 각 타깃 카드의 <b>📥 입력 보기</b>에서 실제 소스를 확인하세요.</p>
+    </div>
+    <div class="subcard">
+      <div class="subhd"><span class="pill out">제출물 A</span>에이전트 · Docker · CLI</div>
+      <div class="mini-code"><pre><span class="cm"># 표준 CLI (Docker)</span>
+<span class="fl">docker</span> build -t track04 ./agent
+<span class="fl">docker</span> run --rm -v "$PWD:/w" track04 \
+  --contract   /w/targets/&lt;T&gt;/src/&lt;T&gt;.sol \
+  --invariants /w/targets/&lt;T&gt;/Invariants.sol \
+  --manifest   /w/targets/&lt;T&gt;/manifest.json \
+  --out /w/out/&lt;T&gt; --seed 42 --max-attempts 5
+<span class="cm"># exit 0=증명 · 1=미발견 · 2=오류</span></pre></div>
+      <p class="subnote">소스: <a href="https://github.com/Kairose-master/404-temp/tree/main/agent" target="_blank" rel="noopener">agent/</a> · <a href="https://github.com/Kairose-master/404-temp/blob/main/agent/Dockerfile" target="_blank" rel="noopener">Dockerfile</a></p>
+    </div>
+    <div class="subcard">
+      <div class="subhd"><span class="pill out">제출물 B</span>METHOD.md</div>
+      <details class="mdwrap" id="method-details"><summary>METHOD.md 전문 보기 ▾</summary><div class="md" id="method-md"><pre>불러오는 중…</pre></div></details>
+      <p class="subnote">접근 방식 · 결정론 보장 · 한계까지. 함께: <a href="/analysis.html">분석·논문</a> · <a href="https://github.com/Kairose-master/404-temp/blob/main/FINDINGS.md" target="_blank" rel="noopener">FINDINGS.md</a></p>
+    </div>
+    <div class="subcard">
+      <div class="subhd"><span class="pill out">제출물 C</span>Exploit.sol PoC</div>
+      <p class="subnote">아래 각 타깃 <b>Run</b>이 결정론적으로 생성·검증해 <b>📤 생성된 Exploit.sol</b>로 출력합니다.</p>
+      <p class="subnote">저장된 PoC 7종: <a href="https://github.com/Kairose-master/404-temp/tree/main/exploits" target="_blank" rel="noopener">exploits/</a></p>
+    </div>
+  </div>
+</div></section>
+
 <section id="llmsec"><div class="wrap">
   <div class="llmcard">
     <div class="llmhead">
@@ -337,7 +404,7 @@ async function run(name){
   } else if (data.note){
     setVerdict(name,"safe","NOT PROVEN");
     out.innerHTML = `<div class="metrics"><div class="metric"><div class="k">결과</div><div class="v green">불변식 유지 (오탐 없음)</div></div>
-      <div class="metric"><div class="k">스캐너</div><div class="v">공격 패턴 미검출</div></div></div>`;
+      <div class="metric"><div class="k">스캐너</div><div class="v">공격 패턴 미검출</div></div></div>` + srcHtml(data);
   } else {
     setVerdict(name,"safe","NOT PROVEN");
     out.innerHTML = metricsHtml(data,false) + srcHtml(data);
@@ -357,9 +424,39 @@ function metricsHtml(data, proven){
   </div>`;
 }
 function srcHtml(data){
-  if(!data.exploit_src) return "";
-  const esc = s=>s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  return `<details style="margin-top:10px"><summary>생성된 Exploit.sol 보기</summary><pre>${esc(data.exploit_src)}</pre></details>`;
+  const esc = s=>(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  let h = "";
+  // ── 입력 세트 (주최 제공) ──
+  if(data.target_src)
+    h += `<details class="io-d"><summary>📥 입력 · 타깃 소스 <span class="io-f">.sol</span></summary><pre>${esc(data.target_src)}</pre></details>`;
+  if(data.invariants_src)
+    h += `<details class="io-d"><summary>📥 입력 · 불변식 <span class="io-f">Invariants.sol</span></summary><pre>${esc(data.invariants_src)}</pre></details>`;
+  if(data.manifest_json)
+    h += `<details class="io-d"><summary>📥 입력 · 매니페스트 <span class="io-f">manifest.json</span></summary><pre>${esc(data.manifest_json)}</pre></details>`;
+  // ── 스캔: 계열 점수 ──
+  const scan = (data.steps||[]).find(s=>s.step==="scan");
+  if(scan && scan.scores){
+    const rows = Object.entries(scan.scores).sort((a,b)=>b[1]-a[1])
+      .map(([k,v])=>`${k} = ${v}`).join("   ·   ");
+    h += `<details class="io-d"><summary>🔎 스캔 · 계열 점수</summary><pre>${esc(rows)}\n\n선택 전략: ${esc(scan.strategy||'—')}</pre></details>`;
+  }
+  // ── attempts.log (파이프라인 로그) ──
+  if(data.steps && data.steps.length){
+    const log = data.steps.map(s=>{
+      let l = "["+s.step+"]";
+      if(s.strategy) l += " strategy="+s.strategy;
+      if(s.title) l += " · "+s.title;
+      if(s.balance_wei) l += " · balance="+fmtEth(s.balance_wei);
+      if(s.checkAll_after) l += " · allHold="+s.checkAll_after.allHold+(s.checkAll_after.firstViolated?(" violated="+s.checkAll_after.firstViolated):"");
+      if(s.drained_wei) l += " · drained="+fmtEth(s.drained_wei);
+      return l;
+    }).join("\n");
+    h += `<details class="io-d"><summary>🧾 attempts.log · 파이프라인 로그</summary><pre>${esc(log)}</pre></details>`;
+  }
+  // ── 제출물 C: 생성된 Exploit.sol ──
+  if(data.exploit_src)
+    h += `<details class="io-d" open><summary>📤 제출물 C · 생성된 Exploit.sol</summary><pre>${esc(data.exploit_src)}</pre></details>`;
+  return h;
 }
 
 document.querySelectorAll('.runbtn').forEach(b=>b.onclick=()=>run(b.dataset.t));
@@ -565,6 +662,27 @@ async function runCustom(){
   btn.disabled=false;
 }
 document.getElementById('runCustom').onclick = runCustom;
+
+// ── 제출물 B: METHOD.md 지연 로딩 ──
+(function(){
+  const d=document.getElementById('method-details'), box=document.getElementById('method-md');
+  if(!d||!box) return;
+  let loaded=false;
+  d.addEventListener('toggle', async ()=>{
+    if(!d.open || loaded) return; loaded=true;
+    try{
+      const r=await fetch('/METHOD.md',{cache:'no-store'});
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      const t=await r.text();
+      const pre=document.createElement('pre'); pre.textContent=t;
+      box.innerHTML=''; box.appendChild(pre);
+    }catch(e){
+      const pre=document.createElement('pre');
+      pre.textContent='METHOD.md를 불러오지 못했습니다 ('+e+'). GitHub의 METHOD.md에서 확인하세요.';
+      box.innerHTML=''; box.appendChild(pre); loaded=false;
+    }
+  });
+})();
 </script>
 </body>
 </html>
