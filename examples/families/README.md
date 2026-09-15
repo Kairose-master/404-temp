@@ -21,6 +21,9 @@ python3 -m unittest tests.python.test_family_examples
 | `SeededAllowance.sol` | `seeded_allowance_drain` | Setup이 남긴 allowance |
 | `CrossChainBridge.sol` | `cross_chain_bridge` | lzReceive / relayMessage |
 | `StructCtor.sol` | `struct_ctor` | `constructor(Init memory)` |
+| `LiquidateOther.sol` | `liquidate_other` | Handsel MiniVault — 키 없는 청산 |
+| `ImportedProtocol.sol` | `imported_protocol` | 다른 파일의 Uni/Aave |
+| `OpaqueYul.sol` | `opaque_ir` | 순수 Yul (전문 synth 생략) |
 
 트랙 공개셋 대응은 `targets/` 에 있다 (재진입·tx.origin·오라클·delegatecall·난수·initializer).
 의도 경로 카운터예제는 `examples/frontier/`.

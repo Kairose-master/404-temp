@@ -170,7 +170,9 @@ def _fold_exploit(src, target_name, feats, cs, steps) -> str:
     for fn, slot in GETTERS:
         if fn in seen_fn:
             continue
-        if re.search(rf"function\s+{fn}\s*\(", s) or any(c.kind == slot for c in cs):
+        if re.search(rf"function\s+{fn}\s*\(", s) or re.search(
+                rf"(address|IERC20|IPool)\s+(?:public\s+|immutable\s+)*{fn}\b", s
+        ) or any(c.kind == slot for c in cs):
             seen_fn.add(fn)
             getters.append(
                 f"        try IT(t).{fn}() returns (address a) {{ "

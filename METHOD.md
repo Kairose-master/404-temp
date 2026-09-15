@@ -106,8 +106,15 @@ LLM 은 **선택적 가속**이다. 키가 있으면 `claude-sonnet-5`, `tempera
   `manifest.world.txs` 를 두번째 EOA 의 실제 트랜잭션으로 보낸다.
   교차 체인은 같은 EVM 안의 메신저(`lzReceive`/`relayMessage`) 목까지.
   실제 두 체인·다른 키의 오프라인 서명 트랜잭션은 밖.
-- 의도 경로: 불변식이 유지된 채 ETH 만 움직인 swap-only 후보는
-  `intended_path` 로 분류하고 PROVEN(exit 0) 으로 치지 않는다.
+- 키 없는 피해자: 남은 allowance 가 없으면 **permissionless `liquidate(address)` /
+  skim / rescue** 로 간다 (Handsel MiniVault). 서명이 필요한 순수 EOA 는 여전히 밖.
+- 한 파일이 아닌 프로토콜: 매니페스트 디렉터리 `**/*.sol` 전부 컴파일하고
+  `IPool`/`ILendingPool` public 변수의 자동 게터로 접는다.
+  `manifest.world.files` 로 더 넣을 수 있다.
+- Vyper/순수 Yul 은 `opaque_ir` — 계열 synth 를 건너뛰고 퍼저만 돌린다.
+- Handsel `docs/failure-modes.md` 에서 온 컨트랙트 모양: 이중 `postJob` 에스크로
+  (`non_idempotent_post`), `Accepted` 에 출구 없는 잠금, 오너 가격 오라클 +
+  무허가 청산. 오프체인 재시도/웹훅 이중 과금은 이 엔진의 칸이 아니다.
 - 여러 취약점이 조합돼야 성립하는 공격, 다중 트랜잭션/다중 블록 상태가 필요한
   공격은 단일 `run()` 템플릿으로는 얕게만 시도한다.
 - 검증기는 하네스 `_prove` 의 단일 호출 의미를 재현한다. 하네스가 향후 다중 호출·

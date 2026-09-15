@@ -298,6 +298,32 @@ class CrossChain(unittest.TestCase):
         self.assertTrue(any(l.startswith("cross-chain") for l in labels))
 
 
+class HandselNoKey(unittest.TestCase):
+    def test_minivault_liquidate(self):
+        src = (ROOT / "examples/families/LiquidateOther.sol").read_text()
+        f = extract_features(src, "MiniVaultLike")
+        self.assertIn("liquidate_other", f)
+        self.assertIn("no_key_path", f)
+        self.assertTrue(should_run("liquidate_other", f))
+        labels = [l for l, _ in iter_defi_families(src, "MiniVaultLike")]
+        self.assertTrue(any(l.startswith("liquidate-other") for l in labels))
+        body = next(s for l, s in iter_defi_families(src, "MiniVaultLike") if l.startswith("liquidate-other"))
+        self.assertNotIn("vm.prank", body)
+
+    def test_imported_protocol(self):
+        src = (ROOT / "examples/families/ImportedProtocol.sol").read_text()
+        f = extract_features(src, "ProtocolDesk")
+        self.assertIn("imported_lending", f)
+        self.assertTrue(should_run("imported_protocol", f))
+
+    def test_yul_skips_specialized_not_unknown(self):
+        src = (ROOT / "examples/families/OpaqueYul.sol").read_text()
+        f = extract_features(src, "OpaqueYul")
+        self.assertIn("opaque_ir", f)
+        self.assertFalse(should_run("liquidate_other", f))
+        self.assertTrue(should_run("not_a_real_fn", f))
+
+
 
 if __name__ == "__main__":
     unittest.main()

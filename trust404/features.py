@@ -274,6 +274,9 @@ def extract_features(src: str, name: str | None = None) -> Set[str]:
     if has(r"function\s+(token0|token1|pair|pool|oracle|router|factory|token|asset|collateral)\s*\("):
         feats.add("sibling_getter")
         feats.add("multi_contract_unit")
+    if has(r"(IERC20|IPool|IUniswap|ILendingPool)\s+(public|immutable)"):
+        feats.add("sibling_getter")
+        feats.add("multi_contract_unit")
 
     # TWAP surface. A real time-window TWAP cannot move inside one run()
     # (harness does not warp mid-call). Many "TWAP" desks still consult the
@@ -310,6 +313,45 @@ def extract_features(src: str, name: str | None = None) -> Set[str]:
         feats.add("cross_chain_bridge")
     if has(r"approve\s*\(") and has(r"prank|makeAddr|victim|user"):
         feats.add("setup_seeded_allowance")
+
+    # ── remaining losing shapes + Handsel failure-modes.md ──────────────
+    # Vyper / Yul: regex IR is blind. Tag so specialized synths skip.
+    if has(r"#\s*@version") or has(r"\bobject\s+\""):
+        feats.add("opaque_ir")
+    # owner declared after other state (MiniVault: slot 0 is totalSupply)
+    decls = re.findall(
+        r"^\s*(address|uint256|uint|bool|bytes32|mapping)\s+", s, re.M)
+    owner_m = re.search(
+        r"^\s*address\s+(?:public\s+|private\s+|internal\s+)?owner\b", s, re.M)
+    if owner_m:
+        before = s[: owner_m.start()]
+        n_before = len(re.findall(
+            r"^\s*(address|uint256|uint|bool|bytes32)\s+", before, re.M))
+        if n_before >= 1:
+            feats.add("owner_not_slot0")
+    # entropy mixed with nonce/storage — CoinFlip clone is a false path
+    if "block_entropy" in feats and has(r"nonce|sload|seed\["):
+        feats.add("mixed_entropy")
+    # liquidate(address other) — unknown-key victim via a public path
+    # (Handsel MiniVault walkthrough: second account liquidates)
+    if has(r"function\s+liquidate\s*\(\s*address"):
+        feats.add("liquidate_other")
+        feats.add("no_key_path")
+    if has(r"function\s+(skim|rescue|sweep|collectProtocol)\s*\("):
+        feats.add("no_key_path")
+    # imported protocols not in this file (Aave/Uni/bridge)
+    if has(r"IUniswapV2|IUniswapV3|ISwapRouter|IUniswap"):
+        feats.add("imported_amm")
+        feats.add("multi_contract_unit")
+    if has(r"ILendingPool|IPool\b|IAave|IFlashLoan"):
+        feats.add("imported_lending")
+        feats.add("multi_contract_unit")
+    # Handsel #3/#13: non-idempotent post/retry (double escrow)
+    if has(r"function\s+(postJob|retry|post)\s*\(") and has(r"transferFrom|escrow"):
+        feats.add("non_idempotent_post")
+    # Handsel #14: check then slow external then act
+    if has(r"\.call\s*\{") and has(r"posted|pending|escrow"):
+        feats.add("check_act_gap")
 
     return feats
 

@@ -75,5 +75,26 @@
     "feature": "struct_ctor",
     "provider": null,
     "origin": "constructor(Init memory) — ABI tuple encoding"
+  },
+  {
+    "file": "LiquidateOther.sol",
+    "contract": "MiniVaultLike",
+    "feature": "liquidate_other",
+    "provider": "liquidate_other",
+    "origin": "Handsel MiniVault — permissionless liquidate(user), no victim key"
+  },
+  {
+    "file": "ImportedProtocol.sol",
+    "contract": "ProtocolDesk",
+    "feature": "imported_lending",
+    "provider": "imported_protocol",
+    "origin": "Uni/Aave in other files — extra_sources rglob + getters"
+  },
+  {
+    "file": "OpaqueYul.sol",
+    "contract": "OpaqueYul",
+    "feature": "opaque_ir",
+    "provider": null,
+    "origin": "pure Yul — specialized synths skip, fuzz remains"
   }
 ]
