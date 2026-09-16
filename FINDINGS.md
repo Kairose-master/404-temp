@@ -94,6 +94,11 @@ DeFi, Capture the Ether)이 가르치는 계열 3종을 스캐너·전략·타�
 - **안전(LibraryVault):** delegatecall 대상이 생성자에서 고정한 `immutable` 모듈
   뿐이고 함수 인자로 주소를 받지 않는다. 스캐너 판별자: delegatecall 수신자가
   **함수 파라미터**일 때만 스코어링. 고정 모듈은 무점수 → 오탐 없음.
+  단, 대상을 고정하는 것만으로는 부족하다 — 모듈의 **스토리지 레이아웃이
+  프록시와 정렬**되어야 한다. 예전 모듈은 `pings`가 슬롯 0이라 `run(ping())`
+  한 번이 슬롯 0(`owner`)을 덮어써 `ownerUnchanged`를 깨는 잠복 반례였다.
+  현재 모듈은 슬롯 0을 `owner` 미러로 예약하고 카운터를 슬롯 1에 두어 어떤
+  페이로드로도 owner 슬롯을 건드릴 수 없다(내장 EVM으로 확인).
 - **방어:** 신뢰된 라이브러리만 delegatecall, 프록시 저장소 레이아웃 정렬, EIP-1967.
 
 ### 약한/예측 가능한 난수 (Ethernaut CoinFlip, Capture the Ether "Predict the Future")
