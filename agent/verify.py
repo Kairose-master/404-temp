@@ -114,9 +114,11 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
         if need not in arts:
             raise RuntimeError(f"missing compiled artifact: {need}")
 
-    backend = PyEVMBackend.from_mnemonic(
-        "test test test test test test test test test test test junk",
-        genesis_state_overrides={"balance": 10**24},
+    det = manifest.get("determinism") or {}
+    from trust404.hevm import make_backend
+    backend, _box = make_backend(
+        int(det.get("block_number") or 0),
+        int(det.get("block_timestamp") or 0) or 1,
     )
     et = EthereumTester(backend=backend)
     w3 = Web3(Web3.EthereumTesterProvider(et))
@@ -266,12 +268,15 @@ def _deploy_via_setup(w3, art, acct):
     rec = w3.eth.wait_for_transaction_receipt(tx)
     saddr = rec.contractAddress
     sc = w3.eth.contract(address=saddr, abi=art["abi"])
-    nonce = w3.eth.get_transaction_count(saddr)
+    nonce_before = w3.eth.get_transaction_count(saddr)
     tx = sc.functions.run().transact({"from": acct, "gas": 12_000_000})
     rec = w3.eth.wait_for_transaction_receipt(tx)
     if rec.get("status") == 0:
         raise RuntimeError("Setup.run reverted")
-    return _evm_create_address(saddr, nonce)
+    nonce_after = w3.eth.get_transaction_count(saddr)
+    if nonce_after <= nonce_before:
+        raise RuntimeError("Setup.run created no contract")
+    return _evm_create_address(saddr, nonce_after - 1)
 
 
 def _repo_root():

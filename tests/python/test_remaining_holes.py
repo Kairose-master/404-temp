@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""Open divergences vs official run-only _prove(). Needs solc 0.8.24.
-
-Each row is a real counterexample: official harness result != py-evm.
-When a row starts matching, drop it from OPEN and add it to OfficialRunOnly.
-"""
+"""Official run-only results for the remaining-hole fixtures. Needs solc 0.8.24."""
 import json
 import sys
 import unittest
@@ -15,14 +11,14 @@ sys.path.insert(0, str(ROOT / "agent"))
 
 FIX = ROOT / "tests" / "fixtures" / "counterexamples"
 
-# name, official, py-evm, kind
-OPEN = [
-    ("TimeAhead", "NOT_PROVEN", "PROVEN", "FP no warp, wall-clock"),
-    ("BlockLow", "NOT_PROVEN", "PROVEN", "FP no roll, genesis block 0"),
-    ("TimeExact", "PROVEN", "NOT_PROVEN", "FN frozen timestamp"),
-    ("WarpInRun", "PROVEN", "NOT_PROVEN", "FN HEVM warp inside run()"),
-    ("SetupDealVault", "PROVEN", "ERROR", "FN Setup vm.deal then empty ctor"),
-    ("SetupTwoCreates", "PROVEN", "NOT_PROVEN", "FN CREATE nonce is Dummy"),
+# name, official
+CLOSED = [
+    ("TimeAhead", "NOT_PROVEN"),
+    ("BlockLow", "NOT_PROVEN"),
+    ("TimeExact", "PROVEN"),
+    ("WarpInRun", "PROVEN"),
+    ("SetupDealVault", "PROVEN"),
+    ("SetupTwoCreates", "PROVEN"),
 ]
 
 
@@ -61,10 +57,9 @@ def _run(name):
 
 
 @unittest.skipUnless(_solc(), "solc 0.8.24 not installed")
-class RemainingHoles(unittest.TestCase):
-    def test_each_open_hole_still_diverges(self):
-        for name, official, ours, why in OPEN:
+class ClosedHoles(unittest.TestCase):
+    def test_pyevm_matches_official(self):
+        for name, official in CLOSED:
             with self.subTest(name=name):
                 got, detail = _run(name)
-                self.assertEqual(got, ours, f"{why}: {detail}")
-                self.assertNotEqual(got, official, f"{name} unexpectedly matches official")
+                self.assertEqual(got, official, detail)
