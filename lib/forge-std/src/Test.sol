@@ -16,6 +16,7 @@ interface Vm {
     function parseJsonUint(string calldata, string calldata) external returns (uint256);
     function keyExistsJson(string calldata, string calldata) external returns (bool);
     function expectRevert() external;
+    function readFile(string calldata) external view returns (string memory);
 }
 
 library console2 {
@@ -39,4 +40,8 @@ abstract contract Test {
     function assertEq(string memory a, string memory b, string memory m) internal pure {
         require(keccak256(bytes(a)) == keccak256(bytes(b)), m);
     }
+
+    // foundry Test.sol compatibility — empty so generated tests compile
+    event log_named_string(string key, string val);
+    function log_named_string(string memory, string memory) internal pure {}
 }

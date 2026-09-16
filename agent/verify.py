@@ -405,9 +405,73 @@ def _apply_derived_eoas(w3, et, taddr, target_src, extra_sources):
             pass
 
 
-# ── forge 검증기(선택) ───────────────────────────────────────────────────────
+# ── forge 검증기 ────────────────────────────────────────────────────────────
+def _repo_root():
+    from pathlib import Path
+    return Path(__file__).resolve().parent.parent
+
+
+def _harness_dir():
+    from pathlib import Path
+    env = os.environ.get("TRUST404_HARNESS_DIR")
+    if env:
+        p = Path(env)
+        if p.exists():
+            return p
+    p = _repo_root() / "harness"
+    if p.exists():
+        return p
+    raise VerifyUnavailable("TRUST404_HARNESS_DIR not set / missing")
+
+
+def _forge_std_dir():
+    from pathlib import Path
+    env = os.environ.get("TRUST404_FORGE_STD")
+    if env:
+        p = Path(env)
+        if (p / "src" / "Test.sol").exists():
+            return p
+    p = _repo_root() / "lib" / "forge-std"
+    if (p / "src" / "Test.sol").exists():
+        return p
+    raise VerifyUnavailable("vendored forge-std missing (lib/forge-std)")
+
+
+def _safe_write(root, rel, content):
+    """Write rel under root. Reject path escape."""
+    from pathlib import Path
+    root = Path(root).resolve()
+    p = (root / str(rel).lstrip("/")).resolve()
+    if p != root and not str(p).startswith(str(root) + "/"):
+        p = root / Path(rel).name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    return p
+
+
+def _parse_proof_result(out: str):
+    """Read Harness ProofResult from forge -vv logs."""
+    import re
+    proven, violated = None, ""
+    for line in out.splitlines():
+        if "ProofResult" not in line:
+            continue
+        m = re.search(
+            r"ProofResult\s*\(\s*(?:proven:\s*)?(true|false)\s*,\s*(?:firstViolated:\s*)?\"?([^\"\)]*)\"?\s*\)",
+            line, re.I)
+        if m:
+            proven = m.group(1).lower() == "true"
+            violated = (m.group(2) or "").strip().rstrip(",")
+        elif "PROVEN" in line and "NOT PROVEN" not in line:
+            proven = True
+        elif "NOT PROVEN" in line or "NOT_PROVEN" in line:
+            proven = False
+    return proven, violated
+
+
 def _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest,
                   extra_sources=None):
+    import json
     import shutil
     import subprocess
     import tempfile
@@ -415,74 +479,75 @@ def _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest
 
     if shutil.which("forge") is None:
         raise VerifyUnavailable("forge not on PATH")
-    harness_dir = os.environ.get("TRUST404_HARNESS_DIR")
-    if not harness_dir or not Path(harness_dir).exists():
-        raise VerifyUnavailable("TRUST404_HARNESS_DIR not set / missing")
+    harness_dir = _harness_dir()
+    forge_std = _forge_std_dir()
 
-    dep = manifest.get("deploy", {})
+    dep = manifest.get("deploy", {}) or {}
     seed_wei = _parse_decimal(str(dep.get("value_wei", "0")))
-    block_number = manifest["determinism"]["block_number"]
-    block_timestamp = manifest["determinism"]["block_timestamp"]
+    funding = DEFAULT_EXPLOIT_FUNDING_WEI
+    target_src_rel = (manifest.get("target") or {}).get("src") or f"src/{target_name}.sol"
+    inv_rel = (manifest.get("invariants") or {}).get("contract") or "Invariants.sol"
+    evm = (manifest.get("target") or {}).get("evm_version", "cancun")
+    solc = (manifest.get("target") or {}).get("solc", "0.8.24")
+    man_json = json.dumps(manifest)
 
-    work = Path(tempfile.mkdtemp(prefix="t404-forge-"))
-    src = work / "src"
-    test = work / "test"
-    src.mkdir(parents=True)
-    test.mkdir(parents=True)
-    (src / f"{target_name}.sol").write_text(target_src)
-    (src / "Invariants.sol").write_text(invariants_src)
-    (src / "Exploit.sol").write_text(exploit_src)
-    for rel, content in (extra_sources or {}).items():
-        p = work / rel if "/" in rel or rel.endswith(".sol") else src / rel
-        if not str(p).startswith(str(work)):
-            p = src / Path(rel).name
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content)
-    shutil.copytree(Path(harness_dir) / "src", work / "harness_src")
-    (work / "foundry.toml").write_text(
-        "[profile.default]\n"
-        f"evm_version = \"{manifest['target'].get('evm_version','cancun')}\"\n"
-        "src = 'src'\ntest = 'test'\n"
-        "remappings = ['forge-std/=lib/forge-std/src/']\n"
-    )
-    cargs = dep.get("constructor_args", [])
-    try:
-        from trust404.abi import forge_ctor
-        prelude, ctor = forge_ctor(cargs, src=target_src, name=target_name)
-    except Exception:
-        prelude, ctor = "", ""
-        if len(cargs) == 1 and isinstance(cargs[0], str) and cargs[0].startswith("0x"):
-            ctor = f"address({cargs[0]})"
-    test_src = f"""// SPDX-License-Identifier: MIT
-pragma solidity 0.8.24;
+    with tempfile.TemporaryDirectory(prefix="t404-forge-") as td:
+        work = Path(td)
+        (work / "src").mkdir(parents=True, exist_ok=True)
+        (work / "test").mkdir(parents=True, exist_ok=True)
+        shutil.copytree(Path(harness_dir) / "src", work / "harness_src")
+        shutil.copytree(forge_std, work / "lib" / "forge-std")
+        _safe_write(work, target_src_rel, target_src)
+        _safe_write(work, inv_rel, invariants_src)
+        _safe_write(work, "src/Exploit.sol", exploit_src)
+        (work / "manifest.json").write_text(man_json, encoding="utf-8")
+        for rel, content in (extra_sources or {}).items():
+            if content:
+                _safe_write(work, rel, content)
+        (work / "foundry.toml").write_text(
+            "[profile.default]\n"
+            f"solc_version = \"{solc}\"\n"
+            f"evm_version = \"{evm}\"\n"
+            "src = '.'\n"
+            "test = 'test'\n"
+            "libs = ['lib']\n"
+            "remappings = ['forge-std/=lib/forge-std/src/']\n"
+            "fs_permissions = [{ access = \"read\", path = \"./\" }]\n"
+            "offline = true\n"
+        )
+        # Caller keeps seed + exploit funding + gas headroom. _prove sends
+        # run{value: funding} from this contract; seed is for the target ctor
+        # / Setup, not for the caller remainder.
+        deal_wei = seed_wei + funding + 10**18
+        test_src = f"""// SPDX-License-Identifier: MIT
+pragma solidity {solc};
 import {{Harness}} from "../harness_src/Harness.sol";
-import {{{target_name}}} from "../src/{target_name}.sol";
-import {{Invariants}} from "../src/Invariants.sol";
 import {{Exploit}} from "../src/Exploit.sol";
 contract Run is Harness {{
     function test_prove() public {{
-        vm.deal(address(this), {seed_wei});
-{prelude}
-        {target_name} target = new {target_name}{{value: {seed_wei}}}({ctor});
-        Invariants inv = new Invariants();
+        vm.deal(address(this), {deal_wei});
+        string memory man = vm.readFile("manifest.json");
+        (address target, address inv, uint256 bn, uint256 ts,) = _deployFromManifest(man, "");
         Exploit exp = new Exploit();
-        (bool proven, string memory v) = _prove(
-            address(target), address(inv), address(exp),
-            {block_number}, {block_timestamp}, {DEFAULT_EXPLOIT_FUNDING_WEI});
-        if (proven) emit log_named_string("AGENT_RESULT", string.concat("PROVEN:", v));
-        else emit log_named_string("AGENT_RESULT", "NOT_PROVEN");
+        (bool proven, string memory v) = _prove(target, inv, address(exp), bn, ts, {funding});
+        proven; v;
     }}
 }}
 """
-    (test / "Run.t.sol").write_text(test_src)
-    proc = subprocess.run(
-        ["forge", "test", "--match-contract", "Run", "-vv"],
-        cwd=work, capture_output=True, text=True, timeout=180)
-    out = proc.stdout + proc.stderr
-    if "AGENT_RESULT" not in out:
-        raise RuntimeError(f"forge produced no result:\n{out[-800:]}")
-    line = [l for l in out.splitlines() if "AGENT_RESULT" in l][-1]
-    if "PROVEN:" in line and "NOT_PROVEN" not in line:
-        violated = line.split("PROVEN:")[-1].strip().strip('"')
-        return True, violated, "forge"
-    return False, "", "forge NOT_PROVEN"
+        (work / "test" / "Run.t.sol").write_text(test_src)
+        try:
+            proc = subprocess.run(
+                ["forge", "test", "--match-contract", "Run", "-vv", "--offline"],
+                cwd=work, capture_output=True, text=True, timeout=180)
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"forge timed out: {e}")
+        out = (proc.stdout or "") + (proc.stderr or "")
+        proven, violated = _parse_proof_result(out)
+        if proven is None:
+            if proc.returncode != 0 and (
+                "Compiler run failed" in out or "not found" in out
+                or "failing tests" not in out.lower()
+            ):
+                raise RuntimeError(f"forge verifier infrastructure failed:\n{out[-1200:]}")
+            return False, "", "forge NOT_PROVEN (no ProofResult)"
+        return bool(proven), violated if proven else "", "forge"

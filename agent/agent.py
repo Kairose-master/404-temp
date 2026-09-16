@@ -155,7 +155,6 @@ def main(argv=None):
     feats = set()
     if extract_features is not None:
         try:
-        try:
             blob = contract_src
             if extra_sources:
                 blob = contract_src + "\n" + "\n".join(extra_sources.values())
@@ -352,10 +351,9 @@ def main(argv=None):
     })
     write_log(out_dir, log)
     if not verifier_ok:
-        # 검증기를 못 돌린 경우에도 후보는 남기되, 증명은 하지 못했으므로 1로 종료
-        print(f"UNVERIFIED target={target_name} (verifier unavailable) — best candidate written")
-    else:
-        print(f"NOT_PROVEN target={target_name} within budget")
+        print(f"INCONCLUSIVE target={target_name} (verifier unavailable)")
+        return EXIT_ERROR
+    print(f"NOT_PROVEN target={target_name} within budget")
     return EXIT_NOT_FOUND
 
 

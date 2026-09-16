@@ -171,8 +171,17 @@ contract ProveTest is Harness {
 interface ISafeVault { function deposit() external payable; function withdraw() external; }
 contract SafeVaultAttempt {
     ISafeVault t; uint256 u;
-    function run(address a) external payable { t = ISafeVault(a); u = 1 ether; t.deposit{value: u}(); t.withdraw(); }
-    receive() external payable { if (address(t).balance >= u) t.withdraw(); }
+    function run(address a) external payable {
+        t = ISafeVault(a);
+        u = 1 ether;
+        t.deposit{value: u}();
+        t.withdraw();
+    }
+    receive() external payable {
+        if (address(t).balance >= u) {
+            try t.withdraw() {} catch {}
+        }
+    }
 }
 
 interface IBounded { function propose(address, uint256) external returns (uint256); function execute(uint256) external; }

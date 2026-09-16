@@ -13,7 +13,7 @@ python3 agent/agent.py --contract <path> --invariants <path> --manifest <path> \
 |---|---|
 | 0 | 불변식을 1개 이상 깨는 `Exploit.sol` 확보 (`--out/Exploit.sol`) |
 | 1 | 예산 내 미발견 (`--out/Exploit.sol` 에 마지막 후보, 증명 아님) |
-| 2 | 사용법/내부 오류 |
+| 2 | 입력/검증기/내부 오류 (검증기 부재 포함 — 미발견과 합치지 않음) |
 
 산출물: `--out/Exploit.sol`(최선 후보), `--out/attempts.log`(시도별 로그).
 
@@ -47,8 +47,9 @@ docker run --rm \
   --manifest /work/target/manifest.json \
   --out /work/out --timeout 300 --seed 42 --max-attempts 5
 ```
-이미지는 빌드 시 `solc 0.8.24` 를 받아 고정하므로 실행 시 네트워크가 없어도 된다
-(채점 샌드박스 전제). LLM 키가 없으면 오프라인 휴리스틱으로 동작한다.
+이미지는 빌드 시 `solc 0.8.24` 와 Foundry **1.7.1**, vendored `forge-std` 를 넣는다.
+실행 시 네트워크가 없어도 된다. 기본 검증기는 py-evm. Forge 경로:
+`TRUST404_VERIFIER=forge`. LLM 키가 없으면 오프라인 휴리스틱으로 동작한다.
 
 ## 로컬 실행 (Docker 없이)
 ```bash
