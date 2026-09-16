@@ -22,3 +22,6 @@ Mirrored under `benches/fixtures/dual_surface/` so
 `python -m trust404.benches` scores it with the other class fixtures.
 
 Do not add this to the track-04 12. Those stay the regression gate.
+
+Harder sibling: [`hostile/`](./hostile/) — owner is slot 2, lottery mixes nonce+salt.
+Slot-0 Pwn and a CoinFlip clone both miss.
