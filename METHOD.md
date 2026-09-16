@@ -125,8 +125,9 @@ LLM 은 **선택적 가속**이다. 키가 있으면 `claude-sonnet-5`, `tempera
   공개셋에 없는 완전히 새로운 유형(비공개 타깃)은 가장 가까운 템플릿으로만 접근한다.
 - 워게임 유도 3종(delegatecall/난수/initializer)도 단일 `run()` 안에서 성립하는
   형태만 다룬다. delegatecall 하이재킹은 슬롯 0 = owner/admin 레이아웃을 가정하며
-  (다른 슬롯의 권한 변수는 오프셋 조정 필요), 약한 난수는 소스의 엔트로피 식이
-  블록/`msg` 글로벌만 참조할 때 복제가 유효하다(내부 상태를 섞으면 얕게만 시도).
+  (owner/admin 슬롯은 선행 상태변수 개수로 계산해 Pwn 을 패딩한다),
+  약한 난수는 블록 엔트로피에 public `nonce`/`seed` 가 섞여 있으면 게터를
+  읽어 같은 식을 복제한다.
   initializer는 무인자 또는 단일 address 인자 형태를 지원한다.
 - 트랙의 PROVEN 은 **불변식 위반**이다. 수익이 나와도 불변식이 유지되면 미증명.
   (의도된 스왑 vs 도난 같은 라벨 문제는 채점 밖. 노트만: [`docs/FRONTIER.md`](./docs/FRONTIER.md))

@@ -32,6 +32,8 @@ python3 -m unittest tests.python.test_family_examples
 | `CommitReveal.sol` | `commit_reveal` | 커밋 후 다음 블록 리빌 |
 | `ExternalErc.sol` | `external_erc` | 소스 없는 ERC-20/4626/Uni 셀렉터 |
 | `MakeAddrVictim.sol` | `make_addr_victim` | forge-std makeAddr 키 파생 |
+| `OffsetOwner.sol` | `owner_not_slot0` | owner 슬롯 1, 패딩 후 delegatecall |
+| `MixedEntropy.sol` | `mixed_entropy` | keccak(blockhash, nonce) |
 
 트랙 공개셋 대응은 `targets/` 에 있다 (재진입·tx.origin·오라클·delegatecall·난수·initializer).
 의도 경로 카운터예제는 `examples/frontier/`.

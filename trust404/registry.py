@@ -166,6 +166,12 @@ PROVIDERS: List[Provider] = [
     Provider("external_erc", "external_erc", "synth",
              frozenset({"external_erc", "erc2612"}),
              "소스 없는 형제: ERC-20/2612/4626/3156/UniV2 셀렉터"),
+    Provider("owner_slot_hijack", "owner_slot_hijack", "synth",
+             frozenset({"owner_not_slot0", "delegatecall_param"}),
+             "owner/admin 이 슬롯 0이 아니면 패딩 후 delegatecall 탈취"),
+    Provider("mixed_entropy", "mixed_entropy", "synth",
+             frozenset({"mixed_entropy"}),
+             "block.* ⊕ public nonce/seed — 게터를 읽어 같은 식을 복제"),
 ]
 
 _BY_FN = {p.fn_name: p for p in PROVIDERS}

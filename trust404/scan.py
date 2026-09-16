@@ -258,5 +258,6 @@ def scan_target(contract_src, invariants_src, manifest):
             sig["init_fn"] = fn
 
     sig["scores"] = scores
+    sig["src"] = src
     sig["invariant_predicates"] = manifest.get("invariants", {}).get("predicates", [])
     return sig
