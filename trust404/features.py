@@ -376,6 +376,23 @@ def extract_features(src: str, name: str | None = None) -> Set[str]:
     if "create2_predict" in feats and "selfdestruct" in feats:
         feats.add("metamorphic")
 
+    # makeAddr("alice") in Setup/source — key is keccak(name)
+    if has(r"makeAddr(?:AndKey)?\s*\("):
+        feats.add("make_addr_victim")
+        feats.add("no_key_path")
+    # commit / reveal across blocks
+    if has(r"function\s+commit\s*\(") and has(r"function\s+reveal\s*\("):
+        feats.add("commit_reveal")
+    if has(r"commitBlock|commitBlockNumber|revealBlock") and has(r"block\.number"):
+        feats.add("commit_reveal")
+    # source-less external: hardcoded 0x addresses + ERC interfaces
+    if has(r"0x[a-fA-F0-9]{40}") and has(r"IERC20|IERC4626|IERC3156|IUniswap"):
+        feats.add("external_erc")
+    if has(r"supportsInterface\s*\("):
+        feats.add("erc165")
+    if has(r"function\s+permit\s*\(") or has(r"PERMIT_TYPEHASH"):
+        feats.add("erc2612")
+
     return feats
 
 

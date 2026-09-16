@@ -361,6 +361,44 @@ class HiddenSetDeep(unittest.TestCase):
         self.assertTrue(should_run("metamorphic", f))
 
 
+class LastThree(unittest.TestCase):
+    def test_commit_reveal(self):
+        src = (ROOT / "examples/families/CommitReveal.sol").read_text()
+        f = extract_features(src, "CommitReveal")
+        self.assertIn("commit_reveal", f)
+        self.assertTrue(should_run("commit_reveal", f))
+        srcs = dict(iter_defi_families(src, "CommitReveal"))
+        self.assertIn("commit-reveal", srcs)
+        self.assertIn("prepare", srcs["commit-reveal"])
+        self.assertIn("vm.roll", srcs["commit-reveal"])
+
+    def test_external_erc(self):
+        from trust404.erc import hardcoded_addresses, classify, SELECTORS
+        src = (ROOT / "examples/families/ExternalErc.sol").read_text()
+        f = extract_features(src, "ExternalDesk")
+        self.assertIn("external_erc", f)
+        addrs = hardcoded_addresses(src)
+        self.assertTrue(any(a.lower().endswith("2488d") for a in addrs))
+        self.assertIn("d505accf", SELECTORS)
+        self.assertEqual(SELECTORS["a9059cbb"], "transfer(address,uint256)")
+        self.assertIn("erc20", classify({"a9059cbb", "70a08231", "095ea7b3"}))
+
+    def test_make_addr_parse(self):
+        from trust404.eoa import make_addr_names
+        src = (ROOT / "examples/families/MakeAddrVictim.sol").read_text()
+        f = extract_features(src, "PullVault")
+        self.assertIn("make_addr_victim", f)
+        self.assertEqual(make_addr_names(src), ["alice"])
+
+    def test_push4_selectors(self):
+        from trust404.erc import selectors_from_bytecode, classify
+        # PUSH4 a9059cbb  (transfer)
+        code = bytes.fromhex("63a9059cbb")
+        sel = selectors_from_bytecode(code)
+        self.assertIn("a9059cbb", sel)
+        self.assertIn("erc20", classify(sel | {"70a08231", "095ea7b3"}))
+
+
 
 if __name__ == "__main__":
     unittest.main()

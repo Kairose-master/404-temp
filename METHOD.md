@@ -107,10 +107,13 @@ LLM 은 **선택적 가속**이다. 키가 있으면 `claude-sonnet-5`, `tempera
   교차 체인은 같은 EVM 안의 메신저(`lzReceive`/`relayMessage`) 목까지.
   실제 두 체인·다른 키의 오프라인 서명 트랜잭션은 밖.
 - 키 없는 피해자: 남은 allowance 가 없으면 **permissionless `liquidate(address)` /
-  skim / rescue** 로 간다 (Handsel MiniVault). 서명이 필요한 순수 EOA 는 여전히 밖.
-- 한 파일이 아닌 프로토콜: 매니페스트 디렉터리 `**/*.sol` 전부 컴파일하고
-  `IPool`/`ILendingPool` public 변수의 자동 게터로 접는다.
-  `manifest.world.files` 로 더 넣을 수 있다.
+  skim / rescue** 로 간다 (Handsel MiniVault). Setup 이 `makeAddr("alice")` 를
+  쓰면 검증기가 keccak256("alice") 키로 **실제 approve 트랜잭션** 을 보낸다
+  (forge-std 와 동일). 파생식 없는 랜덤 EOA 는 밖.
+- 소스 없는 외부 프로토콜: 하드코딩 0x + ERC-20/2612/4626/3156/UniV2
+  공식 셀렉터 (ethereum/ERCs). 바이트코드 PUSH4 로 계열만 고른다. 디컴파일 없음.
+- 여러 블록 커밋-리빌: `prepare` 에서 commit, HEVM `roll` / py-evm `mine_block`
+  후 `reveal`. 같은 트랜잭션의 두 번의 호출은 같은 블록이라 안 된다.
 - Vyper/순수 Yul 은 `opaque_ir` — 계열 synth 를 건너뛰고 퍼저만 돌린다.
 - 숨은 셋 심화(한 `run()`): read-only reentrancy, ERC4626 첫 입금 인플레,
   ERC777/721 훅 재진입, nonce 없는 서명 재사용, CREATE2 변태.

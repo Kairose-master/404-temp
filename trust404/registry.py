@@ -160,6 +160,12 @@ PROVIDERS: List[Provider] = [
     Provider("metamorphic", "metamorphic", "synth",
              frozenset({"metamorphic"}),
              "CREATE2 + selfdestruct 같은 주소 교체"),
+    Provider("commit_reveal", "commit_reveal", "synth",
+             frozenset({"commit_reveal"}),
+             "commit → roll N 블록 → reveal (HEVM / phased)"),
+    Provider("external_erc", "external_erc", "synth",
+             frozenset({"external_erc", "erc2612"}),
+             "소스 없는 형제: ERC-20/2612/4626/3156/UniV2 셀렉터"),
 ]
 
 _BY_FN = {p.fn_name: p for p in PROVIDERS}
