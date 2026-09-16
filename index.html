@@ -180,6 +180,9 @@
   .dep-pill.ok{color:var(--green);background:var(--green-bg);border:1px solid rgba(61,220,151,.35)}
   .dep-pill.warn{color:var(--amber);background:var(--amber-bg);border:1px solid rgba(255,180,84,.4)}
   .dep-item textarea{width:100%;margin-top:7px;min-height:80px;background:#0b0e14;border:1px solid var(--line2);border-radius:7px;color:#c7cff0;font-family:var(--mono);font-size:11px;padding:8px;resize:vertical}
+  .drop-hint{margin-top:8px;font-size:11.5px;color:var(--tx3);border:1px dashed var(--line2);border-radius:8px;padding:8px 10px}
+  .deps.drag .drop-hint{border-color:var(--acc2);color:var(--acc2);background:rgba(34,211,238,.06)}
+  .dep-item .row-up{margin-top:6px;font-size:11px;padding:4px 8px}
 </style>
 <section id="deliverables"><div class="wrap">
   <div class="tag"><span class="dot"></span>SPEC I/O · 입력과 제출물</div>
@@ -267,16 +270,16 @@
   <div style="border-top:1px solid var(--line);padding-top:30px">
     <div class="tag"><span class="dot"></span>CUSTOM · 임의 컨트랙트 검사</div>
     <h1 style="font-size:clamp(22px,3.4vw,30px)">직접 올린 컨트랙트를 <span class="grad">스캔·생성·증명</span></h1>
-    <p class="lede" style="font-size:15px">컨트랙트 소스를 붙여넣거나 <b>.sol</b> 파일을 올리세요.
-      불변식(Invariants)을 주면 그걸로 증명하고, 없으면 <b>자동 합성 효과 검사</b>로 실제 배포·실행해
-      자금 유출·소유권 탈취·부채 초과를 관찰합니다. 알려진 4대 템플릿에 안 맞아도
+    <p class="lede" style="font-size:15px">컨트랙트 소스를 붙여넣거나 <b>.sol / 폴더 / zip</b> 을 통째로 올리세요.
+      상대 import 는 올린 파일에서 자동으로 찾습니다. 불변식(Invariants)을 주면 그걸로 증명하고, 없으면
+      <b>자동 합성 효과 검사</b>로 실제 배포·실행해 자금 유출·소유권 탈취·부채 초과를 관찰합니다. 알려진 4대 템플릿에 안 맞아도
       <b>범용 퍼저</b>가 호출 시퀀스를 탐색해 신종 취약점까지 실제로 성립시킵니다.</p>
 
     <div class="custom-grid">
       <div class="fld">
         <label>컨트랙트 소스 <span class="req">*</span>
-          <input type="file" id="f-contract" accept=".sol,text/plain" hidden>
-          <button class="up" data-for="c-contract" data-file="f-contract">📎 .sol 업로드</button>
+          <input type="file" id="f-contract" accept=".sol,.zip,text/plain" hidden multiple>
+          <button class="up" data-for="c-contract" data-file="f-contract">📎 .sol / zip 업로드</button>
         </label>
         <textarea id="c-contract" placeholder="// SPDX-License-Identifier: MIT&#10;pragma solidity 0.8.24;&#10;contract MyVault { ... }"></textarea>
       </div>
@@ -300,9 +303,14 @@
       <div class="deps-head">
         <span>📦 감지된 import <b id="deps-count">0</b></span>
         <button class="btn small" id="resolveDeps" type="button">웹에서 자동 해결 ↻</button>
+        <button class="btn small" id="bundleBtn" type="button">📁 파일·zip 통째 찾기</button>
+        <button class="btn small" id="dirBtn" type="button">📂 폴더</button>
+        <input type="file" id="f-bundle" accept=".sol,.zip,text/plain" hidden multiple>
+        <input type="file" id="f-dir" hidden webkitdirectory multiple>
         <label style="font-size:11px;color:var(--tx3)">OZ/npm 버전 <input class="dep-ver" id="dep-ver" value="latest"></label>
         <span class="apihint" id="deps-hint"></span>
       </div>
+      <div class="drop-hint" id="deps-drop">import 에 해당하는 .sol · 프로젝트 폴더 · zip 을 여기로 떨어뜨리거나 통째 업로드하세요. 파일 이름·경로로 자동 매칭합니다.</div>
       <div id="deps-list"></div>
     </div>
 
@@ -594,8 +602,17 @@ document.querySelectorAll('.up').forEach(b=>{
   const fileInput = document.getElementById(b.dataset.file);
   const ta = document.getElementById(b.dataset.for);
   b.onclick = ()=> fileInput.click();
-  fileInput.onchange = ()=>{
-    const f = fileInput.files[0]; if(!f) return;
+  fileInput.onchange = async ()=>{
+    const files = [...(fileInput.files||[])];
+    if(!files.length) return;
+    if (b.dataset.file === "f-contract"){
+      const n = await ingestUpload(files, {fillMain: true, mainTa: ta, btn: b});
+      refreshDepsPanel();
+      if (detectImports(ta.value).length) runResolve();
+      if (n) document.getElementById('customhint').textContent = `올린 파일에서 import ${n}개 매칭`;
+      return;
+    }
+    const f = files[0];
     const r = new FileReader();
     r.onload = ()=>{ ta.value = r.result; b.textContent = "✓ " + f.name; };
     r.readAsText(f);
@@ -744,6 +761,155 @@ function detectImports(src){
   while((m = re.exec(s))) out.push(m[1]);
   return [...new Set(out)];
 }
+function _normPath(p){
+  return String(p||'').replace(/\\/g,'/').replace(/^\.?\//,'').replace(/^\/+/, '');
+}
+function _basename(p){ const n=_normPath(p).split('/'); return n[n.length-1]||''; }
+function splitFlattened(text){
+  const t = text || '';
+  const re = /(?:^|\n)\/\/\s*(?:File|Source|SPDX-FilePath):\s*(\S+)/g;
+  const idx = []; let m;
+  while((m = re.exec(t))) idx.push({at: m.index + (m[0].startsWith('\n')?1:0), name: m[1].replace(/^["']|["']$/g,'')});
+  if(idx.length < 2) return null;
+  const parts = [];
+  for(let i=0;i<idx.length;i++){
+    const start = idx[i].at;
+    const end = i+1<idx.length ? idx[i+1].at : t.length;
+    const body = t.slice(start, end).replace(/^\/\/[^\n]*\n/, '');
+    if(/pragma solidity|contract\s+\w+|library\s+\w+|interface\s+\w+/.test(body))
+      parts.push({path: idx[i].name, text: body.trim()});
+  }
+  return parts.length ? parts : null;
+}
+function matchImport(imp, files, used){
+  const want = _normPath(imp);
+  const base = _basename(want).toLowerCase();
+  let best=null, bestScore=0;
+  for(const f of files){
+    if(used && used.has(f.path)) continue;
+    const p = _normPath(f.path);
+    const pb = _basename(p).toLowerCase();
+    let s=0;
+    if(p===want || p.endsWith('/'+want)) s=100;
+    else if(want.endsWith('/'+p)) s=85;
+    else if(pb===base && base.endsWith('.sol')) s = p.split('/').length<=2 ? 70 : 55;
+    if(s>bestScore){ bestScore=s; best=f; }
+  }
+  return bestScore>=55 ? best : null;
+}
+function attachMatched(files){
+  const main = document.getElementById('c-contract').value;
+  const wanted = new Set([
+    ...detectImports(main),
+    ...Object.values(_attached).flatMap(detectImports),
+  ]);
+  const used = new Set();
+  let n=0;
+  wanted.forEach(imp=>{
+    if(_attached[imp]) return;
+    const hit = matchImport(imp, files, used);
+    if(!hit) return;
+    _attached[imp] = hit.text;
+    used.add(hit.path);
+    n++;
+  });
+  files.forEach(f=>{
+    if(used.has(f.path)) return;
+    const b = _basename(f.path);
+    if(!b.endsWith('.sol')) return;
+    const as = './'+b;
+    if(!_attached[as] && !_attached[b]){ _attached[as]=f.text; n++; }
+  });
+  return n;
+}
+function pickMainSol(files){
+  const named = (document.getElementById('c-name').value||'').trim();
+  const sols = files.filter(f=>/\.sol$/i.test(f.path) && !/I?nvariants\.sol$/i.test(_basename(f.path)));
+  if(!sols.length) return null;
+  if(named){
+    const hit = sols.find(f=>new RegExp('contract\\s+'+named+'\\b').test(f.text))
+      || sols.find(f=>_basename(f.path).replace(/\.sol$/i,'')===named);
+    if(hit) return hit;
+  }
+  const scored = sols.map(f=>{
+    const imps = detectImports(f.text).length;
+    const hasInv = /function\s+checkAll\s*\(/.test(f.text);
+    return {f, s: (hasInv?-10:0) + imps + (f.text.match(/\bfunction\s+/g)||[]).length/10};
+  }).sort((a,b)=>b.s-a.s);
+  return scored[0].f;
+}
+async function filesFromZip(buf){
+  if(!window.JSZip){
+    await new Promise((res,rej)=>{
+      const s=document.createElement('script');
+      s.src='https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
+      s.onload=res; s.onerror=()=>rej(new Error('JSZip load failed'));
+      document.head.appendChild(s);
+    });
+  }
+  const zip = await window.JSZip.loadAsync(buf);
+  const out=[];
+  const names = Object.keys(zip.files);
+  for(const name of names){
+    const zf = zip.files[name];
+    if(zf.dir) continue;
+    if(!/\.(sol|txt|json)$/i.test(name) && !/manifest\.json$/i.test(name)) continue;
+    const text = await zf.async('string');
+    out.push({path: name, text});
+  }
+  return out;
+}
+function readBlob(file){
+  return new Promise((res,rej)=>{
+    const r=new FileReader();
+    r.onload=()=>res(r.result);
+    r.onerror=()=>rej(r.error);
+    if(/\.zip$/i.test(file.name) || file.type==='application/zip') r.readAsArrayBuffer(file);
+    else r.readAsText(file);
+  });
+}
+async function collectFromFileList(fileList){
+  const out=[];
+  for(const file of fileList){
+    const rel = file.webkitRelativePath || file.name;
+    if(/\.zip$/i.test(file.name)){
+      const buf = await readBlob(file);
+      const inner = await filesFromZip(buf);
+      inner.forEach(x=> out.push({path: rel.replace(/\.zip$/i,'')+'/'+x.path, text:x.text, zip:true}));
+      continue;
+    }
+    if(!/\.(sol|txt|json)$/i.test(rel) && file.type && !file.type.startsWith('text')) continue;
+    const text = await readBlob(file);
+    if(typeof text !== 'string') continue;
+    const flat = splitFlattened(text);
+    if(flat) flat.forEach(p=> out.push(p));
+    else out.push({path: rel, text});
+  }
+  return out;
+}
+async function ingestUpload(fileList, opts){
+  const files = await collectFromFileList(fileList);
+  if(!files.length) return 0;
+  const invHit = files.find(f=>/invariants\.sol$/i.test(_basename(f.path)) || /contract\s+Invariants\b/.test(f.text));
+  if(invHit && !document.getElementById('c-inv').value.trim())
+    document.getElementById('c-inv').value = invHit.text;
+  const manHit = files.find(f=>/manifest\.json$/i.test(_basename(f.path)));
+  if(manHit && !document.getElementById('c-man').value.trim()){
+    try{ JSON.parse(manHit.text); document.getElementById('c-man').value = manHit.text; }catch(e){}
+  }
+  if(opts && opts.fillMain){
+    const main = pickMainSol(files) || files.find(f=>/\.sol$/i.test(f.path));
+    if(main && opts.mainTa){
+      opts.mainTa.value = main.text;
+      if(opts.btn) opts.btn.textContent = "✓ " + _basename(main.path) + (files.length>1? ` +${files.length-1}`:'');
+      const nm = (main.text.match(/contract\s+(\w+)/)||[])[1];
+      if(nm && !document.getElementById('c-name').value) document.getElementById('c-name').value = nm;
+    }
+  }
+  const n = attachMatched(files);
+  document.getElementById('deps-panel').hidden = false;
+  return n;
+}
 function depUrl(path, baseUrl, ver){
   if(/^https?:\/\//.test(path)){
     let u = path.replace('github.com/','raw.githubusercontent.com/').replace('/blob/','/');
@@ -795,6 +961,8 @@ async function runResolve(){
   const src = document.getElementById('c-contract').value.trim();
   const ver = (document.getElementById('dep-ver').value.trim() || 'latest');
   const hint = document.getElementById('deps-hint'); const list = document.getElementById('deps-list');
+  const flat = splitFlattened(src);
+  if(flat) attachMatched(flat);
   hint.textContent = '웹에서 의존성 해결 중…';
   const {sources, unresolved} = await resolveAllDeps(src, ver);
   _depSources = sources;
@@ -808,16 +976,48 @@ async function runResolve(){
   });
   unresolved.forEach(p=>{
     html += `<div class="dep-item"><span class="dpath">${p}</span><span class="dep-pill warn">첨부 필요</span>`
-         +  `<textarea data-imp="${encodeURIComponent(p)}" placeholder="이 의존성(${p}) 의 .sol 소스를 붙여넣으세요">${_attached[p]||''}</textarea></div>`;
+         +  `<button type="button" class="btn small row-up" data-one="${encodeURIComponent(p)}">📎 이 파일 업로드</button>`
+         +  `<textarea data-imp="${encodeURIComponent(p)}" placeholder="이 의존성(${p}) 의 .sol 소스를 붙여넣거나, 위 버튼으로 파일·zip 을 통째 올리세요">${_attached[p]||''}</textarea></div>`;
   });
   list.innerHTML = html;
   list.querySelectorAll('textarea[data-imp]').forEach(ta=>{
     ta.addEventListener('input', ()=>{ _attached[decodeURIComponent(ta.dataset.imp)] = ta.value; });
   });
+  list.querySelectorAll('button[data-one]').forEach(btn=>{
+    btn.onclick = ()=> document.getElementById('f-bundle').click();
+  });
   return unresolved.length;
 }
 document.getElementById('c-contract').addEventListener('input', refreshDepsPanel);
 document.getElementById('resolveDeps').onclick = runResolve;
+document.getElementById('bundleBtn').onclick = ()=> document.getElementById('f-bundle').click();
+document.getElementById('dirBtn').onclick = ()=> document.getElementById('f-dir').click();
+document.getElementById('f-bundle').addEventListener('change', async (e)=>{
+  const files = [...(e.target.files||[])]; if(!files.length) return;
+  const n = await ingestUpload(files, {});
+  await runResolve();
+  document.getElementById('customhint').textContent = n?`통째 업로드에서 import ${n}개 찾음`:'올린 파일에서 매칭되는 import 없음';
+});
+document.getElementById('f-dir').addEventListener('change', async (e)=>{
+  const files = [...(e.target.files||[])]; if(!files.length) return;
+  const n = await ingestUpload(files, {fillMain: !document.getElementById('c-contract').value.trim()});
+  refreshDepsPanel();
+  await runResolve();
+  document.getElementById('customhint').textContent = n?`폴더에서 import ${n}개 찾음`:'폴더를 올렸습니다';
+});
+(function(){
+  const panel = document.getElementById('deps-panel');
+  ['dragenter','dragover'].forEach(ev=> panel.addEventListener(ev, e=>{ e.preventDefault(); panel.classList.add('drag'); }));
+  ['dragleave','drop'].forEach(ev=> panel.addEventListener(ev, e=>{ e.preventDefault(); panel.classList.remove('drag'); }));
+  panel.addEventListener('drop', async e=>{
+    const files = [...(e.dataTransfer.files||[])];
+    if(!files.length) return;
+    const n = await ingestUpload(files, {fillMain: !document.getElementById('c-contract').value.trim()});
+    refreshDepsPanel();
+    await runResolve();
+    document.getElementById('customhint').textContent = n?`드롭한 파일에서 import ${n}개 찾음`:'드롭한 파일에서 매칭 없음';
+  });
+})();
 
 document.getElementById('runCustom').onclick = runCustom;
 
