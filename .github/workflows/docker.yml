@@ -1,0 +1,49 @@
+name: docker-offline-verifier
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker-offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the actual image without cached layers
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker build --pull --no-cache --platform linux/amd64 \
+            -f agent/Dockerfile -t trust404:ci . 2>&1 | tee docker-build.log
+      - name: Exercise both real CLI entrypoints offline
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 30s docker run --rm --network none trust404:ci --help
+          timeout 30s docker run --rm --network none trust404:ci audit --help
+      - name: Prove positive and negative fixtures offline in each backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          for backend in evm forge; do
+            timeout 300s docker run --rm --network none --entrypoint python \
+              --mount "type=bind,src=$PWD/scripts/docker_smoke.py,dst=/checks/docker_smoke.py,readonly" \
+              --mount "type=bind,src=$PWD/tests/fixtures/counterexamples,dst=/checks/fixtures,readonly" \
+              trust404:ci /checks/docker_smoke.py \
+                --root /work --fixtures /checks/fixtures --backend "$backend" \
+              2>&1 | tee "docker-smoke-$backend.log"
+          done
+      - name: Preserve build and proof logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-offline-logs
+          path: |
+            docker-build.log
+            docker-smoke-*.log
+          if-no-files-found: warn

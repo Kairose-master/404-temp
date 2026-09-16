@@ -12,24 +12,30 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /work
 
+# solcx's pinned Linux solc 0.8.24 binary is x86-64. Do not claim ARM support
+# just because a Foundry ARM tarball exists. ARM hosts can build/run amd64.
+RUN test "$(dpkg --print-architecture)" = amd64 \
+    || (echo 'Use docker build --platform linux/amd64 for this image.' >&2; exit 1)
+
 RUN apt-get update \
     && apt-get install -y --no-install-recommends curl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-# Official v1.7.1 tarball — foundryup + FOUNDRY_DIR would install into a
-# different path than we copied from, and `--install 1.7.1` (no v) is rejected.
-ARG TARGETARCH=amd64
+# Install directly into the one runtime path; no foundryup/home-directory mismatch.
+# Separate download and extraction so a failed download cannot be hidden by a pipe.
 RUN mkdir -p /opt/foundry/bin \
-    && arch="$TARGETARCH" \
-    && if [ "$arch" = "arm64" ] || [ "$arch" = "aarch64" ]; then arch=arm64; else arch=amd64; fi \
-    && curl -fsSL "https://github.com/foundry-rs/foundry/releases/download/v1.7.1/foundry_v1.7.1_linux_${arch}.tar.gz" \
-       | tar -xz --no-same-owner -C /opt/foundry/bin \
+    && curl -fsSL --retry 3 \
+       https://github.com/foundry-rs/foundry/releases/download/v1.7.1/foundry_v1.7.1_linux_amd64.tar.gz \
+       -o /tmp/foundry.tar.gz \
+    && tar -xzf /tmp/foundry.tar.gz --no-same-owner -C /opt/foundry/bin \
+    && rm /tmp/foundry.tar.gz \
     && chmod +x /opt/foundry/bin/forge /opt/foundry/bin/cast \
     && forge --version
 
 COPY agent/requirements.txt /work/agent/requirements.txt
 RUN pip install -r /work/agent/requirements.txt \
-    && python -c "import solcx; solcx.install_solc('0.8.24')"
+    && python -c "import solcx; solcx.install_solc('0.8.24')" \
+    && /opt/solc/solc-v0.8.24 --version
 
 COPY agent /work/agent
 COPY harness /work/harness
@@ -41,5 +47,7 @@ COPY targets /work/targets
 RUN chmod +x /work/agent/docker-entry.sh \
     && python -m compileall -q /work/agent /work/api /work/trust404
 
+# Both backends use /opt/solc via solcx. verify.py passes the exact local
+# executable to Forge with --use; an empty ~/.svm cache needs no download.
 # Default CLI is still py-evm. Forge path: TRUST404_VERIFIER=forge
 ENTRYPOINT ["/work/agent/docker-entry.sh"]
