@@ -1,0 +1,28 @@
+{
+  "schema": "trust404.track04.manifest/0.1",
+  "target": {
+    "name": "HostileDesk",
+    "src": "HostileDesk.sol",
+    "solc": "0.8.24",
+    "evm_version": "cancun"
+  },
+  "deploy": {
+    "mode": "local",
+    "constructor_args": [],
+    "value_wei": "10000000000000000000"
+  },
+  "determinism": {
+    "block_number": 21000000,
+    "block_timestamp": 1735689600,
+    "seed": 7
+  },
+  "invariants": {
+    "contract": "Invariants.sol",
+    "predicates": ["ownerUnchanged", "houseAlive", "customerFunds"]
+  },
+  "frontier": {
+    "expect": "theft",
+    "class": "hostile-layout",
+    "why": "owner is slot 2; lottery mixes nonce+salt. Slot-0 Pwn and CoinFlip clone both miss."
+  }
+}
