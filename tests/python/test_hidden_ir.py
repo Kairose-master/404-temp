@@ -399,6 +399,42 @@ class LastThree(unittest.TestCase):
         self.assertIn("erc20", classify(sel | {"70a08231", "095ea7b3"}))
 
 
+class SlotAndMix(unittest.TestCase):
+    def test_offset_owner_pads_slot_1(self):
+        from trust404.layout import privileged_slot, pwn_hijack
+        src = (ROOT / "examples/families/OffsetOwner.sol").read_text()
+        f = extract_features(src, "OffsetVault")
+        self.assertIn("owner_not_slot0", f)
+        self.assertIn("delegatecall_param", f)
+        self.assertTrue(should_run("owner_slot_hijack", f))
+        self.assertEqual(privileged_slot(src), 1)
+        pwn = pwn_hijack(1)
+        self.assertIn("pad0", pwn)
+        self.assertIn("slot1", pwn)
+        body = next(s for l, s in iter_defi_families(src, "OffsetVault") if l.startswith("owner-slot"))
+        self.assertIn("pad0", body)
+        self.assertNotIn("slot0 = msg.sender", body)
+
+    def test_delegatevault_stays_slot_0(self):
+        from trust404.layout import privileged_slot
+        from trust404.targets import load_target
+        t = load_target("DelegateVault")
+        if not t:
+            self.skipTest("targets missing")
+        self.assertEqual(privileged_slot(t["src"]), 0)
+        self.assertNotIn("owner_not_slot0", extract_features(t["src"], "DelegateVault"))
+
+    def test_mixed_entropy_reads_nonce(self):
+        src = (ROOT / "examples/families/MixedEntropy.sol").read_text()
+        f = extract_features(src, "MixedFlip")
+        self.assertIn("mixed_entropy", f)
+        self.assertIn("block_entropy", f)
+        self.assertTrue(should_run("mixed_entropy", f))
+        body = next(s for l, s in iter_defi_families(src, "MixedFlip") if l.startswith("mixed-entropy"))
+        self.assertIn("nonce()", body)
+        self.assertIn("blockhash", body)
+
+
 
 if __name__ == "__main__":
     unittest.main()

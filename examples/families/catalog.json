@@ -152,5 +152,19 @@
     "feature": "make_addr_victim",
     "provider": null,
     "origin": "forge-std makeAddr — verifier derives keccak256(name)"
+  },
+  {
+    "file": "OffsetOwner.sol",
+    "contract": "OffsetVault",
+    "feature": "owner_not_slot0",
+    "provider": "owner_slot_hijack",
+    "origin": "owner at slot 1, deposits at slot 0"
+  },
+  {
+    "file": "MixedEntropy.sol",
+    "contract": "MixedFlip",
+    "feature": "mixed_entropy",
+    "provider": "mixed_entropy",
+    "origin": "keccak(blockhash, nonce) — getter replay"
   }
 ]

