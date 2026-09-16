@@ -198,9 +198,12 @@ contract BoundedOwnerAttempt {
 // wrapped so it fails without reverting the proof pipeline.
 interface ILibrarySafe { function run(bytes calldata data) external; }
 contract LibraryVaultAttempt {
-    // delegatecall target is fixed, so a hijack() payload hits the benign
-    // module and the owner slot is never written.
+    // The fixed module is storage-layout-aligned with the vault: ping() only
+    // ever writes slot 1 (pings), never slot 0 (owner). Probe the REAL module
+    // selector (ping), which does exist, so this genuinely exercises the
+    // storage-collision path a hijack would rely on. Owner stays untouched.
     function run(address a) external payable {
+        try ILibrarySafe(a).run(abi.encodeWithSignature("ping()")) {} catch {}
         try ILibrarySafe(a).run(abi.encodeWithSignature("hijack()")) {} catch {}
     }
     receive() external payable {}
