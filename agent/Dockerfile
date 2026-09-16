@@ -33,7 +33,9 @@ RUN mkdir -p /opt/foundry/bin \
     && forge --version
 
 COPY agent/requirements.txt /work/agent/requirements.txt
-RUN pip install -r /work/agent/requirements.txt \
+# solcx does not create a custom SOLCX_BINARY_PATH directory.
+RUN mkdir -p "$SOLCX_BINARY_PATH" \
+    && pip install -r /work/agent/requirements.txt \
     && python -c "import solcx; solcx.install_solc('0.8.24')" \
     && /opt/solc/solc-v0.8.24 --version
 
