@@ -238,7 +238,7 @@ Backends      py-evm (기본) | anvil+forge (교차검증)
 |---|---|---|---|
 | P1 | solc AST 파서 + SliSE Stage I 슬라이스 | FSE 2024, 교차함수 재진입 | M |
 | P1 | 템플릿 관례명 폴백 삭제, 스캔 시그니처만 | METHOD 한계절 | S |
-| P1 | Setup.s.sol 을 py-evm 정본 배포기 | Harness 주석, A1 ctor 도구 | S |
+| P1 | Setup.s.sol 을 py-evm 정본 배포기 | 완료: `Setup.run()` 반환 주소. 치트코드 Setup 은 0-인자 생성자로 폴백 |
 | P1 | 효과 오라클 플러그인 (DoS/공급량/권한락) | fuzz checker 4종뿐 | M |
 | P1 | **profit oracle** (extractable ETH) | Verite / A1 / SCONE 2025–26 | M |
 | P1 | capability → 계층 지식(의미/원인/프리미티브) | EvoPoC HKG | M |

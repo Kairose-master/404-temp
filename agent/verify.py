@@ -1,13 +1,9 @@
 # TRUST404 Track04 — candidate verifier.
-# 하네스 harness/src/Harness.sol 의 _prove() 절차를 그대로 재현한다:
-#   1. 결정론 시간 고정(내장 EVM은 배포 시점 고정 블록 사용)
-#   2. 배포 직후 checkAll(target) == (true,"") (아니면 BAD TARGET DESIGN)
-#   3. Exploit 에 10 ETH 지급 후 run{value: 10 ether}(target)
-#   4. 재검사 — allHold==false 면 PROVEN
-#   5. profit oracle: 펀딩 이후·run 이후 잔액 Δ. 펀딩 자체는 수익이 아님.
-# 기본 검증기는 내장 EVM(solc 0.8.24 + eth-tester/py-evm)이라 forge 없이,
-# 네트워크 없이 오프라인으로 동작한다. TRUST404_VERIFIER=forge 로 두면
-# 참가 번들 하네스를 forge test 로 돌리는 경로를 쓴다(그 환경에 forge 필요).
+# Official _prove() meaning only:
+#   Setup.run() address if deploy.setup exists, else constructor + value_wei
+#   checkAll healthy → exploit.run{value: 10 ether}(target) once → recheck
+# Extra prepare/finish, makeAddr auto-approve, and world.txs are NOT part of
+# the official run() and must not decide PROVEN.
 from __future__ import annotations
 
 import os
@@ -152,17 +148,21 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
         cargs = _coerce_args(raw_cargs, Web3)
     seed_wei = _parse_decimal(str(dep.get("value_wei", "0")))
 
-    target, taddr = deploy(arts[target_name], cargs, value=seed_wei)
+    setup_err = None
+    target = taddr = None
+    if dep.get("setup") and "Setup" in arts:
+        try:
+            taddr = _deploy_via_setup(w3, arts["Setup"], acct)
+            target = w3.eth.contract(address=taddr, abi=arts[target_name]["abi"])
+        except Exception as e:
+            setup_err = e
+            target = taddr = None
+    if taddr is None:
+        if _ctor_inputs(arts[target_name]["abi"]) and dep.get("setup"):
+            raise RuntimeError(
+                f"Setup.run failed and constructor needs args: {setup_err}")
+        target, taddr = deploy(arts[target_name], cargs, value=seed_wei)
     inv, iaddr = deploy(arts["Invariants"])
-
-    try:
-        _apply_world_txs(w3, arts, taddr, helpers_addr, manifest, acct)
-    except Exception:
-        pass
-    try:
-        _apply_derived_eoas(w3, et, taddr, target_src, extra_sources)
-    except Exception:
-        pass
 
     before = inv.functions.checkAll(taddr).call()
     if before[0] is not True:
@@ -185,14 +185,6 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
 
     after = inv.functions.checkAll(taddr).call()
     proven = after[0] is False
-    if not proven:
-        try:
-            p2, a2, e2 = _phased_retry(w3, et, exp, taddr, inv, exploit_src)
-            if p2:
-                proven, after = True, a2
-                run_err = ((run_err or "") + f" phased=1 {e2}").strip()
-        except Exception as e:
-            run_err = ((run_err or "") + f" phase_err={str(e)[:80]}").strip()
     profit = None
     if measure_evm and before_att is not None:
         try:
@@ -254,158 +246,34 @@ def _parse_decimal(s):
     return int(s)
 
 
-def _phased_retry(w3, et, exp, taddr, inv, exploit_src):
-    """prepare → time_travel → finish. py-evm stand-in for HEVM warp/prank.
-
-    No-op if the exploit has no prepare(). Must not break the 12-target path.
-    """
-    fnames = {i.get("name") for i in (exp.abi or []) if i.get("type") == "function"}
-    if "prepare" not in fnames:
-        return False, None, "no-prepare"
-    acct = w3.eth.accounts[0]
-    tx = exp.functions.prepare(taddr).transact(
-        {"from": acct, "value": DEFAULT_EXPLOIT_FUNDING_WEI, "gas": 12_000_000})
-    w3.eth.wait_for_transaction_receipt(tx)
-    window = 3600
-    try:
-        from trust404.hevm import window_seconds
-        window = window_seconds(exploit_src)
-    except Exception:
-        pass
-    try:
-        latest = w3.eth.get_block("latest")
-        et.time_travel(int(latest["timestamp"]) + max(int(window), 1))
-    except Exception:
-        try:
-            et.time_travel(int(w3.eth.get_block("latest").timestamp) + max(int(window), 1))
-        except Exception:
-            pass
-    for _ in range(3):
-        try:
-            et.mine_block()
-        except Exception:
-            break
-    if "finish" in fnames:
-        tx = exp.functions.finish(taddr).transact(
-            {"from": acct, "value": DEFAULT_EXPLOIT_FUNDING_WEI, "gas": 12_000_000})
-    else:
-        tx = exp.functions.run(taddr).transact(
-            {"from": acct, "value": DEFAULT_EXPLOIT_FUNDING_WEI, "gas": 12_000_000})
-    w3.eth.wait_for_transaction_receipt(tx)
-    after = inv.functions.checkAll(taddr).call()
-    return after[0] is False, after, ""
+def _ctor_inputs(abi):
+    for e in abi or []:
+        if e.get("type") == "constructor":
+            return e.get("inputs") or []
+    return []
 
 
-def _apply_world_txs(w3, arts, taddr, helpers, manifest, acct0):
-    """Send real txs from a second EOA (no cheatcodes).
-
-    manifest.world.txs: [{from: "victim", to: "$token"| "$target", sig: "approve(address,uint256)", args: [...]}]
-    `victim` is w3.eth.accounts[1]. $Name resolved from deploy.helpers.
-    """
-    txs = ((manifest.get("world") or {}).get("txs")) or []
-    if not txs:
-        return
-    accounts = list(w3.eth.accounts)
-    victim = accounts[1] if len(accounts) > 1 else accounts[0]
-    try:
-        w3.eth.send_transaction({"from": acct0, "to": victim, "value": 10**18, "gas": 21000})
-    except Exception:
-        pass
-
-    def resolve_addr(x):
-        if not isinstance(x, str):
-            return x
-        if x in ("$target", "target"):
-            return taddr
-        if x.startswith("$") and x[1:] in helpers:
-            return helpers[x[1:]]
-        if x.startswith("0x") and len(x) == 42:
-            return w3.to_checksum_address(x)
-        return x
-
-    for step in txs:
-        actor = (step.get("from") or step.get("actor") or "attacker")
-        frm = victim if str(actor).lower() in ("victim", "user", "alice", "holder") else acct0
-        to = resolve_addr(step.get("to") or "$target")
-        sig = step.get("sig") or step.get("fn") or ""
-        args = [resolve_addr(a) if isinstance(a, str) else a for a in (step.get("args") or [])]
-        args = ["max" if a == "max" else a for a in args]
-        args = [2**256 - 1 if a == "max" else a for a in args]
-        if not sig or not to:
-            continue
-        name, _, rest = sig.partition("(")
-        types = [t.strip() for t in rest.rstrip(")").split(",") if t.strip()]
-        abi = [{
-            "type": "function", "name": name,
-            "inputs": [{"type": t, "name": f"a{i}"} for i, t in enumerate(types)],
-            "outputs": [],
-        }]
-        c = w3.eth.contract(address=to, abi=abi)
-        fn = getattr(c.functions, name)
-        from trust404.abi import coerce
-        coerced = coerce(args, w3)
-        tx = fn(*coerced).transact({
-            "from": frm,
-            "value": int(step.get("value") or 0),
-            "gas": 2_000_000,
-        })
-        w3.eth.wait_for_transaction_receipt(tx)
+def _evm_create_address(sender: str, nonce: int) -> str:
+    import rlp
+    from eth_utils import keccak, to_canonical_address, to_checksum_address
+    return to_checksum_address(keccak(rlp.encode([to_canonical_address(sender), nonce]))[12:])
 
 
-def _apply_derived_eoas(w3, et, taddr, target_src, extra_sources):
-    """Register Foundry makeAddr keys and approve the target as those EOAs.
-
-    No cheatcode: a real signed tx from keccak256(name). Only works when
-    eth_account is installed (agent extras). Silent no-op in unit tests.
-    """
-    from trust404.eoa import derived_accounts, make_addr_names
-    blobs = [target_src or ""] + list((extra_sources or {}).values())
-    names = []
-    for b in blobs:
-        names.extend(make_addr_names(b))
-    if not names:
-        return
-    accts = derived_accounts(*blobs)
-    token_abi = [{
-        "type": "function", "name": "approve",
-        "inputs": [{"name": "s", "type": "address"}, {"name": "n", "type": "uint256"}],
-        "outputs": [{"type": "bool"}],
-    }, {
-        "type": "function", "name": "token",
-        "inputs": [], "outputs": [{"type": "address"}],
-        "stateMutability": "view",
-    }]
-    tok = taddr
-    try:
-        t = w3.eth.contract(address=taddr, abi=token_abi)
-        tok = t.functions.token().call()
-    except Exception:
-        tok = taddr
-    for _name, addr, key in accts:
-        try:
-            et.add_account(key)
-        except Exception:
-            try:
-                et.add_account(key[2:] if key.startswith("0x") else key)
-            except Exception:
-                continue
-        try:
-            w3.eth.send_transaction({
-                "from": w3.eth.accounts[0], "to": addr, "value": 10**18, "gas": 21000,
-            })
-        except Exception:
-            pass
-        try:
-            c = w3.eth.contract(address=tok, abi=token_abi)
-            tx = c.functions.approve(taddr, 2**256 - 1).transact({
-                "from": addr, "gas": 200_000,
-            })
-            w3.eth.wait_for_transaction_receipt(tx)
-        except Exception:
-            pass
+def _deploy_via_setup(w3, art, acct):
+    """Deploy Setup and call run(). That address is the official target."""
+    C = w3.eth.contract(abi=art["abi"], bytecode=art["bin"])
+    tx = C.constructor().transact({"from": acct, "gas": 12_000_000})
+    rec = w3.eth.wait_for_transaction_receipt(tx)
+    saddr = rec.contractAddress
+    sc = w3.eth.contract(address=saddr, abi=art["abi"])
+    nonce = w3.eth.get_transaction_count(saddr)
+    tx = sc.functions.run().transact({"from": acct, "gas": 12_000_000})
+    rec = w3.eth.wait_for_transaction_receipt(tx)
+    if rec.get("status") == 0:
+        raise RuntimeError("Setup.run reverted")
+    return _evm_create_address(saddr, nonce)
 
 
-# ── forge 검증기 ────────────────────────────────────────────────────────────
 def _repo_root():
     from pathlib import Path
     return Path(__file__).resolve().parent.parent
