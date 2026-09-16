@@ -93,18 +93,15 @@ LLM 은 **선택적 가속**이다. 키가 있으면 `claude-sonnet-5`, `tempera
 
 ## 6. 한계
 - 오라클: 스팟 조작과 **같은 블록에서 스팟으로 붕괴하는 TWAP**은 합성한다.
-  저장된 Observation[] 윈도우는 `run()` 안에서 Foundry HEVM `warp` 로 채운다
-  (공식 하네스에서 치트코드 주소가 Setup과 같이 열린다). py-evm 는
-  `prepare → time_travel → finish` 로 같은 순서를 재현한다.
+  저장된 Observation[] 윈도우는 `run()` 안에서 Foundry HEVM `warp` 로 채운다.
+  py-evm 증명은 `run()` 한 번만 호출한다. `prepare`/`finish` 추가 호출로
+  증명하지 않는다.
 - 생성자 인자는 JSON 배열·문자열·bytes·address[]·**struct/tuple** 을
-  컴파일된 constructor ABI 로 인코딩한다. `$Token` 플레이스홀더는
-  `deploy.helpers` 로 먼저 배포한 주소를 끼운다. Setup.s.sol 이 있으면
-  형제를 같이 컴파일한다.
-- 교차 컨트랙트: 같은 컴파일 유닛 + `token()`/`pool()`/`oracle()` 게터로 형제를
-  찾아 `run(address)` 안에 접는다. 피해자 approve 가 Setup/`world.txs` 로
-  **이미 들어가 있으면** 치트코드 없이 `transferFrom` 한다. py-evm 는
-  `manifest.world.txs` 를 두번째 EOA 의 실제 트랜잭션으로 보낸다.
-  교차 체인은 같은 EVM 안의 메신저(`lzReceive`/`relayMessage`) 목까지.
+  컴파일된 constructor ABI 로 인코딩한다. `deploy.setup` 이 있으면
+  `Setup.run()` 반환 주소가 타깃이다 (공식 하네스와 같음).
+- 교차 컨트랙트: 같은 컴파일 유닛 + 게터로 형제를 `run(address)` 안에 접는다.
+  피해자 approve 는 Setup 이 남긴 것만 쓴다. 검증기가 `makeAddr` 이름을
+  보고 승인을 만들지 않는다.
   실제 두 체인·다른 키의 오프라인 서명 트랜잭션은 밖.
 - 키 없는 피해자: 남은 allowance 가 없으면 **permissionless `liquidate(address)` /
   skim / rescue** 로 간다 (Handsel MiniVault). Setup 이 `makeAddr("alice")` 를

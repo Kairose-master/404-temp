@@ -1,13 +1,8 @@
 """Foundry cheatcode snippets used inside IExploit.run(address).
 
-The official harness is still one `run()` call. Foundry exposes the HEVM
-address to *any* contract in the test (Setup.s.sol already uses
-`vm.deal`). An exploit can therefore `warp` / `prank` mid-run on the
-forge scoring path.
-
-The py-evm verifier does not hook 0x7109, so it instead runs
-`prepare → time_travel → finish` when those functions exist
-(`agent/verify.py`).
+The official harness calls run() once. py-evm proof does the same —
+it does not call prepare/finish around run(). warp/prank inside run()
+only work on the Forge path (HEVM address 0x7109).
 """
 from __future__ import annotations
 
