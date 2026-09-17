@@ -139,7 +139,7 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
         return w3.eth.contract(address=r.contractAddress, abi=art["abi"]), r.contractAddress
 
     dep = manifest.get("deploy", {})
-    target, taddr = _deploy_target(w3, compiled, arts, target_name, dep, acct, deploy)
+    target, taddr = _deploy_target(w3, compiled, arts, target_name, dep, acct, deploy, _box)
     inv, iaddr = deploy(arts["Invariants"])
 
     before = inv.functions.checkAll(taddr).call()
@@ -188,7 +188,7 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
     )
 
 
-def _deploy_target(w3, compiled, arts, target_name, dep, acct, deploy):
+def _deploy_target(w3, compiled, arts, target_name, dep, acct, deploy, hevm_box=None):
     """Setup presence selects a mandatory path, never a best-effort hint."""
     if "setup" in dep:
         setup_file = dep["setup"]
@@ -201,7 +201,7 @@ def _deploy_target(w3, compiled, arts, target_name, dep, acct, deploy):
         try:
             setup_art = {"abi": artifact["abi"],
                          "bin": artifact["evm"]["bytecode"]["object"]}
-            taddr = _deploy_via_setup(w3, setup_art, acct)
+            taddr = _deploy_via_setup(w3, setup_art, acct, hevm_box)
             if not taddr or not w3.eth.get_code(taddr):
                 raise RuntimeError("Setup target has no deployed code")
             target = w3.eth.contract(address=taddr, abi=arts[target_name]["abi"])
@@ -285,7 +285,7 @@ def _evm_create_address(sender: str, nonce: int) -> str:
     return to_checksum_address(keccak(rlp.encode([to_canonical_address(sender), nonce]))[12:])
 
 
-def _deploy_via_setup(w3, art, acct):
+def _deploy_via_setup(w3, art, acct, hevm_box=None):
     """Deploy Setup and take ISetup.run() return value as the official target."""
     C = w3.eth.contract(abi=art["abi"], bytecode=art["bin"])
     tx = C.constructor().transact({"from": acct, "gas": 12_000_000})
@@ -294,10 +294,17 @@ def _deploy_via_setup(w3, art, acct):
     if rec.get("status") != 1 or not saddr or not w3.eth.get_code(saddr):
         raise RuntimeError("Setup constructor deployment failed")
     sc = w3.eth.contract(address=saddr, abi=art["abi"])
+    # eth_call rolls back EVM state but not the Python HEVM box. Snapshot so
+    # a relative vm.warp/roll inside Setup.run() is not applied twice.
+    snap = dict(hevm_box) if hevm_box is not None else None
     try:
         taddr = sc.functions.run().call({"from": acct})
     except Exception as e:
         raise RuntimeError(f"Setup.run reverted: {e}") from e
+    finally:
+        if snap is not None:
+            hevm_box.clear()
+            hevm_box.update(snap)
     tx = sc.functions.run().transact({"from": acct, "gas": 12_000_000})
     rec = w3.eth.wait_for_transaction_receipt(tx)
     if rec.get("status") != 1:
