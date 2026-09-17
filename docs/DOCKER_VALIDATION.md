@@ -35,7 +35,7 @@ Only the smoke driver and input fixtures are mounted. Agent code, Python
 packages, harness and vendored forge-std are taken from the built image so a
 checkout mount cannot hide a broken COPY instruction or missing dependency.
 There are no host compiler-cache or home-directory mounts. Each backend gets a
-fresh container and must pass all five checks without skips:
+fresh container and must pass all its checks without skips:
 
 | Case | Expected |
 | --- | --- |
@@ -44,9 +44,15 @@ fresh container and must pass all five checks without skips:
 | ApprovalMirage | NOT_PROVEN |
 | DirectConstructor | PROVEN, unbroken |
 | HealthyNoop | NOT_PROVEN |
+| SetupZeroArgControl | PROVEN, unbroken (both backends) |
+| SetupRevertsZeroArg | SetupDeploymentError / INCONCLUSIVE (py-evm only) |
+
+The EVM gate runs seven checks; the Forge gate runs six. The EVM error check
+requires the specific Setup.run-reverted diagnostic, not any exception.
+The positive control changes only that Setup's revert into a successful return.
 
 Forge negative fixtures must reach the official `ProofResult` event, not just
-exit with an infrastructure error or reverted test. Forge now requests `-vvvv`
+exit with an infrastructure error or reverted test. Forge requests `-vvvv`
 traces, checks the process exit code before trusting any event, and treats a
 successful process without a proof result as an error rather than a negative.
 
@@ -57,8 +63,9 @@ gate, add its check to the repository's required status checks; the workflow
 alone does not change branch protection.
 
 This gate validates packaging and these selected proof paths, not all possible
-Setup programs or semantic equivalence of py-evm and Forge. In particular, the
-existing zero-argument fallback after a failed py-evm Setup is not changed by
-this Docker-focused patch. Python dependencies still use the existing version
-ranges; byte-for-byte reproducible builds would additionally require a reviewed
-lock file and pinned base-image digest.
+Setup programs or semantic equivalence of py-evm and Forge. A declared py-evm
+Setup now fails closed: it never falls back to the target constructor. See
+[Setup failure policy](SETUP_FAILURE.md) for the error contract and remaining
+limitations. Python dependencies still use the existing version ranges;
+byte-for-byte reproducible builds would additionally require a reviewed lock
+file and pinned base-image digest.

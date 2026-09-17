@@ -31,7 +31,7 @@ def main() -> int:
     subprocess.run([str(compiler), "--version"], check=True, timeout=15)
     subprocess.run(["forge", "--version"], check=True, timeout=15)
     from trust404.abi import load_extra_sources
-    from verify import verify_full
+    from verify import verify_full, SetupDeploymentError
 
     checks = []
 
@@ -104,6 +104,31 @@ contract Exploit {
 """.replace("BODY", body)
         result = verify_full("SmokeTarget", target, inv, exploit, manifest, seed=42)
         check(name, result, expected, "unbroken" if expected else "")
+
+    # A reverting Setup is an EVM deployment error, NOT a negative proof or a
+    # license to deploy the same zero-argument target in a different state.
+    base = args.fixtures / "SetupRevertsZeroArg"
+    man = json.loads((base / "manifest.json").read_text())
+    setup_src = (base / "Setup.s.sol").read_text()
+    inputs = dict(target_name=man["target"]["name"],
+                  target_src=(base / man["target"]["src"]).read_text(),
+                  invariants_src=(base / "Invariants.sol").read_text(),
+                  exploit_src=(base / "Exploit.sol").read_text(),
+                  manifest=man, seed=42, extra_sources={"Setup.s.sol": setup_src})
+    if args.backend == "evm":
+        try:
+            verify_full(**inputs)
+        except SetupDeploymentError as exc:
+            if "Setup.run reverted" not in str(exc):
+                raise AssertionError(f"wrong deployment failure: {exc}") from exc
+        else:
+            raise AssertionError("reverting Setup unexpectedly produced a proof result")
+        checks.append({"case": "SetupRevertsZeroArg", "status": "INCONCLUSIVE"})
+        print(json.dumps({"backend": args.backend, **checks[-1]}), flush=True)
+    # Positive control: change only the Setup outcome, keep target and exploit.
+    inputs["extra_sources"]["Setup.s.sol"] = setup_src.replace(
+        'revert("SETUP_REVERT_SENTINEL");', 'return address(target);')
+    check("SetupZeroArgControl", verify_full(**inputs), True, "unbroken")
 
     print(json.dumps({"backend": args.backend, "passed": len(checks), "skipped": 0}), flush=True)
     return 0
