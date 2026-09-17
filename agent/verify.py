@@ -318,7 +318,7 @@ def _safe_write(root, rel, content):
 
 
 def _parse_proof_result(out: str):
-    """Read Harness ProofResult from forge -vv logs."""
+    """Read Harness ProofResult from forge -vvvv traces."""
     import re
     proven, violated = None, ""
     for line in out.splitlines():
@@ -335,6 +335,28 @@ def _parse_proof_result(out: str):
         elif "NOT PROVEN" in line or "NOT_PROVEN" in line:
             proven = False
     return proven, violated
+
+
+def _forge_solc_arg(version: str) -> str:
+    """Reuse the exact solcx binary offline, or let Forge use its own cache.
+
+    Looking up an installed compiler must never download one. In the Docker
+    image solcx owns /opt/solc; Forge's default ~/.svm cache is intentionally
+    empty. Outside Docker, a Forge-only installation remains supported.
+    """
+    from pathlib import Path
+    try:
+        from solcx.install import get_executable
+        from solcx.exceptions import SolcNotInstalled
+    except ImportError:
+        return version
+    try:
+        binary = Path(get_executable(version)).resolve()
+    except SolcNotInstalled:
+        return version
+    if not binary.is_file() or not os.access(binary, os.X_OK):
+        raise VerifyUnavailable(f"solc {version} is not executable: {binary}")
+    return str(binary)
 
 
 def _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest,
@@ -405,17 +427,20 @@ contract Run is Harness {{
         (work / "test" / "Run.t.sol").write_text(test_src)
         try:
             proc = subprocess.run(
-                ["forge", "test", "--match-contract", "Run", "-vv", "--offline"],
+                ["forge", "test", "--match-contract", "Run", "-vvvv", "--offline",
+                 "--use", _forge_solc_arg(solc), "--color", "never"],
                 cwd=work, capture_output=True, text=True, timeout=180)
         except subprocess.TimeoutExpired as e:
             raise RuntimeError(f"forge timed out: {e}")
         out = (proc.stdout or "") + (proc.stderr or "")
+        # Failed execution traces may contain events from reverted calls.
+        # Never accept those events as a successful official proof.
+        if proc.returncode != 0:
+            if ("Compiler run failed" in out or "not found" in out
+                    or "failing tests" not in out.lower()):
+                raise RuntimeError(f"forge verifier infrastructure failed:\n{out[-1200:]}")
+            return False, "", "forge NOT_PROVEN (test reverted/failed)"
         proven, violated = _parse_proof_result(out)
         if proven is None:
-            if proc.returncode != 0 and (
-                "Compiler run failed" in out or "not found" in out
-                or "failing tests" not in out.lower()
-            ):
-                raise RuntimeError(f"forge verifier infrastructure failed:\n{out[-1200:]}")
-            return False, "", "forge NOT_PROVEN (no ProofResult)"
+            raise RuntimeError(f"forge succeeded without ProofResult:\n{out[-1200:]}")
         return bool(proven), violated if proven else "", "forge"

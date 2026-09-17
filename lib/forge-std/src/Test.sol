@@ -41,7 +41,7 @@ abstract contract Test {
         require(keccak256(bytes(a)) == keccak256(bytes(b)), m);
     }
 
-    // foundry Test.sol compatibility — empty so generated tests compile
+    // forge-std compatibility: logging is an event, not a same-named function.
+    // Declaring both makes solc reject every harness compilation (error 2333).
     event log_named_string(string key, string val);
-    function log_named_string(string memory, string memory) internal pure {}
 }
