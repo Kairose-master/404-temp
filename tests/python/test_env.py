@@ -31,6 +31,7 @@ class Env(unittest.TestCase):
         df = (ROOT / "agent" / "Dockerfile").read_text()
         self.assertIn("foundry_v1.7.1_linux_", df)
         self.assertNotIn("foundryup --install 1.7.1", df)
+        self.assertIn("TRUST404_VERIFIER=forge", df)
         self.assertIn("COPY lib /work/lib", df)
         self.assertIn("compileall", df)
         self.assertTrue((ROOT / "harness" / "src" / "Harness.sol").is_file())

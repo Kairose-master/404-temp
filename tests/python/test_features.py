@@ -30,6 +30,22 @@ class FeatureIR(unittest.TestCase):
         self.assertIn("value_call", re_f)
         # SafeVault still has a value call, but mutex + CEI order
         self.assertIn("reentrancy_mutex", safe_f)
+        self.assertNotIn("cei_violation", safe_f)
+
+    def test_value_call_alone_is_not_cei(self):
+        src = """
+        contract Pay {
+            mapping(address => uint) public balances;
+            function pull() external {
+                uint bal = balances[msg.sender];
+                balances[msg.sender] = 0;
+                (bool ok,) = msg.sender.call{value: bal}("");
+                require(ok);
+            }
+        }
+        """
+        feats = extract_features(src, "Pay")
+        self.assertNotIn("cei_violation", feats)
 
     def test_delegate_param_vs_immutable(self):
         dv = extract_features(self.src("DelegateVault"), "DelegateVault")

@@ -31,6 +31,26 @@ jobs:
         run: python3 -m compileall -q -f agent api trust404 tests
       - name: Unit tests (feature IR / scanner / targets)
         run: python3 -m unittest discover -s tests/python -v
+      - name: Standard CLI smoke (generate, do not reuse committed PoCs)
+        run: |
+          set -euo pipefail
+          python3 agent/agent.py \
+            --contract targets/ReentrantVault/src/ReentrantVault.sol \
+            --invariants targets/ReentrantVault/Invariants.sol \
+            --manifest targets/ReentrantVault/manifest.json \
+            --out /tmp/e2e/ReentrantVault --timeout 90 --seed 42 --max-attempts 4
+          python3 -c "import json,sys; r=json.load(open('/tmp/e2e/ReentrantVault/result.json')); assert r.get('proven'), r"
+          test -s /tmp/e2e/ReentrantVault/Exploit.sol
+          set +e
+          python3 agent/agent.py \
+            --contract targets/SafeVault/src/SafeVault.sol \
+            --invariants targets/SafeVault/Invariants.sol \
+            --manifest targets/SafeVault/manifest.json \
+            --out /tmp/e2e/SafeVault --timeout 60 --seed 42 --max-attempts 4
+          sv=$?
+          set -e
+          test "$sv" -eq 1
+          python3 -c "import json,sys; r=json.load(open('/tmp/e2e/SafeVault/result.json')); assert r.get('proven') is False, r; assert r.get('completed_proofs', 1) >= 1, r"
       - name: Run exploit-prover audit
         run: |
           python3 agent/audit.py "${{ github.event.inputs.path || 'targets' }}" \

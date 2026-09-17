@@ -45,7 +45,7 @@ def extract_features(src: str, name: str | None = None) -> Set[str]:
         before, after = fn["body"][: m.start()], fn["body"][m.start() :]
         cleared_before = re.search(r"\w+\[\s*msg\.sender\s*\]\s*(=\s*0|-=)", before)
         cleared_after = re.search(r"\w+\[\s*msg\.sender\s*\]\s*(=\s*0|-=)", after)
-        if not cleared_before and (cleared_after or True):
+        if not cleared_before and cleared_after:
             feats.add("cei_violation")
             break
     if has(r"\bowner\s*=") and not has(r"only\w*[Oo]wner"):

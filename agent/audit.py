@@ -119,6 +119,8 @@ def synth_ctor_args(eng, src, contract):
 
 def severity_for(res):
     """엔진 결과 → 심각도 + 사람이 읽을 근거."""
+    if res.get("error"):
+        return "INFO", f"inconclusive: {str(res['error'])[:180]}", False
     if not res.get("proven"):
         scores = (res.get("steps") or [{}])[0].get("scores") or {}
         positive = {k: v for k, v in scores.items() if v > 0}
@@ -395,8 +397,11 @@ def analyze_source(eng, src, contract, invariants, seed_eth, seed):
 def build_report(findings, args, total_analyzed=None):
     proven = [f for f in findings if f["res"].get("proven")]
     heur = [f for f in findings if (not f["res"].get("proven"))
-            and (f["severity"] == "MEDIUM" or f["res"].get("heuristics"))]
-    clean = [f for f in findings if f["severity"] in ("INFO",) and not f["res"].get("proven")]
+            and (f["severity"] == "MEDIUM" or f["res"].get("heuristics"))
+            and not f["res"].get("error")]
+    clean = [f for f in findings if f["severity"] in ("INFO",)
+             and not f["res"].get("proven") and not f["res"].get("error")]
+    inconclusive = [f for f in findings if f["res"].get("error")]
     counts = {"CRITICAL": 0, "HIGH": 0, "MEDIUM": 0, "LOW": 0, "INFO": 0}
     for f in findings:
         counts[f["severity"]] = counts.get(f["severity"], 0) + 1
@@ -412,6 +417,7 @@ def build_report(findings, args, total_analyzed=None):
             "proven_vulnerabilities": len(proven),
             "heuristic_flags": len(heur),
             "clean": len(clean),
+            "inconclusive": len(inconclusive),
             "severity_counts": counts,
         },
         "findings": [],
@@ -462,13 +468,21 @@ def render_md(report):
     L.append(f"- 분석한 컨트랙트: **{s['contracts_analyzed']}** (리포트 표기: {s.get('reported', s['contracts_analyzed'])})")
     L.append(f"- **증명된 취약점: {s['proven_vulnerabilities']}** "
              f"(🟥 {cc['CRITICAL']} · 🟧 {cc['HIGH']})")
-    L.append(f"- 휴리스틱 플래그(미증명): {s['heuristic_flags']} · 정상: {s['clean']}")
+    L.append(f"- 휴리스틱 플래그(미증명): {s['heuristic_flags']} · 정상: {s['clean']}"
+             f" · 미판정: {s.get('inconclusive', 0)}")
     L.append("")
     L.append("| 컨트랙트 | 심각도 | 판정 | 계열/전략 | SWC / CWE | 근거 |")
     L.append("|---|---|---|---|---|---|")
     def sev_key(f): return (-SEV_ORDER.get(f["severity"], 0), not f["proven"])
     for f in sorted(report["findings"], key=sev_key):
-        verdict = "PROVEN" if f["proven"] else ("휴리스틱" if (f.get("heuristic") or f["severity"] == "MEDIUM") else "clean")
+        if f.get("error"):
+            verdict = "INCONCLUSIVE"
+        elif f["proven"]:
+            verdict = "PROVEN"
+        elif f.get("heuristic") or f["severity"] == "MEDIUM":
+            verdict = "휴리스틱"
+        else:
+            verdict = "clean"
         strat = f["strategy"] or (", ".join(f["scanner_scores"].keys()) or ("정적 휴리스틱" if f.get("heuristic") else "—"))
         ev = (f["evidence"] or "").replace("|", "\\|")
         L.append(f"| `{f['contract']}` | {badge.get(f['severity'],f['severity'])} | {verdict} | {strat} | {f['rule']} · {f['cwe']} | {ev} |")
@@ -683,7 +697,8 @@ def main(argv=None):
                              "line": hot_ln, "decl_line": decl_ln})
 
     if not args.include_safe:
-        findings_out = [f for f in findings if not (f["severity"] == "INFO" and not f["res"].get("proven"))]
+        findings_out = [f for f in findings if not (
+            f["severity"] == "INFO" and not f["res"].get("proven") and not f["res"].get("error"))]
     else:
         findings_out = findings
     # 요약 카운트는 표시 대상 기준
@@ -696,10 +711,12 @@ def main(argv=None):
     s = report["summary"]
     print(f"analyzed={s['contracts_analyzed']} proven={s['proven_vulnerabilities']} "
           f"critical={s['severity_counts']['CRITICAL']} high={s['severity_counts']['HIGH']} "
-          f"heuristic={s['heuristic_flags']} → {outdir}/report.md")
+          f"heuristic={s['heuristic_flags']} inconclusive={s.get('inconclusive', 0)} → {outdir}/report.md")
 
     worst = max((SEV_ORDER[f["severity"]] for f in shown), default=0)
     proven_n = s["proven_vulnerabilities"]
+    if s.get("inconclusive", 0) > 0:
+        return EXIT_ERROR
     if args.fail_on == "proven" and proven_n > 0:
         return EXIT_FINDINGS
     if args.fail_on == "high" and worst >= SEV_ORDER["HIGH"]:
