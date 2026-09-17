@@ -34,22 +34,86 @@ python3 agent/agent.py --contract <path> --invariants <path> --manifest <path> \
   참가 번들 `harness/src/Harness.sol` 의 `_prove()` 를 `forge test` 로 실행.
 
 ## Docker
+
+### 1. 빌드 — build context 는 반드시 저장소 루트(`.`)
 ```bash
-# 번들 최상위에서
-docker build -f agent/Dockerfile -t track04-agent .
-docker run --rm \
-  -e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY \
-  -v "$(pwd)/targets/ReentrantVault:/work/target:ro" \
-  -v "$(pwd)/out:/work/out" \
-  track04-agent \
-  --contract /work/target/src/ReentrantVault.sol \
-  --invariants /work/target/Invariants.sol \
-  --manifest /work/target/manifest.json \
-  --out /work/out --timeout 300 --seed 42 --max-attempts 5
+# 반드시 번들 최상위(404-temp/)에서 실행한다.
+docker build --platform linux/amd64 -t track04 -f agent/Dockerfile .
 ```
-이미지는 빌드 시 `solc 0.8.24` 와 Foundry **1.7.1**, vendored `forge-std` 를 넣는다.
-실행 시 네트워크가 없어도 된다. 기본 검증기는 py-evm. Forge 경로:
-`TRUST404_VERIFIER=forge`. LLM 키가 없으면 오프라인 휴리스틱으로 동작한다.
+- **끝의 `.` 이 build context.** Dockerfile 은 `agent/`·`harness/`·`api/`·
+  `trust404/`·`lib/`·`targets/` 를 모두 `COPY` 하므로 context 가 저장소 루트여야
+  한다. `docker build -t track04 ./agent` 처럼 `./agent` 를 주면 Docker 가 나머지
+  폴더를 못 봐서 `COPY harness ...` 단계에서 실패한다.
+- **`-f agent/Dockerfile`** 로 Dockerfile 위치만 따로 알려준다(context 와 별개).
+- **`--platform linux/amd64`** 는 Apple Silicon(ARM) Mac 에서 필수다. 이미지는
+  x86-64 `solc 0.8.24` 를 넣으므로 Dockerfile 이 amd64 를 명시적으로 요구한다.
+
+### 2. 내장 타깃 실행 — 이름만 바꿔서
+```bash
+# 타깃 이름을 변수에 넣는다. <T> 처럼 꺾쇠를 그대로 쓰면 shell(zsh/bash)이
+# 리다이렉션으로 해석해 "no such file or directory: T" 로 죽는다. 반드시 치환할 것.
+T=ReentrantVault
+docker run --rm -v "$PWD:/w" track04 \
+  --contract   /w/targets/$T/src/$T.sol \
+  --invariants /w/targets/$T/Invariants.sol \
+  --manifest   /w/targets/$T/manifest.json \
+  --out /w/out/$T --seed 42 --max-attempts 5
+```
+`-v "$PWD:/w"` 로 저장소를 컨테이너의 `/w` 에 마운트하고, `--out /w/out/$T` 로
+결과(`Exploit.sol`·`result.json`·`attempts.log`)를 호스트로 되돌려 받는다.
+사용 가능한 이름: `ReentrantVault OpenVault BadAccounting NaiveOracle DelegateVault
+PredictableLottery OpenInitializer SafeVault BoundedOwner LibraryVault CommitLottery
+GuardedInitializer`.
+
+12개 전부 한 번에:
+```bash
+for T in ReentrantVault OpenVault BadAccounting NaiveOracle DelegateVault \
+         PredictableLottery OpenInitializer SafeVault BoundedOwner LibraryVault \
+         CommitLottery GuardedInitializer; do
+  docker run --rm -v "$PWD:/w" track04 \
+    --contract   /w/targets/$T/src/$T.sol \
+    --invariants /w/targets/$T/Invariants.sol \
+    --manifest   /w/targets/$T/manifest.json \
+    --out /w/out/$T --seed 42 --max-attempts 8
+  echo "$T -> exit $?"   # 취약 7개 exit 0, 멀쩡 5개 exit 1
+done
+```
+
+### 3. 임의의 컨트랙트 실행 — 어떤 `.sol` 이든
+불변식(`Invariants.sol`)과 매니페스트(`manifest.json`)가 **있으면** 트랙 CLI 를
+그대로 쓴다. 컨트랙트가 저장소 밖에 있으면 그 폴더를 마운트하면 된다:
+```bash
+docker run --rm \
+  -v "$PWD:/w" \
+  -v "/absolute/path/to/MyProject:/proj" \
+  track04 \
+  --contract   /proj/src/MyVault.sol \
+  --invariants /proj/Invariants.sol \
+  --manifest   /proj/manifest.json \
+  --out /w/out/MyVault --seed 42 --max-attempts 8
+```
+불변식·매니페스트가 **없으면** `audit` 서브커맨드로 라우팅한다. 생성자 인자를
+시그니처에서 자동 합성하고 자동 효과검사로 엔진 전량을 돌려 심각도별 리포트
+(JSON/Markdown)와 PoC 를 낸다. 파일 하나든 디렉터리든 받는다:
+```bash
+# 파일 하나
+docker run --rm -v "$PWD:/w" track04 audit /w/path/to/MyContract.sol --out /w/audit
+# 디렉터리 전체(스크립트/인터페이스/라이브러리는 건너뜀)
+docker run --rm -v "$PWD:/w" track04 audit /w/contracts --out /w/audit
+```
+`audit` 매니페스트 스키마와 불변식 작성법은 `targets/*/manifest.json` 과
+`targets/*/Invariants.sol` 을 그대로 본떠 쓰면 된다.
+
+### 옵션·환경변수
+- `--seed <int>` 결정론 시드(같은 시드 → 바이트 동일 산출). `--max-attempts <int>`
+  후보 예산. `--timeout <sec>` 시간 예산.
+- `-e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY` 를 주면 0단계 LLM 초안을 먼저 시도하고,
+  없으면 오프라인 휴리스틱/합성/퍼저만으로 동작한다(네트워크 불필요).
+- `-e TRUST404_VERIFIER=forge` 로 검증기를 py-evm 대신 Foundry `forge test` 경로로
+  바꾼다(이미지에 Foundry 1.7.1·vendored `forge-std` 포함).
+
+이미지는 빌드 시 `solc 0.8.24`, Foundry **1.7.1**, vendored `forge-std` 를 넣으므로
+실행 시 네트워크가 없어도 된다. 기본 검증기는 py-evm.
 
 ## 로컬 실행 (Docker 없이)
 ```bash

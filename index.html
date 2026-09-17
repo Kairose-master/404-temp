@@ -201,13 +201,20 @@
     </div>
     <div class="subcard">
       <div class="subhd"><span class="pill out">제출물 A</span>에이전트 · Docker · CLI</div>
-      <div class="mini-code"><pre><span class="cm"># 표준 CLI (Docker)</span>
-<span class="fl">docker</span> build -t track04 ./agent
+      <div class="mini-code"><pre><span class="cm"># 표준 CLI (Docker) — build context 는 저장소 루트(.)</span>
+<span class="fl">docker</span> build --platform linux/amd64 -t track04 -f agent/Dockerfile .
+
+<span class="cm"># 타깃 실행: 이름만 T 에 넣으세요. 꺾쇠(&lt;T&gt;)를 쓰면 shell 이</span>
+<span class="cm"># 리다이렉션으로 읽어 "no such file or directory: T" 로 실패합니다.</span>
+<span class="fl">T</span>=ReentrantVault
 <span class="fl">docker</span> run --rm -v "$PWD:/w" track04 \
-  --contract   /w/targets/&lt;T&gt;/src/&lt;T&gt;.sol \
-  --invariants /w/targets/&lt;T&gt;/Invariants.sol \
-  --manifest   /w/targets/&lt;T&gt;/manifest.json \
-  --out /w/out/&lt;T&gt; --seed 42 --max-attempts 5
+  --contract   /w/targets/$T/src/$T.sol \
+  --invariants /w/targets/$T/Invariants.sol \
+  --manifest   /w/targets/$T/manifest.json \
+  --out /w/out/$T --seed 42 --max-attempts 5
+
+<span class="cm"># 임의의 컨트랙트 감사 (불변식 없이) — audit 서브커맨드</span>
+<span class="fl">docker</span> run --rm -v "$PWD:/w" track04 audit /w/path/to/MyContract.sol --out /w/audit
 <span class="cm"># exit 0=증명 · 1=미발견 · 2=오류</span></pre></div>
       <p class="subnote">소스: <a href="https://github.com/Kairose-master/404-temp/tree/main/agent" target="_blank" rel="noopener">agent/</a> · <a href="https://github.com/Kairose-master/404-temp/blob/main/agent/Dockerfile" target="_blank" rel="noopener">Dockerfile</a></p>
     </div>
