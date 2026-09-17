@@ -41,15 +41,25 @@ fresh container and must pass all its checks without skips:
 | --- | --- |
 | SetupOnlyOwner | PROVEN, ownerUnchanged |
 | PhasedGhost | NOT_PROVEN |
-| ApprovalMirage | NOT_PROVEN |
+| ApprovalMirage (original HEVM Setup) | INCONCLUSIVE on py-evm; NOT_PROVEN on Forge |
+| ApprovalMiragePlainSetup (separate control) | NOT_PROVEN on both backends |
 | DirectConstructor | PROVEN, unbroken |
 | HealthyNoop | NOT_PROVEN |
 | SetupZeroArgControl | PROVEN, unbroken (both backends) |
 | SetupRevertsZeroArg | SetupDeploymentError / INCONCLUSIVE (py-evm only) |
 
-The EVM gate runs seven checks; the Forge gate runs six. The EVM error check
-requires the specific Setup.run-reverted diagnostic, not any exception.
-The positive control changes only that Setup's revert into a successful return.
+The EVM gate runs eight checks (six proof results and two explicit deployment
+errors); the Forge gate runs seven proof checks. The EVM error checks require
+the specific Setup.run-reverted diagnostic, not any exception.
+The zero-argument positive control changes only that Setup's revert into a successful return.
+
+The original ApprovalMirage Setup calls HEVM `vm.addr`. Before fail-closed
+handling, py-evm silently discarded that failed Setup and tested a direct
+constructor instead. Its old NOT_PROVEN result was therefore not an official
+Setup execution. The original files remain unchanged; its EVM error is tested
+separately from the plain-Setup control and its real Forge NOT_PROVEN result.
+This changes the reported EVM status intentionally; it does not restore a
+constructor fallback or count an infrastructure exception as a negative proof.
 
 Forge negative fixtures must reach the official `ProofResult` event, not just
 exit with an infrastructure error or reverted test. Forge requests `-vvvv`

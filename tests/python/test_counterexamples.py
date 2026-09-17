@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Official run-only counterexamples. Needs solc 0.8.24."""
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -55,6 +57,16 @@ class OfficialRunOnly(unittest.TestCase):
         r = _case("PhasedGhost")
         self.assertFalse(r.proven, r.detail)
 
+    def test_approval_mirage_hevm_setup_is_inconclusive(self):
+        # Keep the original fixture: vm.addr is unsupported in py-evm.
+        # Its old negative result relied on the constructor fallback.
+        from verify import SetupDeploymentError
+        with patch.dict(os.environ, {"TRUST404_VERIFIER": "evm"}):
+            with self.assertRaisesRegex(SetupDeploymentError, "Setup.run reverted"):
+                _case("ApprovalMirage")
+
     def test_approval_mirage_without_approval_is_not_proven(self):
-        r = _case("ApprovalMirage")
+        # Separate EVM-compatible Setup, identical target/token/exploit/invariant.
+        # An exception does NOT count as a negative result for this control.
+        r = _case("ApprovalMiragePlainSetup")
         self.assertFalse(r.proven, r.detail)
