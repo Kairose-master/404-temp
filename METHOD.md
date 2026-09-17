@@ -102,9 +102,10 @@ LLM 은 **선택적 가속**이다. 키가 있으면 `claude-sonnet-5`, `tempera
 - 교차 컨트랙트: 같은 컴파일 유닛 + 게터로 형제를 `run(address)` 안에 접는다.
   피해자 approve 는 Setup 이 남긴 것만 쓴다. 검증기가 `makeAddr` 이름을
   보고 승인을 만들지 않는다.
-- 아직 공식 하네스와 어긋나는 반례 (tests/fixtures/counterexamples):
-  시간/블록 미고정(TimeAhead, BlockLow, TimeExact), run() 안 warp(WarpInRun),
-  Setup.vm.deal 폴백(SetupDealVault), Setup 이 두 번 CREATE(SetupTwoCreates).
+- py-evm 증명은 `run()` 한 번. 매니페스트 determinism 으로 NUMBER/TIMESTAMP 를
+  고정하고, 0x7109 에서 warp/roll/deal/addr 를 허용한다. Setup.run() 은
+  마지막 CREATE 주소를 타깃으로 쓴다. 선언된 Setup 이 실패하면 생성자 폴백 없이
+  배포 오류로 끝낸다.
   실제 두 체인·다른 키의 오프라인 서명 트랜잭션은 밖.
 - 키 없는 피해자: 남은 allowance 가 없으면 **permissionless `liquidate(address)` /
   skim / rescue** 로 간다 (Handsel MiniVault). Setup 이 `makeAddr("alice")` 를
