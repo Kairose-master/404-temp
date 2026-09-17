@@ -4,7 +4,7 @@
 스스로 증명하는 에이전트 트랙(Exploit Proof Agent)의 사전 리서치 문서입니다.
 공개 타깃 6개 전수 분석 + 잘 알려진 공격 기법 + 최신 논문 레퍼런스를 담았습니다.
 
-라이브 대시보드: https://trust404-exploit-agent-godavid123-3215s-projects.vercel.app
+라이브 대시보드: https://trust404-prover.vercel.app
 
 > 모든 PoC/기법은 트랙 04의 **격리된 로컬 채점 샌드박스**(네트워크 차단) 안에서
 > 방어 연구·자동 검증 목적으로만 다룹니다.
