@@ -18,6 +18,8 @@ CLOSED = [
     ("WarpInRun", "PROVEN"),
     ("SetupDealVault", "PROVEN"),
     ("SetupTwoCreates", "PROVEN"),
+    ("SetupCtorReturn", "PROVEN"),
+    ("SetupHelperAfter", "PROVEN"),
 ]
 
 

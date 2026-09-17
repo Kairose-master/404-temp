@@ -71,12 +71,7 @@ def main() -> int:
         ("ApprovalMiragePlainSetup", False, ""),
     ):
         inputs = case_inputs(name)
-        if name == "ApprovalMirage" and args.backend == "evm":
-            # Preserve the original vm.addr-using fixture. Unsupported Setup is
-            # an explicit error, never a negative proof or constructor fallback.
-            check_setup_error(name, inputs)
-        else:
-            check(name, verify_full(**inputs), expected, violated)
+        check(name, verify_full(**inputs), expected, violated)
 
     target = """// SPDX-License-Identifier: MIT
 pragma solidity 0.8.24;

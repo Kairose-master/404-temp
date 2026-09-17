@@ -286,7 +286,7 @@ def _evm_create_address(sender: str, nonce: int) -> str:
 
 
 def _deploy_via_setup(w3, art, acct):
-    """Deploy Setup and call run(). That address is the official target."""
+    """Deploy Setup and take ISetup.run() return value as the official target."""
     C = w3.eth.contract(abi=art["abi"], bytecode=art["bin"])
     tx = C.constructor().transact({"from": acct, "gas": 12_000_000})
     rec = w3.eth.wait_for_transaction_receipt(tx)
@@ -294,15 +294,17 @@ def _deploy_via_setup(w3, art, acct):
     if rec.get("status") != 1 or not saddr or not w3.eth.get_code(saddr):
         raise RuntimeError("Setup constructor deployment failed")
     sc = w3.eth.contract(address=saddr, abi=art["abi"])
-    nonce_before = w3.eth.get_transaction_count(saddr)
+    try:
+        taddr = sc.functions.run().call({"from": acct})
+    except Exception as e:
+        raise RuntimeError(f"Setup.run reverted: {e}") from e
     tx = sc.functions.run().transact({"from": acct, "gas": 12_000_000})
     rec = w3.eth.wait_for_transaction_receipt(tx)
     if rec.get("status") != 1:
         raise RuntimeError("Setup.run reverted")
-    nonce_after = w3.eth.get_transaction_count(saddr)
-    if nonce_after <= nonce_before:
-        raise RuntimeError("Setup.run created no contract")
-    return _evm_create_address(saddr, nonce_after - 1)
+    if not taddr or not w3.eth.get_code(taddr):
+        raise RuntimeError("Setup.run returned an address with no code")
+    return taddr
 
 
 def _repo_root():

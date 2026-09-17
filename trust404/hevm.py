@@ -1,7 +1,7 @@
 """Foundry HEVM surface for py-evm.
 
 Official _prove warps/rolls then calls run() once. py-evm freezes
-NUMBER/TIMESTAMP to the manifest and honours warp/roll/deal/addr at 0x7109.
+NUMBER/TIMESTAMP to the manifest and honours warp/roll/deal/addr/prank at 0x7109.
 Solidity 0.8 needs extcodesize>0 there, so genesis plants stub code.
 """
 from __future__ import annotations
@@ -16,6 +16,7 @@ IFACE = (
     "    function roll(uint256) external;\n"
     "    function prank(address) external;\n"
     "    function deal(address,uint256) external;\n"
+    "    function addr(uint256) external returns (address);\n"
     "}\n"
 )
 
@@ -25,6 +26,7 @@ _SEL_WARP = bytes.fromhex("e5d6bf02")
 _SEL_ROLL = bytes.fromhex("1f7b4f30")
 _SEL_DEAL = bytes.fromhex("c88a5e6d")
 _SEL_ADDR = bytes.fromhex("ffa18649")
+_SEL_PRANK = bytes.fromhex("ca669fa7")
 
 MNEMONIC = "test test test test test test test test test test test junk"
 
@@ -50,6 +52,25 @@ def _word(data: bytes, i: int) -> int:
     return int.from_bytes(sl.rjust(32, b"\x00"), "big")
 
 
+def _with_sender(message, sender):
+    from eth.vm.message import Message
+    return Message(
+        gas=message.gas,
+        to=message.to,
+        sender=sender,
+        value=message.value,
+        data=message.data,
+        code=message.code,
+        depth=message.depth,
+        create_address=message.create_address,
+        code_address=message.code_address,
+        should_transfer_value=message.should_transfer_value,
+        is_static=message.is_static,
+        is_delegation=getattr(message, "is_delegation", False),
+        refund=getattr(message, "refund", 0),
+    )
+
+
 def make_backend(block_number: int, timestamp: int):
     """eth-tester backend with frozen NUMBER/TIMESTAMP and HEVM precompile."""
     from eth.vm.forks.prague import PragueVM
@@ -58,7 +79,11 @@ def make_backend(block_number: int, timestamp: int):
     from eth_tester.backends.pyevm.main import PyEVMBackend, get_default_genesis_params
     from eth_utils import to_canonical_address
 
-    box = {"block_number": int(block_number), "timestamp": int(timestamp)}
+    box = {
+        "block_number": int(block_number),
+        "timestamp": int(timestamp),
+        "prank": None,
+    }
     hevm_addr = to_canonical_address(HEVM)
 
     def hevm(computation):
@@ -79,10 +104,34 @@ def make_backend(block_number: int, timestamp: int):
             except Exception:
                 out = b"\x00" * 20
             computation.output = b"\x00" * 12 + out
+        elif sel == _SEL_PRANK:
+            box["prank"] = _word(data, 0).to_bytes(32, "big")[-20:]
+        else:
+            # Unknown cheatcode: revert instead of silent no-op.
+            from eth.exceptions import Revert
+            raise Revert(b"unknown hevm selector")
         return computation
 
     class Comp(PragueComputation):
         _precompiles = {**PragueComputation.get_precompiles(), hevm_addr: hevm}
+
+        @classmethod
+        def apply_message(cls, state, message, transaction_context, parent_computation=None):
+            who = box.get("prank")
+            if who and parent_computation is not None and message.to != hevm_addr:
+                message = _with_sender(message, who)
+                box["prank"] = None
+            return super().apply_message(
+                state, message, transaction_context, parent_computation)
+
+        @classmethod
+        def apply_computation(cls, state, message, transaction_context, parent_computation=None):
+            snap = {k: box[k] for k in ("block_number", "timestamp", "prank")}
+            computation = super().apply_computation(
+                state, message, transaction_context, parent_computation)
+            if computation.is_error:
+                box.update(snap)
+            return computation
 
     class State(PragueState):
         computation_class = Comp

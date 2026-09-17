@@ -53,6 +53,8 @@
 ## 빠른 시작
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate
 pip install -r agent/requirements.txt
 python3 -c "import solcx; solcx.install_solc('0.8.24')"
 for t in ReentrantVault OpenVault BadAccounting NaiveOracle DelegateVault \
