@@ -25,6 +25,14 @@ import {Setup as TwoSetup} from "./SetupTwoCreates/Setup.s.sol";
 import {Invariants as TwoInv} from "./SetupTwoCreates/Invariants.sol";
 import {Exploit as TwoExp} from "./SetupTwoCreates/Exploit.sol";
 
+import {Setup as CtorSetup} from "./SetupCtorReturn/Setup.s.sol";
+import {Invariants as CtorInv} from "./SetupCtorReturn/Invariants.sol";
+import {Exploit as CtorExp} from "./SetupCtorReturn/Exploit.sol";
+
+import {Setup as HelperSetup} from "./SetupHelperAfter/Setup.s.sol";
+import {Invariants as HelperInv} from "./SetupHelperAfter/Invariants.sol";
+import {Exploit as HelperExp} from "./SetupHelperAfter/Exploit.sol";
+
 interface IInv {
     function checkAll(address target) external view returns (bool, string memory);
 }
@@ -89,5 +97,15 @@ contract OfficialRemainingTest is OfficialRunOnly {
     function test_SetupTwoCreates_returns_second_create_is_PROVEN() public {
         (bool proven,) = _prove(new TwoSetup().run(), address(new TwoInv()), address(new TwoExp()));
         require(proven, "Setup.run return value is the target, not the first CREATE");
+    }
+
+    function test_SetupCtorReturn_constructor_target_is_PROVEN() public {
+        (bool proven,) = _prove(new CtorSetup().run(), address(new CtorInv()), address(new CtorExp()));
+        require(proven, "constructor-created target must be Setup.run return");
+    }
+
+    function test_SetupHelperAfter_returns_first_create_is_PROVEN() public {
+        (bool proven,) = _prove(new HelperSetup().run(), address(new HelperInv()), address(new HelperExp()));
+        require(proven, "Setup.run return is the target, not the later Helper");
     }
 }

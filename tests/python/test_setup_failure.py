@@ -46,7 +46,7 @@ class SetupPolicy(unittest.TestCase):
             result = self.deploy_target({"setup": "Setup.s.sol", "constructor_args": ["ignored"],
                                          "helpers": [{"contract": "Helper"}]})
         self.assertEqual(result[1], "target")
-        setup.assert_called_once_with(self.w3, {"abi": [], "bin": "6001"}, "sender")
+        setup.assert_called_once_with(self.w3, {"abi": [], "bin": "6001"}, "sender", None)
         self.deploy.assert_not_called()
 
     def test_setup_exception_cannot_fall_back(self):

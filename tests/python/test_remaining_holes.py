@@ -20,6 +20,7 @@ CLOSED = [
     ("SetupTwoCreates", "PROVEN"),
     ("SetupCtorReturn", "PROVEN"),
     ("SetupHelperAfter", "PROVEN"),
+    ("SetupWarpOnce", "PROVEN"),
 ]
 
 
