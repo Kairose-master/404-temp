@@ -35,18 +35,34 @@ Only the smoke driver and input fixtures are mounted. Agent code, Python
 packages, harness and vendored forge-std are taken from the built image so a
 checkout mount cannot hide a broken COPY instruction or missing dependency.
 There are no host compiler-cache or home-directory mounts. Each backend gets a
-fresh container and must pass all five checks without skips:
+fresh container and must pass all its checks without skips:
 
 | Case | Expected |
 | --- | --- |
 | SetupOnlyOwner | PROVEN, ownerUnchanged |
 | PhasedGhost | NOT_PROVEN |
-| ApprovalMirage | NOT_PROVEN |
+| ApprovalMirage (original HEVM Setup) | INCONCLUSIVE on py-evm; NOT_PROVEN on Forge |
+| ApprovalMiragePlainSetup (separate control) | NOT_PROVEN on both backends |
 | DirectConstructor | PROVEN, unbroken |
 | HealthyNoop | NOT_PROVEN |
+| SetupZeroArgControl | PROVEN, unbroken (both backends) |
+| SetupRevertsZeroArg | SetupDeploymentError / INCONCLUSIVE (py-evm only) |
+
+The EVM gate runs eight checks (six proof results and two explicit deployment
+errors); the Forge gate runs seven proof checks. The EVM error checks require
+the specific Setup.run-reverted diagnostic, not any exception.
+The zero-argument positive control changes only that Setup's revert into a successful return.
+
+The original ApprovalMirage Setup calls HEVM `vm.addr`. Before fail-closed
+handling, py-evm silently discarded that failed Setup and tested a direct
+constructor instead. Its old NOT_PROVEN result was therefore not an official
+Setup execution. The original files remain unchanged; its EVM error is tested
+separately from the plain-Setup control and its real Forge NOT_PROVEN result.
+This changes the reported EVM status intentionally; it does not restore a
+constructor fallback or count an infrastructure exception as a negative proof.
 
 Forge negative fixtures must reach the official `ProofResult` event, not just
-exit with an infrastructure error or reverted test. Forge now requests `-vvvv`
+exit with an infrastructure error or reverted test. Forge requests `-vvvv`
 traces, checks the process exit code before trusting any event, and treats a
 successful process without a proof result as an error rather than a negative.
 
@@ -57,8 +73,9 @@ gate, add its check to the repository's required status checks; the workflow
 alone does not change branch protection.
 
 This gate validates packaging and these selected proof paths, not all possible
-Setup programs or semantic equivalence of py-evm and Forge. In particular, the
-existing zero-argument fallback after a failed py-evm Setup is not changed by
-this Docker-focused patch. Python dependencies still use the existing version
-ranges; byte-for-byte reproducible builds would additionally require a reviewed
-lock file and pinned base-image digest.
+Setup programs or semantic equivalence of py-evm and Forge. A declared py-evm
+Setup now fails closed: it never falls back to the target constructor. See
+[Setup failure policy](SETUP_FAILURE.md) for the error contract and remaining
+limitations. Python dependencies still use the existing version ranges;
+byte-for-byte reproducible builds would additionally require a reviewed lock
+file and pinned base-image digest.

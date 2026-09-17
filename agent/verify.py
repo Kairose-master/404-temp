@@ -43,6 +43,14 @@ class VerifyUnavailable(Exception):
     """검증 도구를 이 환경에서 사용할 수 없음."""
 
 
+class SetupDeploymentError(VerifyUnavailable):
+    """The declared official initial state could not be established.
+
+    Inherit VerifyUnavailable so the CLI emits INCONCLUSIVE / exit 2,
+    rather than claiming a negative proof after silently changing targets.
+    """
+
+
 def verify_candidate(target_name, target_src, invariants_src, exploit_src, manifest, seed,
                      extra_sources=None):
     return verify_full(
@@ -129,39 +137,7 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
         return w3.eth.contract(address=r.contractAddress, abi=art["abi"]), r.contractAddress
 
     dep = manifest.get("deploy", {})
-    helpers_addr = {}
-    for h in dep.get("helpers") or []:
-        cname = h.get("contract")
-        if not cname or cname not in arts:
-            continue
-        hargs = _coerce_args(h.get("args") or [], Web3)
-        _hc, haddr = deploy(arts[cname], hargs, value=_parse_decimal(str(h.get("value_wei", "0"))))
-        helpers_addr[cname] = haddr
-    raw_cargs = dep.get("constructor_args", [])
-    if isinstance(raw_cargs, dict):
-        raw_cargs = [raw_cargs]
-    try:
-        from trust404.abi import resolve_placeholders, coerce_against_abi
-        raw_cargs = resolve_placeholders(raw_cargs, helpers_addr)
-        cargs = coerce_against_abi(raw_cargs, arts[target_name]["abi"], Web3)
-    except Exception:
-        cargs = _coerce_args(raw_cargs, Web3)
-    seed_wei = _parse_decimal(str(dep.get("value_wei", "0")))
-
-    setup_err = None
-    target = taddr = None
-    if dep.get("setup") and "Setup" in arts:
-        try:
-            taddr = _deploy_via_setup(w3, arts["Setup"], acct)
-            target = w3.eth.contract(address=taddr, abi=arts[target_name]["abi"])
-        except Exception as e:
-            setup_err = e
-            target = taddr = None
-    if taddr is None:
-        if _ctor_inputs(arts[target_name]["abi"]) and dep.get("setup"):
-            raise RuntimeError(
-                f"Setup.run failed and constructor needs args: {setup_err}")
-        target, taddr = deploy(arts[target_name], cargs, value=seed_wei)
+    target, taddr = _deploy_target(w3, compiled, arts, target_name, dep, acct, deploy)
     inv, iaddr = deploy(arts["Invariants"])
 
     before = inv.functions.checkAll(taddr).call()
@@ -208,6 +184,54 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
         detail=detail,
         profit=profit,
     )
+
+
+def _deploy_target(w3, compiled, arts, target_name, dep, acct, deploy):
+    """Setup presence selects a mandatory path, never a best-effort hint."""
+    if "setup" in dep:
+        setup_file = dep["setup"]
+        if not isinstance(setup_file, str) or not setup_file.strip():
+            raise SetupDeploymentError("deploy.setup must name a nonempty source path")
+        # Do not use the last contract named Setup from a different source unit.
+        artifact = compiled.get("contracts", {}).get(setup_file, {}).get("Setup")
+        if artifact is None:
+            raise SetupDeploymentError(f"missing declared Setup artifact: {setup_file}:Setup")
+        try:
+            setup_art = {"abi": artifact["abi"],
+                         "bin": artifact["evm"]["bytecode"]["object"]}
+            taddr = _deploy_via_setup(w3, setup_art, acct)
+            if not taddr or not w3.eth.get_code(taddr):
+                raise RuntimeError("Setup target has no deployed code")
+            target = w3.eth.contract(address=taddr, abi=arts[target_name]["abi"])
+            return target, taddr
+        except Exception as e:
+            raise SetupDeploymentError(
+                "official Setup deployment failed; constructor fallback is forbidden: "
+                f"{e}. Setups requiring Foundry cheatcodes need TRUST404_VERIFIER=forge."
+            ) from e
+
+    # No declared Setup: preserve the existing helper/constructor path.
+    Web3 = type(w3)
+    helpers_addr = {}
+    for h in dep.get("helpers") or []:
+        cname = h.get("contract")
+        if not cname or cname not in arts:
+            continue
+        hargs = _coerce_args(h.get("args") or [], Web3)
+        _hc, haddr = deploy(arts[cname], hargs, value=_parse_decimal(str(h.get("value_wei", "0"))))
+        helpers_addr[cname] = haddr
+    raw_cargs = dep.get("constructor_args", [])
+    if isinstance(raw_cargs, dict):
+        raw_cargs = [raw_cargs]
+    try:
+        from trust404.abi import resolve_placeholders, coerce_against_abi
+        raw_cargs = resolve_placeholders(raw_cargs, helpers_addr)
+        cargs = coerce_against_abi(raw_cargs, arts[target_name]["abi"], Web3)
+    except Exception:
+        cargs = _coerce_args(raw_cargs, Web3)
+    seed_wei = _parse_decimal(str(dep.get("value_wei", "0")))
+
+    return deploy(arts[target_name], cargs, value=seed_wei)
 
 
 def _coerce_args(args, Web3):
@@ -264,12 +288,14 @@ def _deploy_via_setup(w3, art, acct):
     C = w3.eth.contract(abi=art["abi"], bytecode=art["bin"])
     tx = C.constructor().transact({"from": acct, "gas": 12_000_000})
     rec = w3.eth.wait_for_transaction_receipt(tx)
-    saddr = rec.contractAddress
+    saddr = rec.get("contractAddress")
+    if rec.get("status") != 1 or not saddr or not w3.eth.get_code(saddr):
+        raise RuntimeError("Setup constructor deployment failed")
     sc = w3.eth.contract(address=saddr, abi=art["abi"])
     nonce = w3.eth.get_transaction_count(saddr)
     tx = sc.functions.run().transact({"from": acct, "gas": 12_000_000})
     rec = w3.eth.wait_for_transaction_receipt(tx)
-    if rec.get("status") == 0:
+    if rec.get("status") != 1:
         raise RuntimeError("Setup.run reverted")
     return _evm_create_address(saddr, nonce)
 
