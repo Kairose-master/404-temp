@@ -215,6 +215,7 @@ def main(argv=None):
     last_source = _fallback_stub()
     attempts = 0
     verifier_ok = True
+    completed_proofs = 0
     stages_seen = []
     held_invariants = {}  # 실패한 시도에서 '유지된' 불변식 관찰(피드백)
     critiques = []
@@ -243,6 +244,7 @@ def main(argv=None):
                 extra_sources=extra_sources or None,
             )
             proven, first_violated, detail = result.tuple()
+            completed_proofs += 1
         except VerifyUnavailable as e:
             verifier_ok = False
             note(f"attempt {attempts} [{stage}/{label}]: verifier unavailable ({e}); emitting best candidate")
@@ -264,6 +266,16 @@ def main(argv=None):
         except Exception:
             intent_cls = None
 
+        if proven:
+            ok, why = _confirm_official(
+                target_name, contract_src, invariants_src, source, manifest,
+                extra_sources or None)
+            if ok is False:
+                note(f"attempt {attempts} [{stage}/{label}]: py-evm PROVEN, official harness NOT_PROVEN ({why}); drop")
+                proven = False
+                detail = (detail or "") + f" forge_disagree={why}"
+            elif ok is True:
+                note(f"# official harness confirmed ({why})")
         if proven:
             note(f"attempt {attempts} [{stage}/{label}]: PROVEN — invariant violated: {first_violated}")
             if getattr(result, "profit", None) is not None:
@@ -344,6 +356,7 @@ def main(argv=None):
         "proven": False, "target": target_name,
         "attempts": attempts, "stages": stages_seen,
         "verifier_available": verifier_ok,
+        "completed_proofs": completed_proofs,
         "feedback": held_invariants,
         "critiques": [c.as_dict() for c in critiques] if critiques else [],
         "features": sorted(feats),
@@ -353,8 +366,36 @@ def main(argv=None):
     if not verifier_ok:
         print(f"INCONCLUSIVE target={target_name} (verifier unavailable)")
         return EXIT_ERROR
+    if completed_proofs == 0:
+        print(f"INCONCLUSIVE target={target_name} (no successful proof ran)")
+        return EXIT_ERROR
     print(f"NOT_PROVEN target={target_name} within budget")
     return EXIT_NOT_FOUND
+
+
+def _confirm_official(target_name, target_src, invariants_src, exploit_src, manifest,
+                      extra_sources):
+    """If Forge is available, it is the proof of record. None = skipped."""
+    import shutil
+    mode = os.environ.get("TRUST404_VERIFIER", "evm").lower()
+    if mode == "forge":
+        return True, "forge"
+    if shutil.which("forge") is None:
+        return None, "forge not on PATH"
+    prev = os.environ.get("TRUST404_VERIFIER")
+    os.environ["TRUST404_VERIFIER"] = "forge"
+    try:
+        r = verify_full(
+            target_name, target_src, invariants_src, exploit_src, manifest, 0,
+            extra_sources=extra_sources)
+        return (True, "forge") if r.proven else (False, r.detail)
+    except Exception as e:
+        return None, str(e)[:160]
+    finally:
+        if prev is None:
+            os.environ.pop("TRUST404_VERIFIER", None)
+        else:
+            os.environ["TRUST404_VERIFIER"] = prev
 
 
 def _write_result(out_dir, obj):
