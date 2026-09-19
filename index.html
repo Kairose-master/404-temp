@@ -213,8 +213,10 @@
   --manifest   /w/targets/$T/manifest.json \
   --out /w/out/$T --seed 42 --max-attempts 5
 
-<span class="cm"># 임의의 컨트랙트 감사 (불변식 없이) — audit 서브커맨드</span>
-<span class="fl">docker</span> run --rm -v "$PWD:/w" track04 audit /w/path/to/MyContract.sol --out /w/audit
+<span class="cm"># 임의의 컨트랙트 감사 — 파일은 마운트한 /w 아래에 있어야 합니다.</span>
+<span class="cm"># 파일 하나 · 폴더 · zip 모두 가능(폴더/zip 은 import 를 자동 해석·인라인).</span>
+<span class="fl">docker</span> run --rm -v "$PWD:/w" track04 audit /w/MyContract.sol --out /w/audit
+<span class="fl">docker</span> run --rm -v "$PWD:/w" track04 audit /w/MyProject.zip --out /w/audit
 <span class="cm"># exit 0=증명 · 1=미발견 · 2=오류</span></pre></div>
       <p class="subnote">소스: <a href="https://github.com/Kairose-master/404-temp/tree/main/agent" target="_blank" rel="noopener">agent/</a> · <a href="https://github.com/Kairose-master/404-temp/blob/main/agent/Dockerfile" target="_blank" rel="noopener">Dockerfile</a></p>
     </div>
