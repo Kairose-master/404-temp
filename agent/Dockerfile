@@ -45,9 +45,14 @@ COPY api /work/api
 COPY trust404 /work/trust404
 COPY lib /work/lib
 COPY targets /work/targets
+COPY scripts/serve.py /work/scripts/serve.py
+COPY index.html analysis.html track04.html METHOD.md /work/
+COPY vendor /work/vendor
 
 RUN chmod +x /work/agent/docker-entry.sh \
-    && python -m compileall -q /work/agent /work/api /work/trust404
+    && python -m compileall -q /work/agent /work/api /work/trust404 /work/scripts
+
+EXPOSE 8000
 
 # Both backends use /opt/solc via solcx. verify.py passes the exact local
 # executable to Forge with --use; an empty ~/.svm cache needs no download.

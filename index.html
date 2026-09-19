@@ -218,17 +218,17 @@
 <span class="fl">docker</span> run --rm -v "$PWD:/w" track04 audit /w/MyContract.sol --out /w/audit
 <span class="fl">docker</span> run --rm -v "$PWD:/w" track04 audit /w/MyProject.zip --out /w/audit
 <span class="cm"># exit 0=증명 · 1=미발견 · 2=오류</span></pre></div>
-      <p class="subnote">소스: <a href="https://github.com/Kairose-master/404-temp/tree/main/agent" target="_blank" rel="noopener">agent/</a> · <a href="https://github.com/Kairose-master/404-temp/blob/main/agent/Dockerfile" target="_blank" rel="noopener">Dockerfile</a></p>
+      <p class="subnote">소스: <a href="https://github.com/Kairose-master/404-temp/tree/claude/inspiring-faraday-0ik3jv/agent" target="_blank" rel="noopener">agent/</a> · <a href="https://github.com/Kairose-master/404-temp/blob/claude/inspiring-faraday-0ik3jv/agent/Dockerfile" target="_blank" rel="noopener">Dockerfile</a></p>
     </div>
     <div class="subcard">
       <div class="subhd"><span class="pill out">제출물 B</span>METHOD.md</div>
       <details class="mdwrap" id="method-details"><summary>METHOD.md 전문 보기 ▾</summary><div class="md" id="method-md"><pre>불러오는 중…</pre></div></details>
-      <p class="subnote">접근 방식 · 결정론 보장 · 한계까지. 함께: <a href="/analysis.html">분석·논문</a> · <a href="https://github.com/Kairose-master/404-temp/blob/main/FINDINGS.md" target="_blank" rel="noopener">FINDINGS.md</a></p>
+      <p class="subnote">접근 방식 · 결정론 보장 · 한계까지. 함께: <a href="/analysis.html">분석·논문</a> · <a href="https://github.com/Kairose-master/404-temp/blob/claude/inspiring-faraday-0ik3jv/FINDINGS.md" target="_blank" rel="noopener">FINDINGS.md</a></p>
     </div>
     <div class="subcard">
       <div class="subhd"><span class="pill out">제출물 C</span>Exploit.sol PoC</div>
       <p class="subnote">아래 각 타깃 <b>Run</b>이 결정론적으로 생성·검증해 <b>📤 생성된 Exploit.sol</b>로 출력합니다.</p>
-      <p class="subnote">저장된 PoC 7종: <a href="https://github.com/Kairose-master/404-temp/tree/main/exploits" target="_blank" rel="noopener">exploits/</a></p>
+      <p class="subnote">저장된 PoC 7종: <a href="https://github.com/Kairose-master/404-temp/tree/claude/inspiring-faraday-0ik3jv/exploits" target="_blank" rel="noopener">exploits/</a></p>
     </div>
   </div>
 </div></section>
@@ -370,8 +370,35 @@ const STEP_DEFS = [
   {key:"run_exploit",   label:"Exploit 배포 + 실행"},
   {key:"verify",        label:"불변식 재검사"},
 ];
-const fmtEth = wei => { try { return (Number(BigInt(wei))/1e18).toLocaleString(undefined,{maximumFractionDigits:4}) + " ETH"; } catch { return wei; } };
-const shortAddr = a => { try { return a.slice(0,6)+"…"+a.slice(-4); } catch { return a; } };
+const esc = value => String(value ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+const fmtEth = wei => { if(wei==null || wei==='') return '—'; try { return (Number(BigInt(wei))/1e18).toLocaleString(undefined,{maximumFractionDigits:4}) + " ETH"; } catch { return "—"; } };
+const shortAddr = a => { const value=String(a ?? ''); return value.length>12 ? value.slice(0,6)+"…"+value.slice(-4) : value; };
+const resultSteps = data => Array.isArray(data.steps) ? data.steps.filter(s=>s && typeof s==='object') : [];
+const resultHeuristics = data => Array.isArray(data.heuristics) ? data.heuristics.filter(h=>h && typeof h==='object') : [];
+function showError(el, error){
+  const message=document.createElement('div'); message.className='err'; message.setAttribute('role','alert');
+  message.textContent=error instanceof Error ? error.message : String(error);
+  el.replaceChildren(message);
+}
+async function request(url, options={}, timeoutMs=90000, json=true){
+  const controller=new AbortController();
+  const timer=setTimeout(()=>controller.abort(), timeoutMs);
+  try{
+    const response=await fetch(url,{...options,signal:controller.signal});
+    const raw=await response.text();
+    let data;
+    if(json){
+      try{ data=JSON.parse(raw); }
+      catch{ throw new Error(response.ok ? '서버 응답이 JSON 형식이 아닙니다. API 실행 환경을 확인하세요.' : `HTTP ${response.status}: 서버 요청에 실패했습니다.`); }
+    } else data=raw;
+    if(!response.ok) throw new Error(`HTTP ${response.status}: ${json && data && data.error ? String(data.error) : '서버 요청에 실패했습니다.'}`);
+    if(json && (!data || typeof data!=='object' || Array.isArray(data))) throw new Error('서버 응답 형식이 올바르지 않습니다.');
+    return data;
+  }catch(error){
+    if(controller.signal.aborted) throw new Error(`요청 시간이 ${Math.round(timeoutMs/1000)}초를 초과했습니다. 잠시 후 다시 실행하세요.`);
+    throw error;
+  }finally{ clearTimeout(timer); }
+}
 
 const grid = document.getElementById('grid');
 TARGETS.forEach(t => {
@@ -397,85 +424,53 @@ function setVerdict(name, kind, text){
   v.className = `verdict ${kind}`; v.textContent = text;
 }
 function resetSteps(name){
-  STEP_DEFS.forEach((_,i)=>{ const s=document.getElementById(`st-${name}-${i}`); s.className="st"; });
+  STEP_DEFS.forEach((def,i)=>{ const s=document.getElementById(`st-${name}-${i}`); s.className="st"; s.querySelector('.d').textContent=def.label; });
   document.getElementById(`out-${name}`).innerHTML="";
 }
-const sleep = ms => new Promise(r=>setTimeout(r,ms));
+const activeRuns = new Map();
+let runningAll = false;
+function syncRunButtons(){
+  document.querySelectorAll('.runbtn').forEach(btn=>{ btn.disabled=runningAll || activeRuns.has(btn.dataset.t); });
+  document.getElementById('runAll').disabled=runningAll || activeRuns.size>0;
+}
 
-async function run(name){
-  const btn = document.querySelector(`.runbtn[data-t="${name}"]`);
-  btn.disabled = true; resetSteps(name); setVerdict(name,"run","RUNNING…");
-  // animate step 1..2 immediately (client side) for feel
-  for (let i=0;i<2;i++){ document.getElementById(`st-${name}-${i}`).classList.add("on"); await sleep(160); }
-  let data;
-  try {
-    const res = await fetch(`/api/prove?target=${encodeURIComponent(name)}`, {cache:"no-store"});
-    data = await res.json();
-  } catch(e){
-    setVerdict(name,"idle","API ERROR");
-    document.getElementById(`out-${name}`).innerHTML = `<div class="err">API 호출 실패: ${e}</div>`;
-    btn.disabled=false; return data;
+function run(name){
+  if(activeRuns.has(name)) return activeRuns.get(name);
+  const pending=runTarget(name).finally(()=>{ activeRuns.delete(name); syncRunButtons(); });
+  activeRuns.set(name,pending); syncRunButtons(); return pending;
+}
+async function runTarget(name){
+  resetSteps(name); setVerdict(name,"run","RUNNING…");
+  const out=document.getElementById(`out-${name}`);
+  try{
+    const data=await request(`/api/prove?target=${encodeURIComponent(name)}`,{cache:'no-store'});
+    if(data.error) throw new Error(String(data.error));
+    if(typeof data.proven!=='boolean') throw new Error('서버 응답에 증명 결과가 없습니다.');
+    renderSteps(document.getElementById(`steps-${name}`),data,name);
+    setVerdict(name,data.proven?'proven':'idle',data.proven?'PROVEN':'NOT PROVEN');
+    out.innerHTML=metricsHtml(data,data.proven)
+      + (!data.proven ? `<p class="apihint">공격이 증명되지 않았습니다. 이 결과만으로 안전을 보장하지 않습니다.</p>` : '')
+      + (data.note ? `<p class="apihint">${esc(data.note)}</p>` : '') + srcHtml(data);
+    return data;
+  }catch(error){
+    setVerdict(name,'idle','ERROR'); showError(out,error);
+    return {error:error.message};
   }
-  if (data.error){
-    setVerdict(name,"idle","ERROR");
-    document.getElementById(`out-${name}`).innerHTML = `<div class="err">${data.error}</div>`;
-    btn.disabled=false; return data;
-  }
-  // map returned steps to the fixed 5 rows
-  const byKey = {}; (data.steps||[]).forEach(s=>byKey[s.step]=s);
-  for (let i=0;i<STEP_DEFS.length;i++){
-    const def = STEP_DEFS[i]; const s = byKey[def.key];
-    const row = document.getElementById(`st-${name}-${i}`);
-    row.classList.add("on"); await sleep(180);
-    if (s){
-      row.classList.add("done");
-      // enrich step text
-      if (def.key==="scan" && s.strategy) row.querySelector(".d").innerHTML = `${def.label} → <b>${s.strategy}</b>`;
-      if (def.key==="deploy_target") row.querySelector(".d").innerHTML =
-        (s.addresses && s.addresses.length) ? `${def.label} → ${s.addresses.map(a=>`<b>${shortAddr(a)}</b>`).join(', ')}`
-        : s.address ? `${def.label} → <b>${shortAddr(s.address)}</b>${s.library_address?` · lib <b>${shortAddr(s.library_address)}</b>`:""}`
-        : `${def.label} → <b>${fmtEth(s.balance_wei)}</b> 시드`;
-      if (def.key==="run_exploit" && s.exploit_address) row.querySelector(".d").innerHTML = `${def.label} → <b>${shortAddr(s.exploit_address)}</b>`;
-      if (def.key==="verify"){
-        const v=s.checkAll_after;
-        row.querySelector(".d").innerHTML = `${def.label} → allHold=<b>${v.allHold}</b>${v.firstViolated?` · <b>${v.firstViolated}</b>`:""}`;
-      }
-    } else {
-      // 성립했는데 특정 스텝 데이터가 없으면 '완료'로, 미성립(안전)일 때만 skip
-      row.classList.add("done");
-      row.querySelector(".d").innerHTML = data.proven ? `${def.label} → <b>완료</b>` : `${def.label} → <b>skip</b>`;
-    }
-  }
-  // verdict + metrics
-  const out = document.getElementById(`out-${name}`);
-  if (data.proven){
-    setVerdict(name,"proven","PROVEN");
-    out.innerHTML = metricsHtml(data, true) + srcHtml(data);
-  } else if (data.note){
-    setVerdict(name,"safe","NOT PROVEN");
-    out.innerHTML = `<div class="metrics"><div class="metric"><div class="k">결과</div><div class="v green">불변식 유지 (오탐 없음)</div></div>
-      <div class="metric"><div class="k">스캐너</div><div class="v">공격 패턴 미검출</div></div></div>` + srcHtml(data);
-  } else {
-    setVerdict(name,"safe","NOT PROVEN");
-    out.innerHTML = metricsHtml(data,false) + srcHtml(data);
-  }
-  btn.disabled=false; return data;
 }
 
 function metricsHtml(data, proven){
-  const v = (data.steps||[]).find(s=>s.step==="verify") || {};
-  const dt = (data.steps||[]).find(s=>s.step==="deploy_target") || {};
-  const drained = v.drained_wei ? fmtEth(v.drained_wei) : "0 ETH";
+  const v = resultSteps(data).find(s=>s.step==="verify") || {};
+  const dt = resultSteps(data).find(s=>s.step==="deploy_target") || {};
+  const drained = fmtEth(v.drained_wei);
   return `<div class="metrics">
-    <div class="metric"><div class="k">깨진 술어</div><div class="v ${proven?'red':'green'}">${data.firstViolated||"—"}</div></div>
-    <div class="metric"><div class="k">탈취 금액</div><div class="v ${proven?'red':''}">${drained}</div></div>
-    <div class="metric"><div class="k">잔액 전 → 후</div><div class="v">${fmtEth(data.balance_before_wei||dt.balance_wei||'0')} → ${fmtEth(data.balance_after_wei||v.balance_wei||'0')}</div></div>
-    <div class="metric"><div class="k">실행 시간</div><div class="v">${data.ms||0} ms</div></div>
+    <div class="metric"><div class="k">깨진 술어</div><div class="v ${proven?'red':''}">${esc(data.firstViolated||"—")}</div></div>
+    <div class="metric"><div class="k">탈취 금액</div><div class="v ${proven?'red':''}">${esc(drained)}</div></div>
+    <div class="metric"><div class="k">잔액 전 → 후</div><div class="v">${esc(fmtEth(data.balance_before_wei ?? dt.balance_wei))} → ${esc(fmtEth(data.balance_after_wei ?? v.balance_wei))}</div></div>
+    <div class="metric"><div class="k">실행 시간</div><div class="v">${esc(data.ms ?? '—')} ms</div></div>
   </div>`;
 }
 function heuristicsHtml(data){
-  const esc = s=>(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  const hs = data.heuristics || [];
+  const hs = resultHeuristics(data);
   if(!hs.length) return "";
   return hs.map(h=>`<div class="heur">
     <h4>⚠︎ ${esc(h.title)} · ${esc(h.severity||'HIGH')}</h4>
@@ -485,7 +480,6 @@ function heuristicsHtml(data){
   </div>`).join("");
 }
 function srcHtml(data){
-  const esc = s=>(s||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
   let h = "";
   // ── 입력 세트 (주최 제공) ──
   if(data.target_src)
@@ -495,19 +489,19 @@ function srcHtml(data){
   if(data.manifest_json)
     h += `<details class="io-d"><summary>📥 입력 · 매니페스트 <span class="io-f">manifest.json</span></summary><pre>${esc(data.manifest_json)}</pre></details>`;
   // ── 스캔: 계열 점수 ──
-  const scan = (data.steps||[]).find(s=>s.step==="scan");
+  const scan = resultSteps(data).find(s=>s.step==="scan");
   if(scan && scan.scores){
     const rows = Object.entries(scan.scores).sort((a,b)=>b[1]-a[1])
       .map(([k,v])=>`${k} = ${v}`).join("   ·   ");
     h += `<details class="io-d"><summary>🔎 스캔 · 계열 점수</summary><pre>${esc(rows)}\n\n선택 전략: ${esc(scan.strategy||'—')}</pre></details>`;
   }
   // ── attempts.log (파이프라인 로그) ──
-  if(data.steps && data.steps.length){
-    const log = data.steps.map(s=>{
+  if(resultSteps(data).length){
+    const log = resultSteps(data).map(s=>{
       let l = "["+s.step+"]";
       if(s.strategy) l += " strategy="+s.strategy;
       if(s.title) l += " · "+s.title;
-      if(s.addresses && s.addresses.length) l += " · deployed="+s.addresses.join(",");
+      if(Array.isArray(s.addresses) && s.addresses.length) l += " · deployed="+s.addresses.join(",");
       else if(s.address) l += " · addr="+s.address+(s.library_address?(" lib="+s.library_address):"");
       if(s.exploit_address) l += " · exploit="+s.exploit_address;
       if(s.balance_wei) l += " · balance="+fmtEth(s.balance_wei);
@@ -525,9 +519,16 @@ function srcHtml(data){
 
 document.querySelectorAll('.runbtn').forEach(b=>b.onclick=()=>run(b.dataset.t));
 document.getElementById('runAll').onclick = async ()=>{
-  const btn=document.getElementById('runAll'); btn.disabled=true;
-  for (const t of TARGETS){ await run(t.name); }
-  btn.disabled=false;
+  if(runningAll || activeRuns.size) return;
+  runningAll=true; syncRunButtons();
+  let errors=0;
+  try{
+    for(let i=0;i<TARGETS.length;i++){
+      document.getElementById('apihint').textContent=`${i+1}/${TARGETS.length} 실행 중 · ${TARGETS[i].name}`;
+      const result=await run(TARGETS[i].name); if(result.error) errors++;
+    }
+    document.getElementById('apihint').textContent=`${TARGETS.length}개 실행 완료${errors ? ` · 오류 ${errors}개 (해당 카드에서 다시 실행 가능)` : ''}`;
+  }finally{ runningAll=false; syncRunButtons(); }
 };
 
 // warm hint + first-call notice
@@ -574,8 +575,8 @@ document.getElementById('llm-test').onclick=async ()=>{
     hint.textContent="로컬 엔드포인트 확인 중…";
     try{
       const base=cfg.base||"http://localhost:11434/v1";
-      const r=await fetch(base.replace(/\/chat\/completions$/,'').replace(/\/$/,'')+"/models",{});
-      hint.textContent = r.ok ? "✓ 로컬 엔드포인트 응답 확인" : `응답 코드 ${r.status}`;
+      await request(base.replace(/\/chat\/completions$/,'').replace(/\/$/,'')+"/models",{},10000);
+      hint.textContent = "✓ 로컬 엔드포인트 응답 확인";
     }catch(e){ hint.textContent="✗ 로컬 호출 실패 (CORS/미실행). OLLAMA_ORIGINS 확인."; }
   } else {
     hint.textContent = (cfg.key||cfg.provider==="openai") ? "설정 저장 후 '분석/증명' 실행 시 사용됩니다." : "API Key를 입력하세요.";
@@ -598,9 +599,8 @@ async function localLLMGenerate(cfg, contract, invariants){
   const base=(cfg.base||"http://localhost:11434/v1").replace(/\/$/,'');
   const url = /\/chat\/completions$/.test(base) ? base : (/\/v1$/.test(base)? base+"/chat/completions" : base+"/v1/chat/completions");
   const headers={"Content-Type":"application/json"}; if(cfg.key) headers["Authorization"]="Bearer "+cfg.key;
-  const res=await fetch(url,{method:"POST",headers,body:JSON.stringify({model:cfg.model||"qwen2.5-coder:14b",temperature:0,
+  const data=await request(url,{method:"POST",headers,body:JSON.stringify({model:cfg.model||"qwen2.5-coder:14b",temperature:0,
     messages:[{role:"user",content:buildLLMPrompt(contract,invariants)}]})});
-  const data=await res.json();
   const text=(data.choices&&data.choices[0]&&data.choices[0].message&&data.choices[0].message.content)||"";
   return extractSolidity(text);
 }
@@ -614,17 +614,18 @@ document.querySelectorAll('.up').forEach(b=>{
   fileInput.onchange = async ()=>{
     const files = [...(fileInput.files||[])];
     if(!files.length) return;
+    try{
     if (b.dataset.file === "f-contract"){
       const n = await ingestUpload(files, {fillMain: true, mainTa: ta, btn: b});
       refreshDepsPanel();
-      if (detectImports(ta.value).length) runResolve();
+      if (detectImports(ta.value).length) await runResolve();
       if (n) document.getElementById('customhint').textContent = `올린 파일에서 import ${n}개 매칭`;
       return;
     }
     const f = files[0];
-    const r = new FileReader();
-    r.onload = ()=>{ ta.value = r.result; b.textContent = "✓ " + f.name; };
-    r.readAsText(f);
+    ta.value = await readBlob(f); b.textContent = "✓ " + f.name;
+    }catch(error){ document.getElementById('customhint').textContent='파일을 읽지 못했습니다: '+error.message; }
+    finally{ fileInput.value=''; }
   };
 });
 
@@ -656,32 +657,34 @@ contract Invariants {
 document.getElementById('loadSample').onclick = ()=>{
   document.getElementById('c-contract').value = SAMPLE_C;
   document.getElementById('c-inv').value = SAMPLE_I;
+  document.getElementById('c-name').value = 'MyVault';
+  document.getElementById('c-man').value = '';
+  _depSources = {}; Object.keys(_attached).forEach(key=>delete _attached[key]);
+  refreshDepsPanel();
   document.getElementById('customhint').textContent = "예시(재진입)를 채웠습니다. '분석 / 증명'을 눌러보세요.";
 };
 
-function renderSteps(stepsEl, data){
-  const byKey = {}; (data.steps||[]).forEach(s=>byKey[s.step]=s);
+function renderSteps(stepsEl, data, name){
+  const byKey = new Map(resultSteps(data).map(s=>[s.step,s]));
   stepsEl.innerHTML = STEP_DEFS.map((def,i)=>{
-    const s = byKey[def.key];
-    const base = (s && s.title) ? s.title : def.label;   // 실제 수행한 스텝 제목 우선
+    const s = byKey.get(def.key);
+    const base = esc((s && s.title) ? s.title : def.label);
     let txt = base, cls = "st";
     if (s){
       cls += " on done";
-      if (def.key==="scan" && s.strategy) txt = `${base} → <b>${s.strategy}</b>`;
+      if (def.key==="scan" && s.strategy) txt = `${base} → <b>${esc(s.strategy)}</b>`;
       if (def.key==="scan" && !s.strategy) txt = `${base} → <b>패턴 없음</b>`;
       if (def.key==="deploy_target"){
-        if (s.addresses && s.addresses.length) txt = `${base} → ${s.addresses.map(a=>`<b>${shortAddr(a)}</b>`).join(', ')}`;
-        else if (s.address) txt = `${base} → <b>${shortAddr(s.address)}</b>${s.library_address?` · lib <b>${shortAddr(s.library_address)}</b>`:""}`;
-        else txt = `${base} → <b>${fmtEth(s.balance_wei)}</b> 시드`;
+        if (Array.isArray(s.addresses) && s.addresses.length) txt = `${base} → ${s.addresses.map(a=>`<b>${esc(shortAddr(a))}</b>`).join(', ')}`;
+        else if (s.address) txt = `${base} → <b>${esc(shortAddr(s.address))}</b>${s.library_address?` · lib <b>${esc(shortAddr(s.library_address))}</b>`:""}`;
+        else if(s.balance_wei!=null) txt = `${base} → <b>${esc(fmtEth(s.balance_wei))}</b> 시드`;
       }
-      if (def.key==="run_exploit" && s.exploit_address) txt = `${base} → <b>${shortAddr(s.exploit_address)}</b>`;
-      if (def.key==="verify" && s.checkAll_after){ const v=s.checkAll_after; txt = `${base} → allHold=<b>${v.allHold}</b>${v.firstViolated?` · <b>${v.firstViolated}</b>`:""}`; }
+      if (def.key==="run_exploit" && s.exploit_address) txt = `${base} → <b>${esc(shortAddr(s.exploit_address))}</b>`;
+      if (def.key==="verify" && s.checkAll_after){ const v=s.checkAll_after; txt = `${base} → allHold=<b>${esc(v.allHold)}</b>${v.firstViolated?` · <b>${esc(v.firstViolated)}</b>`:""}`; }
     } else {
-      // 성립했는데 특정 스텝이 없으면 '수행함(요약 결과에 포함)'으로, 미성립일 때만 skip
-      cls += " on done";
-      txt = data.proven ? `${def.label} → <b>완료</b>` : `${def.label} → <b>skip</b>`;
+      txt = `${base} → <b>실행 기록 없음</b>`;
     }
-    return `<div class="${cls}"><span class="ic">${i+1}</span><div class="d">${txt}</div></div>`;
+    return `<div class="${cls}"${name ? ` id="st-${esc(name)}-${i}"` : ''}><span class="ic">${i+1}</span><div class="d">${txt}</div></div>`;
   }).join('');
 }
 
@@ -694,6 +697,7 @@ async function runCustom(){
   const stepsEl = document.getElementById('steps-custom');
   const outEl = document.getElementById('out-custom');
   const btn = document.getElementById('runCustom');
+  if(btn.disabled) return;
   if(!contract){ document.getElementById('customhint').textContent = "컨트랙트 소스를 입력하세요."; return; }
   card.style.display = "flex"; btn.disabled = true;
   setVerdict("custom","run","RUNNING…"); stepsEl.innerHTML=""; outEl.innerHTML="";
@@ -701,23 +705,23 @@ async function runCustom(){
   card.scrollIntoView({behavior:"smooth", block:"nearest"});
   let data;
   const cfg = currentLLM();
+  try{
   // 의존성 있으면 먼저 해결(자동), 미해결이 남으면 첨부 요청하고 중단
   if (detectImports(contract).length){
     document.getElementById('deps-panel').hidden = false;
     document.getElementById('customhint').textContent = "의존성(import) 웹에서 해결 중…";
-    const left = await runResolve();
+    const left = await runResolve(contract);
     if (left > 0){
       setVerdict("custom","idle","의존성 필요");
       document.getElementById('customhint').textContent = `미해결 의존성 ${left}개 — 아래 패널에 소스를 첨부한 뒤 다시 실행하세요.`;
       outEl.innerHTML = `<div class="err">import ${left}개를 웹에서 못 찾았습니다. 아래 "📦 감지된 import" 패널의 ⚠️ 항목에 해당 .sol 을 붙여넣고 다시 실행하세요.</div>`;
-      btn.disabled = false; return;
+      return;
     }
   }
   let body = {contract, invariants, targetName, manifest};
-  if (Object.keys(_depSources).length) body.sources = _depSources;
+  if (detectImports(contract).length && Object.keys(_depSources).length) body.sources = _depSources;
   document.getElementById('cmode').textContent = (invariants?"verify":"effect")
     + (cfg.provider!=="off" ? " · LLM:"+cfg.provider : "") ;
-  try{
     if (cfg.provider === "local"){
       document.getElementById('customhint').textContent = "로컬 모델로 Exploit.sol 생성 중…";
       try { body.exploitOverride = await localLLMGenerate(cfg, contract, invariants); }
@@ -726,12 +730,11 @@ async function runCustom(){
       body.llm = {provider:cfg.provider, base:cfg.base, model:cfg.model, key:cfg.key};
       document.getElementById('customhint').textContent = "LLM 후보 생성 + 검증 중…";
     }
-    const res = await fetch(`/api/prove`, {method:"POST", headers:{"Content-Type":"application/json"},
+    data = await request(`/api/prove`, {method:"POST", headers:{"Content-Type":"application/json"},
       body: JSON.stringify(body)});
-    data = await res.json();
-  }catch(e){ setVerdict("custom","idle","API ERROR"); outEl.innerHTML=`<div class="err">API 호출 실패: ${e}</div>`; btn.disabled=false; return; }
   if (data && data.llm_note) document.getElementById('customhint').textContent = data.llm_note;
-  if (data.error){ setVerdict("custom","idle","ERROR"); stepsEl.innerHTML=""; outEl.innerHTML=`<div class="err">${data.error}</div>`; btn.disabled=false; return; }
+  if (data.error) throw new Error(String(data.error));
+  if(typeof data.proven!=='boolean' && data.proven!==null) throw new Error('서버 응답에 증명 결과가 없습니다.');
   document.getElementById('cname').textContent = data.name || "Custom";
   renderSteps(stepsEl, data);
   const ran = (data.mode==="verify" || data.mode==="effect");
@@ -739,35 +742,38 @@ async function runCustom(){
     setVerdict("custom","proven", data.mode==="effect" ? "EXPLOITED" : "PROVEN");
     outEl.innerHTML = metricsHtml(data,true) + srcHtml(data);
   } else if (data.proven === false && ran && data.exploit_src){
-    const hasH = (data.heuristics||[]).length>0;
-    setVerdict("custom", hasH?"heuristic":"safe", hasH?"HEURISTIC":"NO EFFECT");
+    const hasH = resultHeuristics(data).length>0;
+    setVerdict("custom", hasH?"heuristic":"idle", hasH?"HEURISTIC":"NOT PROVEN");
     outEl.innerHTML = metricsHtml(data,false)
-      + `<div style="font-size:12px;color:var(--tx3);margin-top:8px">${data.error?('오류: '+data.error):'실행했으나 관찰 가능한 효과 없음 (안전하거나 이 템플릿으로는 미성립).'}</div>`
+      + `<p class="apihint">실행한 후보로는 공격이 증명되지 않았습니다. 이 결과만으로 안전을 보장하지 않습니다.</p>`
       + heuristicsHtml(data)
       + srcHtml(data);
   } else if (data.proven === null && data.exploit_src){ // generation-only (rare)
     setVerdict("custom","run","GENERATED");
-    outEl.innerHTML = `<div style="font-size:12px;color:var(--tx3)">${data.note||""}</div>` + srcHtml(data);
+    outEl.innerHTML = `<p class="apihint">${esc(data.note)}</p>` + srcHtml(data);
   } else { // no dynamically-proven candidate
-    const hasH = (data.heuristics||[]).length>0;
-    setVerdict("custom", hasH?"heuristic":"safe", hasH?"HEURISTIC":"NO PATTERN");
+    const hasH = resultHeuristics(data).length>0;
+    setVerdict("custom", hasH?"heuristic":"idle", hasH?"HEURISTIC":"NOT PROVEN");
     const metrics = `<div class="metrics">
-      <div class="metric"><div class="k">결과</div><div class="v ${hasH?'':'green'}">${hasH?'정적 휴리스틱 발견 (동적 미성립)':'공격 패턴 미검출'}</div></div>
+      <div class="metric"><div class="k">결과</div><div class="v">${hasH?'정적 휴리스틱 발견 (동적 미성립)':'공격 미증명 (안전 보장 아님)'}</div></div>
       <div class="metric"><div class="k">전략</div><div class="v">—</div></div>
       </div>`;
     outEl.innerHTML = metrics
       + heuristicsHtml(data)
-      + `<div style="font-size:12px;color:var(--tx3);margin-top:8px">${data.note||""}</div>`;
+      + `<p class="apihint">${esc(data.note)}</p>` + srcHtml(data);
   }
-  btn.disabled=false;
+  }catch(error){
+    setVerdict('custom','idle','ERROR'); showError(outEl,error);
+  }finally{ btn.disabled=false; }
 }
 // ── 의존성(import) 자동 해결 + 첨부 UI ──
-const _attached = {};            // importPath -> pasted source
+const _attached = Object.create(null); // importPath -> pasted source
 let _depSources = {};            // key -> content (resolved + attached, sent to server)
 function detectImports(src){
-  const out = []; const s = src.replace(/\/\/[^\n]*/g,'').replace(/\/\*[\s\S]*?\*\//g,'');
-  const re = /import\s+(?:[^;"']*?\s+from\s+)?["']([^"']+)["']\s*;/g; let m;
-  while((m = re.exec(s))) out.push(m[1]);
+  // Strip comments while preserving quoted URLs (including their //).
+  const out = []; const s = src.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'/g, token=>token.startsWith('/') ? ' ' : token);
+  const re = /import\s+(?:[^;"']*?\s+from\s+)?(?:"([^"]+)"|'([^']+)')(?:\s+as\s+\w+)?\s*;/g; let m;
+  while((m = re.exec(s))) out.push(m[1] || m[2]);
   return [...new Set(out)];
 }
 function _normPath(p){
@@ -836,7 +842,7 @@ function pickMainSol(files){
   const sols = files.filter(f=>/\.sol$/i.test(f.path) && !/I?nvariants\.sol$/i.test(_basename(f.path)));
   if(!sols.length) return null;
   if(named){
-    const hit = sols.find(f=>new RegExp('contract\\s+'+named+'\\b').test(f.text))
+    const hit = sols.find(f=>[...f.text.matchAll(/\bcontract\s+(\w+)/g)].some(m=>m[1]===named))
       || sols.find(f=>_basename(f.path).replace(/\.sol$/i,'')===named);
     if(hit) return hit;
   }
@@ -851,7 +857,7 @@ async function filesFromZip(buf){
   if(!window.JSZip){
     await new Promise((res,rej)=>{
       const s=document.createElement('script');
-      s.src='https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js';
+      s.src='/vendor/jszip.min.js';
       s.onload=res; s.onerror=()=>rej(new Error('JSZip load failed'));
       document.head.appendChild(s);
     });
@@ -936,7 +942,7 @@ function depUrl(path, baseUrl, ver){
   return `https://cdn.jsdelivr.net/npm/${pkg}@${v}/${rest}`;
 }
 async function resolveAllDeps(mainSrc, ver){
-  const sources = {}, unresolved = [], seen = new Set();
+  const sources = Object.create(null), unresolved = [], seen = new Set();
   const q = detectImports(mainSrc).map(p => ({path:p, base:null}));
   let guard = 0;
   while(q.length && guard++ < 400){
@@ -944,19 +950,23 @@ async function resolveAllDeps(mainSrc, ver){
     const url = depUrl(path, base, ver);
     const key = url || path;
     if(seen.has(key)) continue; seen.add(key);
+    // Uploaded sources work offline and override remote package versions.
+    if(_attached[path] != null){
+      sources['attach:'+path] = _attached[path];
+      detectImports(_attached[path]).forEach(sub => q.push({path:sub,base:null}));
+      continue;
+    }
     if(url === null){                              // 자동 해결 불가
-      if(_attached[path] != null){
-        sources['attach:'+path] = _attached[path];
-        detectImports(_attached[path]).forEach(sub => q.push({path: sub, base:null}));
-      } else unresolved.push(path);
+      unresolved.push(path);
       continue;
     }
     let txt = null;
-    try{ const r = await fetch(url); if(r.ok) txt = await r.text(); }catch(e){}
-    if(txt == null){ if(_attached[path] != null){ sources['attach:'+path]=_attached[path]; } else unresolved.push(path); continue; }
+    try{ txt = await request(url,{},10000,false); }catch(e){}
+    if(txt == null){ unresolved.push(path); continue; }
     sources[key] = txt;
     detectImports(txt).forEach(sub => q.push({path: sub, base: url}));
   }
+  unresolved.push(...q.map(item=>item.path));
   return {sources, unresolved:[...new Set(unresolved)]};
 }
 function refreshDepsPanel(){
@@ -966,8 +976,8 @@ function refreshDepsPanel(){
   document.getElementById('deps-count').textContent = imps.length;
   panel.hidden = imps.length === 0;
 }
-async function runResolve(){
-  const src = document.getElementById('c-contract').value.trim();
+async function runResolve(source){
+  const src = typeof source==='string' ? source : document.getElementById('c-contract').value.trim();
   const ver = (document.getElementById('dep-ver').value.trim() || 'latest');
   const hint = document.getElementById('deps-hint'); const list = document.getElementById('deps-list');
   const flat = splitFlattened(src);
@@ -981,12 +991,12 @@ async function runResolve(){
   let html = '';
   Object.keys(sources).slice(0,40).forEach(k=>{
     const label = k.replace(/^attach:/,'(첨부) ').replace('https://cdn.jsdelivr.net/npm/','npm:');
-    html += `<div class="dep-item"><span class="dpath">${label.length>90?label.slice(0,90)+'…':label}</span><span class="dep-pill ok">해결됨</span></div>`;
+    html += `<div class="dep-item"><span class="dpath">${esc(label.length>90?label.slice(0,90)+'…':label)}</span><span class="dep-pill ok">해결됨</span></div>`;
   });
   unresolved.forEach(p=>{
-    html += `<div class="dep-item"><span class="dpath">${p}</span><span class="dep-pill warn">첨부 필요</span>`
+    html += `<div class="dep-item"><span class="dpath">${esc(p)}</span><span class="dep-pill warn">첨부 필요</span>`
          +  `<button type="button" class="btn small row-up" data-one="${encodeURIComponent(p)}">📎 이 파일 업로드</button>`
-         +  `<textarea data-imp="${encodeURIComponent(p)}" placeholder="이 의존성(${p}) 의 .sol 소스를 붙여넣거나, 위 버튼으로 파일·zip 을 통째 올리세요">${_attached[p]||''}</textarea></div>`;
+         +  `<textarea data-imp="${encodeURIComponent(p)}" placeholder="${esc(`이 의존성(${p}) 의 .sol 소스를 붙여넣거나, 위 버튼으로 파일·zip 을 통째 올리세요`)}">${esc(_attached[p])}</textarea></div>`;
   });
   list.innerHTML = html;
   list.querySelectorAll('textarea[data-imp]').forEach(ta=>{
@@ -998,21 +1008,33 @@ async function runResolve(){
   return unresolved.length;
 }
 document.getElementById('c-contract').addEventListener('input', refreshDepsPanel);
-document.getElementById('resolveDeps').onclick = runResolve;
+document.getElementById('resolveDeps').onclick = async ()=>{
+  const btn=document.getElementById('resolveDeps'); btn.disabled=true;
+  try{ await runResolve(); }
+  catch(error){ document.getElementById('deps-hint').textContent='의존성 확인 실패: '+error.message; }
+  finally{ btn.disabled=false; }
+};
 document.getElementById('bundleBtn').onclick = ()=> document.getElementById('f-bundle').click();
 document.getElementById('dirBtn').onclick = ()=> document.getElementById('f-dir').click();
 document.getElementById('f-bundle').addEventListener('change', async (e)=>{
   const files = [...(e.target.files||[])]; if(!files.length) return;
+  try{
   const n = await ingestUpload(files, {});
   await runResolve();
   document.getElementById('customhint').textContent = n?`통째 업로드에서 import ${n}개 찾음`:'올린 파일에서 매칭되는 import 없음';
+  }catch(error){ document.getElementById('customhint').textContent='파일을 읽지 못했습니다: '+error.message; }
+  finally{ e.target.value=''; }
 });
 document.getElementById('f-dir').addEventListener('change', async (e)=>{
   const files = [...(e.target.files||[])]; if(!files.length) return;
-  const n = await ingestUpload(files, {fillMain: !document.getElementById('c-contract').value.trim()});
+  try{
+  const mainTa=document.getElementById('c-contract');
+  const n = await ingestUpload(files, {fillMain: !mainTa.value.trim(),mainTa});
   refreshDepsPanel();
   await runResolve();
   document.getElementById('customhint').textContent = n?`폴더에서 import ${n}개 찾음`:'폴더를 올렸습니다';
+  }catch(error){ document.getElementById('customhint').textContent='파일을 읽지 못했습니다: '+error.message; }
+  finally{ e.target.value=''; }
 });
 (function(){
   const panel = document.getElementById('deps-panel');
@@ -1021,10 +1043,13 @@ document.getElementById('f-dir').addEventListener('change', async (e)=>{
   panel.addEventListener('drop', async e=>{
     const files = [...(e.dataTransfer.files||[])];
     if(!files.length) return;
-    const n = await ingestUpload(files, {fillMain: !document.getElementById('c-contract').value.trim()});
+    try{
+    const mainTa=document.getElementById('c-contract');
+    const n = await ingestUpload(files, {fillMain: !mainTa.value.trim(),mainTa});
     refreshDepsPanel();
     await runResolve();
     document.getElementById('customhint').textContent = n?`드롭한 파일에서 import ${n}개 찾음`:'드롭한 파일에서 매칭 없음';
+    }catch(error){ document.getElementById('customhint').textContent='파일을 읽지 못했습니다: '+error.message; }
   });
 })();
 
@@ -1038,9 +1063,7 @@ document.getElementById('runCustom').onclick = runCustom;
   d.addEventListener('toggle', async ()=>{
     if(!d.open || loaded) return; loaded=true;
     try{
-      const r=await fetch('/METHOD.md',{cache:'no-store'});
-      if(!r.ok) throw new Error('HTTP '+r.status);
-      const t=await r.text();
+      const t=await request('/METHOD.md',{cache:'no-store'},10000,false);
       const pre=document.createElement('pre'); pre.textContent=t;
       box.innerHTML=''; box.appendChild(pre);
     }catch(e){
