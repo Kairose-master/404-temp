@@ -2,9 +2,9 @@
 # GET  /api/prove?target=<Name>   : 내장 공개셋 6개
 # POST /api/prove  {contract, invariants?, manifest?, targetName?} : 임의 컨트랙트
 # 실제 in-memory EVM 에서 배포->Exploit.sol 생성->실행->checkAll 재검사.
-import os, json, time, re, random, warnings, traceback
+import os, json, time, re, random, warnings, traceback, tempfile
 warnings.filterwarnings("ignore")
-os.environ.setdefault("SOLCX_BINARY_PATH", "/tmp/solcx-bin")
+os.environ.setdefault("SOLCX_BINARY_PATH", os.path.join(tempfile.gettempdir(), "solcx-bin"))
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path as _Path
@@ -18,6 +18,7 @@ EVM_VERSION = "cancun"
 DEFAULT_EXPLOIT_FUNDING_WEI = 10 * 10**18
 DEFAULT_SEED_WEI = 10 * 10**18
 MAX_SRC = 500000  # per-field source cap for custom uploads
+MAX_BODY = 4_000_000  # bound reads before parsing/flattening untrusted uploads
 
 TARGETS = {
  "ReentrantVault": {
@@ -5399,11 +5400,84 @@ def _run(name):
     except Exception as e:
         return {"name":name,"error":str(e)[:400],"trace":traceback.format_exc()[-800:]}
 
-def _run_custom(body):
+class _RequestError(ValueError):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+def _parse_custom_request(body):
+    """Validate the wire format before compilation or any optional LLM call."""
+    if len(body.encode("utf-8")) > MAX_BODY:
+        raise _RequestError("request body too large", 413)
     try:
         data = json.loads(body or "{}")
     except Exception as e:
-        return {"error":"invalid JSON body: "+str(e)[:120]}
+        raise _RequestError("invalid JSON body: " + str(e)[:120]) from e
+    if not isinstance(data, dict):
+        raise _RequestError("JSON body must be an object")
+    for field in ("contract", "invariants", "targetName", "exploitOverride"):
+        value = data.get(field)
+        if value is not None and not isinstance(value, str):
+            raise _RequestError(f"'{field}' must be a string")
+    if not (data.get("contract") or "").strip():
+        raise _RequestError("'contract' source is required")
+    for field in ("contract", "invariants", "exploitOverride"):
+        if len(data.get(field) or "") > MAX_SRC:
+            raise _RequestError(f"'{field}' source too large", 413)
+    sources = data.get("sources")
+    if sources is not None:
+        if not isinstance(sources, dict) or any(not isinstance(v, str) for v in sources.values()):
+            raise _RequestError("'sources' must be an object of source strings")
+        if len(sources) > 128 or any(len(v) > MAX_SRC for v in sources.values()):
+            raise _RequestError("dependency sources too large", 413)
+        if len(data["contract"]) + sum(map(len, sources.values())) > MAX_SRC * 6:
+            raise _RequestError("combined sources too large", 413)
+    manifest = data.get("manifest")
+    if isinstance(manifest, str):
+        try:
+            manifest = json.loads(manifest) if manifest.strip() else None
+        except Exception as e:
+            raise _RequestError("invalid manifest JSON: " + str(e)[:120]) from e
+        data["manifest"] = manifest
+    if manifest is not None:
+        if not isinstance(manifest, dict):
+            raise _RequestError("'manifest' must be an object")
+        for field in ("target", "deploy", "invariants", "budget", "determinism", "_synth"):
+            if field in manifest and not isinstance(manifest[field], dict):
+                raise _RequestError(f"'manifest.{field}' must be an object")
+        deploy = manifest.get("deploy", {})
+        if "constructor_args" in deploy and not isinstance(deploy["constructor_args"], list):
+            raise _RequestError("'manifest.deploy.constructor_args' must be an array")
+        if "value_wei" in deploy:
+            value = deploy["value_wei"]
+            if isinstance(value, bool) or not isinstance(value, (str, int)) or not re.fullmatch(r"[0-9]+", str(value)):
+                raise _RequestError("'manifest.deploy.value_wei' must be a nonnegative integer")
+        predicates = manifest.get("invariants", {}).get("predicates", [])
+        if not isinstance(predicates, list) or any(not isinstance(p, str) for p in predicates):
+            raise _RequestError("'manifest.invariants.predicates' must be an array of strings")
+    cfg = data.get("llm")
+    if cfg is not None:
+        if not isinstance(cfg, dict):
+            raise _RequestError("'llm' must be an object")
+        for field in ("provider", "base", "model", "key"):
+            if cfg.get(field) is not None and not isinstance(cfg[field], str):
+                raise _RequestError(f"'llm.{field}' must be a string")
+    return data
+
+
+def _run_custom(body):
+    try:
+        data = _parse_custom_request(body)
+    except _RequestError as e:
+        return {"error": str(e), "error_type": "invalid_request", "status": e.status}
+    try:
+        return _run_custom_data(data)
+    except Exception as e:
+        return {"error": "proof execution failed: " + str(e)[:300], "error_type": "execution_error"}
+
+
+def _run_custom_data(data):
     contract = (data.get("contract") or "").strip()
     invariants = (data.get("invariants") or "").strip()
     if not contract:
@@ -5620,6 +5694,7 @@ class handler(BaseHTTPRequestHandler):
         b = json.dumps(obj, ensure_ascii=False).encode()
         self.send_response(code)
         self.send_header("Content-Type","application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(b)))
         self.send_header("Access-Control-Allow-Origin","*")
         self.send_header("Access-Control-Allow-Methods","GET,POST,OPTIONS")
         self.send_header("Access-Control-Allow-Headers","Content-Type")
@@ -5634,11 +5709,27 @@ class handler(BaseHTTPRequestHandler):
         if not name:
             return self._send(200, {"targets":list(TARGETS.keys()),
                                     "usage":"GET ?target=<Name> | POST {contract,invariants?,manifest?,targetName?}"})
+        if name not in TARGETS:
+            return self._send(404, _run(name))
         self._send(200, _run(name))
     def do_POST(self):
+        length = self.headers.get("Content-Length")
+        if self.headers.get("Transfer-Encoding"):
+            return self._send(400, {"error": "Transfer-Encoding is not supported; send Content-Length"})
+        if length is None or not re.fullmatch(r"[0-9]{1,20}", length):
+            return self._send(400, {"error": "valid Content-Length is required"})
+        n = int(length)
+        if n > MAX_BODY:
+            return self._send(413, {"error": "request body too large"})
         try:
-            n = int(self.headers.get("Content-Length") or 0)
-            body = self.rfile.read(n).decode("utf-8", "replace") if n else ""
+            raw = self.rfile.read(n)
+            if len(raw) != n:
+                return self._send(400, {"error": "incomplete request body"})
+            body = raw.decode("utf-8")
         except Exception as e:
             return self._send(400, {"error":"read body failed: "+str(e)[:120]})
-        self._send(200, _run_custom(body))
+        result = _run_custom(body)
+        status = result.pop("status", 400) if result.get("error_type") == "invalid_request" else 200
+        if result.get("error_type") == "execution_error":
+            status = 500
+        self._send(status, result)

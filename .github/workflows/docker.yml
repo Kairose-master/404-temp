@@ -11,9 +11,14 @@ permissions:
 jobs:
   docker-offline:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check browser rendering and failure states
+        run: node --test tests/frontend.test.cjs
       - name: Build the actual image without cached layers
         shell: bash
         run: |
@@ -26,6 +31,16 @@ jobs:
           set -euo pipefail
           timeout 30s docker run --rm --network none trust404:ci --help
           timeout 30s docker run --rm --network none trust404:ci audit --help
+      - name: Check HTTP validation and local server routes in the image
+        shell: bash
+        run: |
+          set -euo pipefail
+          for test in test_api_http.py test_web_server.py; do
+            timeout 90s docker run --rm --network none --entrypoint python \
+              --env PYTHONPATH=/work \
+              --mount "type=bind,src=$PWD/tests,dst=/work/tests,readonly" \
+              trust404:ci -m unittest discover -s /work/tests/python -p "$test" -v
+          done
       - name: Prove positive and negative fixtures offline in each backend
         shell: bash
         run: |
@@ -38,7 +53,45 @@ jobs:
                 --root /work --fixtures /checks/fixtures --backend "$backend" \
               2>&1 | tee "docker-smoke-$backend.log"
           done
-      - name: Preserve build and proof logs
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install browser checks on the runner
+        run: |
+          python -m pip install playwright==1.55.0
+          python -m playwright install --with-deps chromium
+      - name: Start the built image through the documented Compose service
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Keep the documented ports, command and healthcheck. An internal
+          # network prevents the container downloading missing tools at runtime.
+          cat > compose.ci.yaml <<'YAML'
+          services:
+            web:
+              image: trust404:ci
+          networks:
+            default:
+              internal: true
+          YAML
+          docker compose -f compose.yaml -f compose.ci.yaml config
+          docker compose -f compose.yaml -f compose.ci.yaml up --no-build --wait --wait-timeout 90
+      - name: Verify browser uploads and positive and negative EVM proofs
+        shell: bash
+        run: |
+          set -euo pipefail
+          timeout 600s python scripts/docker_web_smoke.py \
+            --base-url http://127.0.0.1:8000 --artifacts docker-web-artifacts \
+            2>&1 | tee docker-web-smoke.log
+      - name: Capture web logs and stop containers
+        if: always()
+        shell: bash
+        run: |
+          if [ -f compose.ci.yaml ]; then
+            docker compose -f compose.yaml -f compose.ci.yaml logs --no-color > docker-web.log 2>&1
+            docker compose -f compose.yaml -f compose.ci.yaml down --volumes
+          fi
+      - name: Preserve build, proof, and browser evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -46,4 +99,6 @@ jobs:
           path: |
             docker-build.log
             docker-smoke-*.log
+            docker-web*.log
+            docker-web-artifacts/
           if-no-files-found: warn

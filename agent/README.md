@@ -35,6 +35,23 @@ python3 agent/agent.py --contract <path> --invariants <path> --manifest <path> \
 
 ## Docker
 
+### 브라우저에서 가장 빠르게 실행
+
+저장소 루트에서 `docker compose up --build`를 실행하고 **http://localhost:8000** 을 연다.
+이미지 빌드·플랫폼·포트·준비 상태 검사는 Compose에 들어 있다. 별도 설치나 마운트 없이
+공개 타깃 실행과 내 `.sol`/ZIP 업로드를 사용할 수 있다. 종료는 `Ctrl+C` 또는
+`docker compose down`. Windows PowerShell에서도 같은 명령이다.
+
+기존 CLI 이미지를 직접 웹 모드로 실행할 수도 있다:
+
+```bash
+docker run --rm -p 127.0.0.1:8000:8000 track04 web
+```
+
+아래 표준 CLI와 `audit` 모드는 그대로 사용할 수 있다. 인자 없이 이미지를 실행하면
+웹 시작 명령과 CLI 도움말을 출력한다. 웹은 임시 EVM 결과를 화면에 표시하며,
+파일을 호스트에 보관하는 CLI는 아래 마운트 예시를 따른다.
+
 ### 1. 빌드 — build context 는 반드시 저장소 루트(`.`)
 ```bash
 # 반드시 번들 최상위(404-temp/)에서 실행한다.
