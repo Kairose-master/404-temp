@@ -94,15 +94,42 @@ docker run --rm \
 ```
 불변식·매니페스트가 **없으면** `audit` 서브커맨드로 라우팅한다. 생성자 인자를
 시그니처에서 자동 합성하고 자동 효과검사로 엔진 전량을 돌려 심각도별 리포트
-(JSON/Markdown)와 PoC 를 낸다. 파일 하나든 디렉터리든 받는다:
+(JSON/Markdown/SARIF)와 PoC 를 낸다. 파일 하나·디렉터리·**zip** 을 받는다.
+
+**컨트랙트를 어디에 두나 (중요).** 컨테이너 안은 호스트와 분리돼 있으므로, 감사할
+파일은 반드시 **마운트한 경로 안**에 있어야 한다. `-v "$PWD:/w"` 는 지금 폴더를
+컨테이너의 `/w` 로 연결하는 것이라, 인자 경로도 `/w/...` 로 줘야 한다. 컨테이너
+바깥(호스트 절대경로)을 그대로 주면 "파일 없음"이 난다.
+
 ```bash
-# 파일 하나
-docker run --rm -v "$PWD:/w" track04 audit /w/path/to/MyContract.sol --out /w/audit
-# 디렉터리 전체(스크립트/인터페이스/라이브러리는 건너뜀)
-docker run --rm -v "$PWD:/w" track04 audit /w/contracts --out /w/audit
+# 1) 파일 하나 — 지금 폴더 기준 상대경로가 /w 아래로 매핑된다
+docker run --rm -v "$PWD:/w" track04 audit /w/MyContract.sol --out /w/audit
+
+# 2) 폴더가 다른 곳에 있으면 그 폴더를 통째로 마운트
+docker run --rm \
+  -v "$PWD:/w" \
+  -v "/absolute/path/to/MyProject:/proj" \
+  track04 audit /proj --out /w/audit
+
+# 3) zip 을 그대로 — 컨테이너가 임시 폴더에 풀어서 감사한다
+docker run --rm -v "$PWD:/w" track04 audit /w/MyProject.zip --out /w/audit
 ```
-`audit` 매니페스트 스키마와 불변식 작성법은 `targets/*/manifest.json` 과
-`targets/*/Invariants.sol` 을 그대로 본떠 쓰면 된다.
+
+**여러 .sol + import 자동 해석.** 디렉터리나 zip 을 주면, 감사 대상 파일마다
+`import` 문을 파싱해 의존 파일을 트리에서 찾아 하나로 인라인(flatten)한 뒤 컴파일한다.
+`remappings.txt` 없이도 별칭 import 를 처리한다:
+
+- `import "./IVault.sol";` · `import "../base/VaultBase.sol";` — 상대경로 해석.
+- `import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";` — 별칭은
+  **경로 접미사 최장 일치**로 트리에서 실제 파일을 찾는다(그 라이브러리가 zip/폴더
+  안 `lib/`·`node_modules/` 어디에 있든 무방). 그러니 의존 라이브러리도 함께 넣어라.
+- 감사 **대상**은 각 파일에 직접 선언된 구체 컨트랙트뿐이다. import 로 끌려온 베이스·
+  인터페이스·라이브러리와 `lib/`·`node_modules/`·`test/`·`script/` 폴더는 대상에서
+  제외하되, import 해석용으로는 계속 참조한다.
+- 해석 못 한 import 는 건너뛰고 로그로 남긴 뒤 가능한 만큼 컴파일을 시도한다.
+
+불변식을 함께 증명하려면 `--invariants Inv.sol` 를 준다. `audit` 매니페스트 스키마와
+불변식 작성법은 `targets/*/manifest.json` 과 `targets/*/Invariants.sol` 을 본떠 쓰면 된다.
 
 ### 옵션·환경변수
 - `--seed <int>` 결정론 시드(같은 시드 → 바이트 동일 산출). `--max-attempts <int>`

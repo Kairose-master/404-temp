@@ -578,15 +578,169 @@ def contract_priority(eng, src, contract):
     return score
 
 
+_TARGET_SKIP = ("/lib/", "/node_modules/", "/out/", "/.git/",
+                "/test/", "/tests/", "/script/", "/scripts/")
+
+
 def gather_files(path):
     p = Path(path)
     if p.is_file():
         return [p]
     if p.is_dir():
-        skip = ("/lib/", "/node_modules/", "/out/", "/.git/", "/test/", "/tests/")
         return sorted(f for f in p.rglob("*.sol")
-                      if not any(sk in str(f).replace("\\", "/") + "/" for sk in skip))
+                      if not any(sk in str(f).replace("\\", "/") + "/" for sk in _TARGET_SKIP))
     raise SystemExit(f"error: path not found: {path}")
+
+
+def prepare_input(path):
+    """입력 경로를 (분석 루트, 정리 함수) 로 정규화한다.
+
+    - `.zip` 이거나 zip 시그니처면 임시 디렉터리로 안전하게 푼다(zip-slip 방지).
+      압축 안에 최상위 폴더 하나만 있으면 그 폴더를 루트로 삼는다.
+    - 그 외에는 경로를 그대로 쓴다.
+    반환한 정리 함수를 마지막에 호출해 임시 디렉터리를 지운다.
+    """
+    import shutil
+    import tempfile
+    import zipfile
+
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"error: path not found: {path}")
+    if p.is_file() and (p.suffix.lower() == ".zip" or zipfile.is_zipfile(p)):
+        tmp = Path(tempfile.mkdtemp(prefix="t404-audit-"))
+        root = tmp.resolve()
+        with zipfile.ZipFile(p) as zf:
+            for member in zf.infolist():
+                # zip-slip 방지: 목적지가 루트 밖이면 거부.
+                dest = (root / member.filename).resolve()
+                if dest != root and not str(dest).startswith(str(root) + os.sep):
+                    raise SystemExit(f"error: unsafe path in zip: {member.filename}")
+                if member.is_dir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(member) as srcf, open(dest, "wb") as outf:
+                    shutil.copyfileobj(srcf, outf)
+        # 최상위에 폴더 하나뿐이면 그 안을 루트로.
+        entries = [e for e in root.iterdir() if e.name != "__MACOSX"]
+        if len(entries) == 1 and entries[0].is_dir():
+            root = entries[0]
+        return root, (lambda: shutil.rmtree(tmp, ignore_errors=True))
+    return p, (lambda: None)
+
+
+# import "..."; / import {A} from "..."; / import * as X from "..."; / import "..." as X;
+_IMPORT_RE = re.compile(
+    r'^\s*import\s+(?:[^"\';]*\bfrom\b\s*)?["\']([^"\']+)["\'][^;]*;',
+    re.MULTILINE)
+_SPDX_RE = re.compile(r'^\s*//\s*SPDX-License-Identifier:.*$', re.MULTILINE)
+_PRAGMA_RE = re.compile(r'^\s*pragma\s+[^;]+;\s*$', re.MULTILINE)
+
+
+def build_source_index(root):
+    """루트 아래 모든 .sol 을 posix 절대경로로 색인한다(라이브러리 포함)."""
+    root = Path(root)
+    idx = []
+    if root.is_file():
+        idx.append(root.resolve())
+        root = root.parent
+    for f in root.rglob("*.sol"):
+        idx.append(f.resolve())
+    # 중복 제거, 결정론 정렬.
+    return sorted(set(idx), key=lambda x: str(x))
+
+
+def resolve_import(imp, importing_abs, index):
+    """import 경로 문자열을 실제 파일로 해석한다.
+
+    1) `./`·`../` 상대경로는 import 한 파일 기준으로 해석.
+    2) 아니면 색인에서 **가장 긴 경로 접미사**가 일치하는 파일을 고른다.
+       (`@openzeppelin/contracts/access/Ownable.sol` 같은 remapping 별칭도
+        `.../access/Ownable.sol` 접미사로 자동 매칭 — remappings.txt 불필요.)
+    동점이면 루트에 가까운(경로 짧은) 파일을 결정론적으로 택한다.
+    """
+    imp = imp.strip().replace("\\", "/")
+    importing_abs = Path(importing_abs).resolve()
+    if imp.startswith("./") or imp.startswith("../"):
+        cand = (importing_abs.parent / imp).resolve()
+        if cand in index:
+            return cand
+        # 상대경로가 색인에 없으면 접미사 매칭으로 폴백.
+    # 접미사 매칭: import 경로의 뒤쪽 세그먼트가 많이 겹칠수록 우선.
+    imp_parts = [s for s in imp.split("/") if s not in ("", ".", "..")]
+    best = None
+    best_score = 0
+    for cand in index:
+        cparts = str(cand.as_posix()).split("/")
+        n = 0
+        while n < len(imp_parts) and n < len(cparts) and imp_parts[-1 - n] == cparts[-1 - n]:
+            n += 1
+        if n == 0:
+            continue
+        # 파일명(마지막 세그먼트)은 반드시 일치해야 함.
+        if imp_parts[-1] != cparts[-1]:
+            continue
+        score = (n, -len(cparts))  # 더 많이 겹치고 더 짧은 경로 우선
+        if best is None or score > best_score:
+            best, best_score = cand, score
+    return best
+
+
+def flatten_sol(entry_abs, index, log=None):
+    """entry 파일과 그 import 를 후위 순회로 인라인해 자체완결 소스 1개를 만든다.
+
+    - SPDX/ pragma/ import 줄은 인라인 시 제거하고, 최종 결과 맨 위에 한 번만 둔다.
+    - 순환 import 와 중복 파일은 방문 집합으로 건너뛴다.
+    - 해석 실패한 import 는 주석으로 남기고 계속(부분 컴파일이라도 시도).
+    """
+    entry_abs = Path(entry_abs).resolve()
+    seen = set()
+    chunks = []
+    pragma_line = None
+    spdx_id = None
+
+    def strip_header(text):
+        nonlocal pragma_line, spdx_id
+        m = _SPDX_RE.search(text)
+        if m and spdx_id is None:
+            spdx_id = m.group(0).strip()
+        m = _PRAGMA_RE.search(text)
+        if m and pragma_line is None:
+            pragma_line = m.group(0).strip()
+        text = _SPDX_RE.sub("", text)
+        text = _PRAGMA_RE.sub("", text)
+        text = _IMPORT_RE.sub("", text)
+        return text.strip("\n")
+
+    def visit(path):
+        path = Path(path).resolve()
+        if path in seen:
+            return
+        seen.add(path)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception as e:
+            if log:
+                log(f"  import read failed: {path}: {e}")
+            return
+        for m in _IMPORT_RE.finditer(text):
+            dep = resolve_import(m.group(1), path, index)
+            if dep is not None:
+                visit(dep)
+            elif log:
+                log(f"  unresolved import '{m.group(1)}' in {path.name} (left as comment)")
+        body = strip_header(text)
+        chunks.append((f"// ── from {path.name} " + "─" * 20, body))
+
+    visit(entry_abs)
+    header = (spdx_id or "// SPDX-License-Identifier: MIT") + "\n" + \
+             (pragma_line or "pragma solidity ^0.8.0;") + "\n"
+    parts = [header]
+    for banner, body in chunks:
+        if body:
+            parts.append(banner + "\n" + body + "\n")
+    return "\n".join(parts)
 
 
 def main(argv=None):
@@ -612,7 +766,13 @@ def main(argv=None):
     else:
         os.environ.setdefault("TRUST404_MAX_SECONDS", "12")  # 단일 감사: 더 끈질기게
     inv_src = Path(args.invariants).read_text(encoding="utf-8") if args.invariants else None
-    files = gather_files(args.path)
+    # zip 이면 임시 폴더로 풀고, 그 안을 루트로 삼는다. 프로세스 종료 시 정리.
+    import atexit
+    input_root, _cleanup = prepare_input(args.path)
+    atexit.register(_cleanup)
+    files = gather_files(input_root)
+    # import 해석용 색인은 라이브러리 폴더까지 포함해 전체를 훑는다.
+    index = build_source_index(input_root)
     outdir = Path(args.out)
     (outdir / "exploits").mkdir(parents=True, exist_ok=True)
 
@@ -624,10 +784,18 @@ def main(argv=None):
     cands = []
     for fp in files:
         try:
-            src = fp.read_text(encoding="utf-8")
+            raw = fp.read_text(encoding="utf-8")
         except Exception as e:
             log(f"skip {fp}: {e}"); continue
-        for c in concrete_contracts(src, eng):
+        # import 가 있으면 의존 파일을 찾아 인라인(flatten)한 소스로 분석한다.
+        src = raw
+        if _IMPORT_RE.search(raw):
+            try:
+                src = flatten_sol(fp, index, log=(None if args.quiet else log))
+            except Exception as e:
+                log(f"flatten failed {fp}: {e}; using raw"); src = raw
+        # 감사 대상은 '이 파일에 선언된' 구체 컨트랙트만 (import 로 끌려온 의존 제외).
+        for c in concrete_contracts(raw, eng):
             if args.only and c != args.only:
                 continue
             cands.append((fp, src, c))
