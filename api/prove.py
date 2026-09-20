@@ -1587,7 +1587,9 @@ def _fuzz_fns(abi):
         if e.get("stateMutability") in ("view","pure"): continue
         types=[i["type"] for i in e.get("inputs",[])]
         if any(not (t=="address" or t=="bool" or t.startswith("uint")) for t in types): continue
-        out.append({"name":e["name"],"types":types,"payable":e.get("stateMutability")=="payable"})
+        signature=f"{e['name']}({','.join(types)})"
+        out.append({"name":e["name"],"signature":signature,"types":types,
+                    "payable":e.get("stateMutability")=="payable"})
     return out
 
 def _fuzz_pool(t, ctx):
@@ -1632,22 +1634,32 @@ def _fuzz_lit(t, a):
     return str(a)
 
 def _fuzz_codegen(seq, payable_map):
-    sigs={}; calls=[]
-    for c in seq:
+    # The official harness gives the Exploit contract one run(address)
+    # transaction.  Emit every discovered action as a low-level call from that
+    # same contract, and tolerate a reverted exploratory call exactly as the
+    # in-memory dispatcher does.  This keeps msg.sender and rollback semantics
+    # aligned between search and final Forge verification.
+    calls=[]
+    for i,c in enumerate(seq):
         if c.get("raw"):  # receive/fallback 트리거
             if c.get("data"):  # 셀렉터 calldata → fallback→delegatecall
-                calls.append(f"        (bool _ok,) = t.call(hex\"{c['data'][2:] if c['data'].startswith('0x') else c['data']}\"); _ok;  // {c.get('sel_of','')}()")
+                payload=f"hex\"{c['data'][2:] if c['data'].startswith('0x') else c['data']}\""
             else:
-                calls.append(f"        (bool _ok,) = t.call{{value: {c['value']}}}(\"\"); _ok;")
-            continue
-        pay=" payable" if payable_map.get(c["name"]) else ""
-        sigs[c["name"]]=f"    function {c['name']}({', '.join(c['types'])}) external{pay};"
-        args=", ".join(_fuzz_lit(t,a) for t,a in zip(c["types"], c["args"]))
-        val=f"{{value: {c['value']}}}" if c.get("value") else ""
-        calls.append(f"        I(t).{c['name']}{val}({args});")
+                payload='bytes("")'
+            comment=f"  // {c.get('sel_of','raw')}" if c.get("sel_of") else ""
+        else:
+            signature=c.get("signature") or f"{c['name']}({','.join(c['types'])})"
+            args=", ".join(_fuzz_lit(t,a) for t,a in zip(c["types"], c["args"]))
+            suffix=f", {args}" if args else ""
+            payload=(f"abi.encodeWithSelector(bytes4(keccak256(bytes(\"{signature}\")))"
+                     f"{suffix})")
+            comment=f"  // {signature}"
+        value=c.get("value",0)
+        calls.append(
+            f"        (bool _ok{i}, bytes memory _ret{i}) = "
+            f"t.call{{value: {value}}}({payload}); _ok{i}; _ret{i};{comment}")
     return ("// SPDX-License-Identifier: MIT\npragma solidity >=0.6.2;\n\n"
             "// Strategy: fuzzed call sequence (template-free) discovered by the agent.\n"
-            "interface I {\n"+"\n".join(sigs.values())+"\n}\n\n"
             "contract Exploit {\n"
             "    function run(address t) external payable {\n"+"\n".join(calls)+"\n    }\n"
             "    receive() external payable {}\n}\n")
@@ -1660,167 +1672,417 @@ def _rw_vars(body):
     return writes, reads
 
 
-def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=None,
-                 depth=2, pool_level=0, deadline=None):
-    """Deploy target once, snapshot, search call sequences (single → pair → triple,
-    depth-controlled) that trip the invariant/effect. pool_level enriches the input
-    pools; deadline (epoch secs) bounds wall-clock. Returns (seq, payable_map, reason) or None.
-    효과 판정은 배포 직후 건강 확인 기준의 실제 관찰이라 시퀀스를 더 깊이 파도 오탐이 없다."""
+_FUZZ_DISPATCHER_SOURCE = """// SPDX-License-Identifier: MIT
+pragma solidity >=0.6.2 <0.9.0;
+pragma experimental ABIEncoderV2;
+
+contract Trust404FuzzDispatcher {
+    event CallResult(uint256 indexed index, bool success, bytes returnData);
+
+    function execute(address target, bytes[] calldata payloads, uint256[] calldata values)
+        external payable
+    {
+        require(payloads.length == values.length, "length mismatch");
+        for (uint256 i = 0; i < payloads.length; i++) {
+            (bool ok, bytes memory ret) = target.call{value: values[i]}(payloads[i]);
+            emit CallResult(i, ok, ret);
+        }
+    }
+
+    receive() external payable {}
+}
+"""
+
+
+def _fuzz_artifact(compiled, source_key, contract_name):
+    artifact = (compiled.get("contracts", {}).get(source_key, {})
+                .get(contract_name))
+    if artifact is None:
+        raise RuntimeError(f"missing fuzz artifact {source_key}:{contract_name}")
+    return {"abi": artifact["abi"],
+            "bin": artifact["evm"]["bytecode"]["object"]}
+
+
+def _fuzz_sequence_key(seq):
+    normalized = []
+    for call in seq:
+        normalized.append({
+            "signature": call.get("signature") or call.get("name"),
+            "args": call.get("args") or [],
+            "value": int(call.get("value") or 0),
+            "raw": bool(call.get("raw")),
+            "data": call.get("data") or "",
+        })
+    return json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+
+
+def _fuzz_call_data(call, target_contract, dispatcher_addr, target_addr, Web3):
+    if call.get("raw"):
+        data = call.get("data") or "0x"
+        return data if str(data).startswith("0x") else "0x" + str(data)
+    args = [_fuzz_resolve(a, dispatcher_addr, target_addr, Web3)
+            for a in call.get("args", [])]
+    signature = call.get("signature") or (
+        f"{call['name']}({','.join(call.get('types', []))})")
+    return target_contract.get_function_by_signature(signature)(
+        *args)._encode_transaction_data()
+
+
+def _iter_fuzz_candidates(name, target_src, invariants_src, manifest, do_verify,
+                          budget=None, depth=2, pool_level=0, deadline=None,
+                          extra_sources=None, banned=None, feedback_sink=None,
+                          max_candidates=None):
+    """Yield harness-shaped call sequences that violate the supplied predicate.
+
+    The target is deployed through the exact manifest Setup/direct-constructor
+    path used by the local verifier.  Every sequence is executed by a deployed
+    dispatcher in one transaction, so target-side ``msg.sender`` equals the
+    final Exploit contract rather than an EOA.  A yielded sequence is added to
+    ``banned`` before control returns; if Forge rejects it, resuming this
+    iterator continues with the next distinct sequence in the same search.
+    """
     import solcx
+    from eth_tester import EthereumTester
     from web3 import Web3
+
     if budget is None:
-        try: budget = int(os.environ.get("TRUST404_FUZZ_BUDGET", "500"))
-        except Exception: budget = 500
-    def _time_left():
-        return deadline is None or time.time() < deadline
-    _solcv, _evm = _solc_for(target_src)
-    files={f"{name}.sol":target_src}
-    if do_verify and invariants_src: files["Invariants_src.sol"]=invariants_src
-    std={"language":"Solidity","sources":{k:{"content":v} for k,v in files.items()},
-         "settings":{"evmVersion":_evm,"outputSelection":{"*":{"*":["abi","evm.bytecode.object"]}}}}
-    compiled=solcx.compile_standard(std, allow_empty=True)
-    arts={}
-    for _fn,cs in compiled.get("contracts",{}).items():
-        for cn,c in cs.items(): arts[cn]={"abi":c["abi"],"bin":c["evm"]["bytecode"]["object"]}
-    if name not in arts: return None
-    w3,acct=_mk_evm()
-    # 타깃은 배포자(owner) 와 다른 계정에서 배포한다 — 공격자(acct)가 owner 로
-    # 바뀌는 탈취(예: Ethernaut Fallback)를 owner() 변화로 탐지할 수 있게.
-    accts = list(w3.eth.accounts)
-    deployer = accts[1] if len(accts) > 1 else acct
-    def deploy(art,args=None,value=0,frm=None):
-        C=w3.eth.contract(abi=art["abi"],bytecode=art["bin"])
-        tx=C.constructor(*(args or [])).transact({"from":frm or acct,"value":value,"gas":12_000_000})
-        r=w3.eth.wait_for_transaction_receipt(tx)
-        if r.contractAddress is None:
-            raise RuntimeError("constructor reverted")
-        return w3.eth.contract(address=r.contractAddress,abi=art["abi"]),r.contractAddress
-    dep=manifest.get("deploy",{}); cargs=_coerce_args(dep.get("constructor_args",[]),Web3)
-    seed_wei=int(str(dep.get("value_wei",str(DEFAULT_SEED_WEI))) or "0")
-    if not _ctor_payable(arts[name]["abi"]):
-        seed_wei=0
-    try: tc,taddr=deploy(arts[name],cargs,value=seed_wei,frm=deployer)
-    except Exception:
-        seed_wei=0; tc,taddr=deploy(arts[name],cargs,value=0,frm=deployer)
-    if seed_wei == 0:  # 피해자 자금 흉내 (receive/fallback 로 시드)
         try:
-            victim = accts[-1]
-            w3.eth.send_transaction({"from":victim,"to":taddr,"value":DEFAULT_SEED_WEI,"gas":200_000})
+            budget = int(os.environ.get("TRUST404_FUZZ_BUDGET", "500"))
         except Exception:
-            pass
-    abi=arts[name]["abi"]
-    inv=None
+            budget = 500
+    if max_candidates is None:
+        try:
+            max_candidates = int(os.environ.get(
+                "TRUST404_FUZZ_CANDIDATES", "8"))
+        except Exception:
+            max_candidates = 8
+    max_candidates = max(1, max_candidates)
+    banned = banned if banned is not None else set()
+    feedback_sink = feedback_sink if feedback_sink is not None else []
+
+    def time_left():
+        return deadline is None or time.time() < deadline
+
+    _solcv, inferred_evm = _solc_for(target_src)
+    target_cfg = manifest.get("target") or {}
+    src_key = target_cfg.get("src") or f"{name}.sol"
+    inv_key = ((manifest.get("invariants") or {}).get("contract")
+               or "Invariants.sol")
+    dispatcher_key = "__Trust404FuzzDispatcher.sol"
+    files = {k: v for k, v in (extra_sources or {}).items() if v}
+    files[src_key] = target_src
     if do_verify and invariants_src:
-        inv_name=infer_invariants_name(invariants_src) or "Invariants"
-        if inv_name not in arts: return None
-        inv,_=deploy(arts[inv_name])
-        if inv.functions.checkAll(taddr).call()[0] is not True: return None
-    owner0 = tc.functions.owner().call() if _has_getter(abi,"owner") else None
-    admin0 = tc.functions.admin().call() if _has_getter(abi,"admin") else None
-    base_bal=w3.eth.get_balance(taddr)
-    has_debt=_has_getter(abi,"totalDebt") and _has_getter(abi,"totalCollateral")
-    # ERC20 잔액 인플레(언더플로 등) 탐지용 balanceOf(address)->uint 게터
-    bal_of = any(e.get("type")=="function" and e.get("name")=="balanceOf"
-                 and [i["type"] for i in e.get("inputs",[])]==["address"]
-                 and e.get("stateMutability") in ("view","pure") for e in abi)
-    tbal0 = tc.functions.balanceOf(acct).call() if bal_of else 0
-    def checker():
-        if inv is not None:
-            r=inv.functions.checkAll(taddr).call()
-            return (r[0] is False, r[1] if r[0] is False else "")
-        reasons=[]
-        if w3.eth.get_balance(taddr) < base_bal: reasons.append(f"funds drained ({(base_bal-w3.eth.get_balance(taddr))/1e18:g} ETH)")
-        if owner0 is not None and tc.functions.owner().call()!=owner0: reasons.append("owner hijacked")
-        if admin0 is not None and tc.functions.admin().call()!=admin0: reasons.append("admin hijacked")
-        if has_debt and tc.functions.totalDebt().call() > tc.functions.totalCollateral().call(): reasons.append("debt > collateral")
-        if bal_of and tc.functions.balanceOf(acct).call() > tbal0 + 10**40:
+        files[inv_key] = invariants_src
+    files[dispatcher_key] = _FUZZ_DISPATCHER_SOURCE
+    std = {
+        "language": "Solidity",
+        "sources": {k: {"content": v} for k, v in files.items()},
+        "settings": {
+            "evmVersion": target_cfg.get("evm_version") or inferred_evm,
+            "outputSelection": {"*": {"*": ["abi", "evm.bytecode.object"]}},
+        },
+    }
+    compiled = solcx.compile_standard(std, allow_empty=True)
+    arts = {}
+    for _filename, contracts in compiled.get("contracts", {}).items():
+        for contract_name, artifact in contracts.items():
+            arts[contract_name] = {
+                "abi": artifact["abi"],
+                "bin": artifact["evm"]["bytecode"]["object"],
+            }
+    arts[name] = _fuzz_artifact(compiled, src_key, name)
+    inv_name = infer_invariants_name(invariants_src) or "Invariants"
+    if do_verify and invariants_src:
+        arts[inv_name] = _fuzz_artifact(compiled, inv_key, inv_name)
+    dispatcher_art = _fuzz_artifact(
+        compiled, dispatcher_key, "Trust404FuzzDispatcher")
+
+    det = manifest.get("determinism") or {}
+    from trust404.hevm import make_backend
+    backend, hevm_box = make_backend(
+        int(det.get("block_number") or 0),
+        int(det.get("block_timestamp") or 0) or 1,
+    )
+    tester = EthereumTester(backend=backend)
+    w3 = Web3(Web3.EthereumTesterProvider(tester))
+    acct = w3.eth.accounts[0]
+
+    def deploy(artifact, args=None, value=0):
+        contract = w3.eth.contract(
+            abi=artifact["abi"], bytecode=artifact["bin"])
+        tx = contract.constructor(*(args or [])).transact({
+            "from": acct, "value": value, "gas": 12_000_000,
+        })
+        receipt = w3.eth.wait_for_transaction_receipt(tx)
+        address = receipt.get("contractAddress")
+        if receipt.get("status") != 1 or not address or not w3.eth.get_code(address):
+            raise RuntimeError("fuzz-world constructor reverted")
+        return w3.eth.contract(address=address, abi=artifact["abi"]), address
+
+    # Reuse the verifier's authoritative Setup/helper/constructor semantics
+    # instead of maintaining another permissive deployment fallback here.
+    try:
+        from agent.verify import _deploy_target as deploy_target
+    except ImportError:
+        from verify import _deploy_target as deploy_target
+    target, target_addr = deploy_target(
+        w3, compiled, arts, name, manifest.get("deploy") or {}, acct, deploy,
+        hevm_box)
+    invariant = None
+    if do_verify and invariants_src:
+        invariant, _ = deploy(arts[inv_name])
+
+    hevm_box["block_number"] = int(det.get("block_number") or 0)
+    hevm_box["timestamp"] = int(det.get("block_timestamp") or 0) or 1
+    hevm_box["prank"] = None
+    if invariant is not None:
+        initial = invariant.functions.checkAll(target_addr).call()
+        if initial[0] is not True:
+            raise RuntimeError(
+                "BAD TARGET DESIGN: invariant already broken before fuzz: "
+                + str(initial[1]))
+
+    dispatcher, dispatcher_addr = deploy(dispatcher_art)
+    funding_receipt = w3.eth.wait_for_transaction_receipt(
+        w3.eth.send_transaction({
+            "from": acct, "to": dispatcher_addr,
+            "value": DEFAULT_EXPLOIT_FUNDING_WEI, "gas": 1_000_000,
+        }))
+    if funding_receipt.get("status") != 1:
+        raise RuntimeError("failed to fund fuzz dispatcher")
+
+    abi = arts[name]["abi"]
+    owner0 = (target.functions.owner().call()
+              if _has_getter(abi, "owner") else None)
+    admin0 = (target.functions.admin().call()
+              if _has_getter(abi, "admin") else None)
+    base_balance = w3.eth.get_balance(target_addr)
+    has_debt = (_has_getter(abi, "totalDebt")
+                and _has_getter(abi, "totalCollateral"))
+    balance_of = any(
+        entry.get("type") == "function"
+        and entry.get("name") == "balanceOf"
+        and [item["type"] for item in entry.get("inputs", [])] == ["address"]
+        and entry.get("stateMutability") in ("view", "pure")
+        for entry in abi)
+    token_balance0 = (target.functions.balanceOf(dispatcher_addr).call()
+                      if balance_of else 0)
+
+    def predicate_state():
+        if invariant is not None:
+            result = invariant.functions.checkAll(target_addr).call()
+            broken = result[0] is False
+            state = {"allHold": bool(result[0]),
+                     "firstViolated": str(result[1])}
+            return broken, str(result[1]) if broken else "", state
+        reasons = []
+        current_balance = w3.eth.get_balance(target_addr)
+        current_owner = (target.functions.owner().call()
+                         if owner0 is not None else None)
+        current_admin = (target.functions.admin().call()
+                         if admin0 is not None else None)
+        debt = (target.functions.totalDebt().call() if has_debt else None)
+        collateral = (target.functions.totalCollateral().call()
+                      if has_debt else None)
+        token_balance = (target.functions.balanceOf(dispatcher_addr).call()
+                         if balance_of else None)
+        if current_balance < base_balance:
+            reasons.append(
+                f"funds drained ({(base_balance-current_balance)/1e18:g} ETH)")
+        if owner0 is not None and current_owner != owner0:
+            reasons.append("owner hijacked")
+        if admin0 is not None and current_admin != admin0:
+            reasons.append("admin hijacked")
+        if has_debt and debt > collateral:
+            reasons.append("debt > collateral")
+        if balance_of and token_balance > token_balance0 + 10**40:
             reasons.append("token balance inflated (overflow/underflow)")
-        return (len(reasons)>0, "; ".join(reasons))
-    tester=w3.provider.ethereum_tester; snap=tester.take_snapshot()
-    ctx={"seed":seed_wei,"attacker":acct,"target":taddr,"owner0":owner0,"pool_level":pool_level}
-    fns=_fuzz_fns(abi)
-    payable_map={f["name"]:f["payable"] for f in fns}
-    movers=_fuzz_value_movers(target_src)
-    calls_by_fn={f["name"]:_fuzz_calls(f,ctx) for f in fns}
-    all_calls=[c for f in fns for c in calls_by_fn[f["name"]]]
-    # 원시 ETH 전송(receive/fallback 로직 트리거) 도 시퀀스 요소로 포함한다 —
-    # Ethernaut Fallback 류(직접 송금으로 owner 탈취)를 잡기 위함.
-    raw_calls=[{"name":"__raw_send__","types":[],"args":[],"value":v,"raw":True} for v in (1, 10**15 - 1, 10**18)]
-    # 프록시 fallback→delegatecall 대응: 소스의 모든 무인자 함수 셀렉터를 raw calldata
-    # 로 타깃에 보내 fallback 을 통해 delegatecall 이 실행되게 한다(Ethernaut Delegation).
+        state = {
+            "allHold": not reasons,
+            "firstViolated": "; ".join(reasons),
+            "targetBalanceWei": str(current_balance),
+            "owner": current_owner,
+            "admin": current_admin,
+            "totalDebt": debt,
+            "totalCollateral": collateral,
+            "attackerTokenBalance": token_balance,
+        }
+        return bool(reasons), "; ".join(reasons), state
+
+    _broken0, _reason0, predicate_before = predicate_state()
+    snapshot_id = tester.take_snapshot()
+    context = {
+        "seed": int(str((manifest.get("deploy") or {}).get("value_wei", "0")) or "0"),
+        "attacker": dispatcher_addr,
+        "target": target_addr,
+        "owner0": owner0,
+        "pool_level": pool_level,
+    }
+    functions = _fuzz_fns(abi)
+    payable_map = {fn["signature"]: fn["payable"] for fn in functions}
+    movers = _fuzz_value_movers(target_src)
+    all_calls = [call for fn in functions for call in _fuzz_calls(fn, context)]
+    raw_calls = [
+        {"name": "__raw_send__", "types": [], "args": [],
+         "value": value, "raw": True}
+        for value in (1, 10**15 - 1, 10**18)
+    ]
     if re.search(r"\bfallback\s*\(|delegatecall", target_src):
-        seen=set()
-        for f in _functions(_strip(target_src)):
-            if not f["args"] and f["name"] and f["name"] not in seen:
-                seen.add(f["name"])
-                sel = Web3.keccak(text=f"{f['name']}()")[:4].hex()
-                raw_calls.append({"name":"__raw_data__","types":[],"args":[],"value":0,
-                                  "raw":True,"data":sel,"sel_of":f["name"]})
-    all_calls = all_calls + raw_calls
-    # ── SliSE 류 슬라이싱 근사: 값-이동/권한 함수(sink)가 읽는 상태를 쓰는 함수
-    # (setup)를 먼저 시도하도록 all_calls 를 우선순위화한다(데이터 의존 기반). ──
-    src_fns = {f["name"]: f for f in _functions(_strip(target_src))}
-    rw = {n: _rw_vars(f["body"]) for n, f in src_fns.items()}
+        seen = set()
+        for fn in _functions(_strip(target_src)):
+            if not fn["args"] and fn["name"] and fn["name"] not in seen:
+                seen.add(fn["name"])
+                selector = Web3.keccak(text=f"{fn['name']}()")[:4].hex()
+                raw_calls.append({
+                    "name": "__raw_data__", "types": [], "args": [],
+                    "value": 0, "raw": True, "data": selector,
+                    "sel_of": fn["name"],
+                })
+    all_calls.extend(raw_calls)
+
+    source_functions = {fn["name"]: fn for fn in _functions(_strip(target_src))}
+    reads_writes = {
+        fn_name: _rw_vars(fn["body"])
+        for fn_name, fn in source_functions.items()
+    }
     sink_reads = set()
-    for n, (w, rd) in rw.items():
-        if n in movers or re.search(r"\bowner\b|\badmin\b", " ".join(rw[n][0])):
-            sink_reads |= rd
-    def _prio(c):
-        if c.get("raw"):
-            return 1  # receive/fallback 트리거는 중간 우선순위
-        w = rw.get(c["name"], (set(), set()))[0]
-        return 2 if (w & sink_reads) else 0  # sink 가 읽는 상태를 쓰면 먼저
-    all_calls.sort(key=_prio, reverse=True)
-    def do_call(c):
-        if c.get("raw"):
-            tx={"from":acct,"to":taddr,"value":c["value"],"gas":300_000}
-            if c.get("data"): tx["data"]=c["data"]
-            w3.eth.send_transaction(tx); return
-        args=[_fuzz_resolve(a,acct,taddr,Web3) for a in c["args"]]
-        getattr(tc.functions,c["name"])(*args).transact({"from":acct,"value":c["value"],"gas":8_000_000})
-    b=0
-    # phase 1: single calls
-    for c in all_calls:
-        if b>=budget or not _time_left(): break
-        b+=1; tester.revert_to_snapshot(snap)
-        try: do_call(c)
-        except Exception: pass
-        trip,reason=checker()
-        if trip: return [c], payable_map, reason
-    if depth < 2:
-        return None
-    # phase 2: setup(any) -> drain/hijack (value-mover 또는 raw send)
-    seconds=[c for c in all_calls if c.get("raw") or c["name"] in movers] or all_calls
-    for c1 in all_calls:
-        if b>=budget or not _time_left(): break
-        for c2 in seconds:
-            if b>=budget or not _time_left(): break
-            b+=1; tester.revert_to_snapshot(snap)
-            try: do_call(c1)
-            except Exception: continue
-            try: do_call(c2)
-            except Exception: pass
-            trip,reason=checker()
-            if trip: return [c1,c2], payable_map, reason
-    if depth < 3:
-        return None
-    # phase 3: setup -> setup -> drain/hijack (3단계 시퀀스; 우선순위 상위만)
-    firsts = all_calls[:max(8, len(all_calls)//3)]
-    for c1 in firsts:
-        if b>=budget or not _time_left(): break
-        for c2 in firsts:
-            if b>=budget or not _time_left(): break
-            for c3 in seconds:
-                if b>=budget or not _time_left(): break
-                b+=1; tester.revert_to_snapshot(snap)
-                try: do_call(c1)
-                except Exception: continue
-                try: do_call(c2)
-                except Exception: pass
-                try: do_call(c3)
-                except Exception: pass
-                trip,reason=checker()
-                if trip: return [c1,c2,c3], payable_map, reason
+    for fn_name, (_writes, reads) in reads_writes.items():
+        if (fn_name in movers
+                or re.search(r"\bowner\b|\badmin\b",
+                             " ".join(reads_writes[fn_name][0]))):
+            sink_reads |= reads
+
+    def priority(call):
+        if call.get("raw"):
+            rank = 1
+        else:
+            writes = reads_writes.get(call["name"], (set(), set()))[0]
+            rank = 2 if writes & sink_reads else 0
+        stable = (call.get("signature") or call.get("name") or "",
+                  repr(call.get("args") or []), int(call.get("value") or 0),
+                  call.get("data") or "")
+        return (-rank, stable)
+
+    all_calls.sort(key=priority)
+
+    def execute_sequence(sequence):
+        payloads = []
+        values = []
+        selectors = []
+        for call in sequence:
+            payload = _fuzz_call_data(
+                call, target, dispatcher_addr, target_addr, Web3)
+            payloads.append(payload)
+            values.append(int(call.get("value") or 0))
+            selectors.append(payload[:10] if len(payload) >= 10 else "0x00000000")
+        feedback = {
+            "sequence": _fuzz_sequence_key(sequence),
+            "caller": dispatcher_addr,
+            "target": target_addr,
+            "predicate_before": predicate_before,
+            "calls": [],
+        }
+        try:
+            tx = dispatcher.functions.execute(target_addr, payloads, values).transact({
+                "from": acct,
+                "value": DEFAULT_EXPLOIT_FUNDING_WEI,
+                "gas": 12_000_000,
+            })
+            receipt = w3.eth.wait_for_transaction_receipt(tx)
+            if receipt.get("status") != 1:
+                feedback["candidate_revert"] = "dispatcher transaction reverted"
+            events = dispatcher.events.CallResult().process_receipt(receipt)
+            by_index = {int(event["args"]["index"]): event["args"]
+                        for event in events}
+            for index, selector in enumerate(selectors):
+                event = by_index.get(index)
+                success = bool(event and event["success"])
+                returned = bytes(event["returnData"]) if event else b""
+                feedback["calls"].append({
+                    "index": index,
+                    "selector": selector,
+                    "success": success,
+                    "revert_data": "0x" + returned.hex() if not success else "",
+                })
+        except Exception as exc:
+            feedback["candidate_revert"] = str(exc)[:300]
+        broken, reason, after = predicate_state()
+        feedback["predicate_after"] = after
+        feedback["reason"] = reason
+        return broken, reason, feedback
+
+    probes = 0
+    emitted = 0
+
+    def probe(sequence):
+        nonlocal probes, emitted
+        if probes >= budget or not time_left() or emitted >= max_candidates:
+            return None
+        probes += 1
+        tester.revert_to_snapshot(snapshot_id)
+        key = _fuzz_sequence_key(sequence)
+        if key in banned:
+            return None
+        broken, reason, feedback = execute_sequence(sequence)
+        if len(feedback_sink) < 128:
+            feedback_sink.append(feedback)
+        if not broken:
+            return None
+        if feedback.get("calls") and not any(
+                call["success"] for call in feedback["calls"]):
+            return None
+        banned.add(key)
+        emitted += 1
+        return list(sequence), payable_map, feedback
+
+    for call in all_calls:
+        if probes >= budget or not time_left() or emitted >= max_candidates:
+            break
+        candidate = probe([call])
+        if candidate:
+            yield candidate
+    if depth < 2 or probes >= budget or not time_left() or emitted >= max_candidates:
+        return
+
+    second_calls = [
+        call for call in all_calls
+        if call.get("raw") or call["name"] in movers
+    ] or all_calls
+    for first in all_calls:
+        if probes >= budget or not time_left() or emitted >= max_candidates:
+            break
+        for second in second_calls:
+            if probes >= budget or not time_left() or emitted >= max_candidates:
+                break
+            candidate = probe([first, second])
+            if candidate:
+                yield candidate
+    if depth < 3 or probes >= budget or not time_left() or emitted >= max_candidates:
+        return
+
+    first_calls = all_calls[:max(8, len(all_calls)//3)]
+    for first in first_calls:
+        if probes >= budget or not time_left() or emitted >= max_candidates:
+            break
+        for second in first_calls:
+            if probes >= budget or not time_left() or emitted >= max_candidates:
+                break
+            for third in second_calls:
+                if probes >= budget or not time_left() or emitted >= max_candidates:
+                    break
+                candidate = probe([first, second, third])
+                if candidate:
+                    yield candidate
+
+
+def _fuzz_search(name, target_src, invariants_src, manifest, do_verify, budget=None,
+                 depth=2, pool_level=0, deadline=None, extra_sources=None):
+    """Compatibility wrapper returning the first harness-shaped candidate."""
+    for sequence, payable_map, feedback in _iter_fuzz_candidates(
+            name, target_src, invariants_src, manifest, do_verify,
+            budget=budget, depth=depth, pool_level=pool_level,
+            deadline=deadline, extra_sources=extra_sources, max_candidates=1):
+        return sequence, payable_map, feedback.get("reason", "")
     return None
 
 def _synth_reentrancy(target_src):
@@ -5219,10 +5481,27 @@ def _fuzz_fallback_impl(name, target_src, invariants_src, manifest, do_verify, s
                 "ms":int((time.time()-t0)*1000)}
     return None
 
+def _track_synth_functions():
+    """Providers whose output can be submitted as one Exploit.run call."""
+    return (
+        _storage_attempt, _proxy_attempt,
+        _synth_storage_collision, _synth_king_dos,
+        _synth_callback_inconsistency, _synth_shop, _synth_lockup_bypass,
+        _synth_gas_griefing, _synth_force, _synth_gatekeeper_two,
+        _synth_gatekeeper_one, _synth_magicnumber, _synth_higher_order,
+        _synth_switch, _synth_array_underflow, _synth_dex_two_drain,
+        _synth_dex_drain, _synth_good_samaritan,
+        _synth_eip7702_reentrancy, _synth_gatekeeper_three,
+        _synth_stake_accounting, _synth_uninitialized,
+        _synth_puzzle_wallet, _synth_ecdsa_malleability,
+        _synth_magic_carousel, _synth_commitment_collision,
+    )
+
+
 def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify=True,
                            analysis_src=None, seed=42, deadline=None,
                            include_templates=True, world_src=None, metrics=None,
-                           search_errors=None):
+                           search_errors=None, extra_sources=None):
     """트랙 자기검증 루프(agent.py)용 후보 생성기.
 
     탐색·생성 단계를 지연(lazy) 산출해 (stage, label, exploit_src) 로 내보낸다. 각 단계는
@@ -5318,15 +5597,10 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     # 레벨 솔버는 계열 capability 로 게이트된다 (trust404.registry).
     # 피처가 없으면 전부 실행(폴백). 태그가 안 겹치면 컴파일/배포를 건너뛴다.
     inv = invariants_src if do_verify else None
-    _synth_fns = (_storage_attempt, _proxy_attempt, _multiblock_attempt,
-               _synth_storage_collision, _synth_king_dos, _synth_callback_inconsistency,
-               _synth_shop, _synth_lockup_bypass, _synth_gas_griefing, _synth_force,
-               _synth_gatekeeper_two, _synth_gatekeeper_one, _synth_magicnumber,
-               _synth_higher_order, _synth_switch, _synth_array_underflow,
-               _synth_dex_two_drain, _synth_dex_drain, _synth_good_samaritan,
-               _synth_eip7702_reentrancy, _synth_gatekeeper_three, _synth_stake_accounting,
-               _synth_uninitialized, _synth_puzzle_wallet, _synth_ecdsa_malleability,
-               _synth_magic_carousel, _synth_commitment_collision)
+    # `_multiblock_attempt` emits an Attacker.step() workflow that needs many
+    # external transactions.  Track 04 accepts one Exploit.run(address) call,
+    # so that provider is deliberately excluded from the submission stream.
+    _synth_fns = _track_synth_functions()
     try:
         from trust404.registry import should_run as _should_run
         from trust404.hkg import order_by_hkg as _hkg_order
@@ -5351,19 +5625,22 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
             yield ("synth", r.get("strategy") or fn.__name__, r["exploit_src"])
     # 3) 범용 퍼저 단계
     metric("fuzz_executions")
+    fuzz_feedback = []
+    fuzz_banned = set()
     try:
-        found = _fuzz_search(name, target_src, inv, manifest, bool(do_verify),
-                             deadline=deadline)
+        for seq, payable_map, feedback in _iter_fuzz_candidates(
+                name, target_src, inv, manifest, bool(do_verify),
+                deadline=deadline, extra_sources=extra_sources,
+                banned=fuzz_banned, feedback_sink=fuzz_feedback):
+            metric("fuzz_candidates")
+            label = "fuzz(" + " → ".join(
+                c.get("name", "raw") for c in seq) + ")"
+            try:
+                yield ("fuzz", label, _fuzz_codegen(seq, payable_map))
+            except Exception as exc:
+                search_error("fuzz", "codegen", exc)
     except Exception as exc:
         search_error("fuzz", "sequence-search", exc)
-        found = None
-    if found:
-        seq, payable_map, reason = found
-        label = "fuzz(" + " → ".join(c.get("name", "raw") for c in seq) + ")"
-        try:
-            yield ("fuzz", label, _fuzz_codegen(seq, payable_map))
-        except Exception as exc:
-            search_error("fuzz", "codegen", exc)
 
 
 def prove_sources(name, target_src, invariants_src, manifest, do_verify=True, extra_candidates=None):

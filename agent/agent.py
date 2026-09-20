@@ -210,6 +210,7 @@ def main(argv=None):
         "provider_skipped": 0,
         "provider_errored": 0,
         "fuzz_executions": 0,
+        "fuzz_candidates": 0,
     }
     search_errors = []
 
@@ -286,7 +287,8 @@ def main(argv=None):
                         do_verify=True, analysis_src=analysis_src,
                         seed=args.seed, deadline=started + args.timeout,
                         include_templates=False, world_src=world_src,
-                        metrics=metrics, search_errors=search_errors):
+                        metrics=metrics, search_errors=search_errors,
+                        extra_sources=extra_sources or None):
                     item = register(stage, label, src)
                     if item:
                         yield item

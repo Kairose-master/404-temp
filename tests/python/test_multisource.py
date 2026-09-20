@@ -146,6 +146,46 @@ class MultiSourceForge(unittest.TestCase):
 
 
 class VerificationAccounting(unittest.TestCase):
+    def test_rejected_fuzz_candidate_continues_to_next_sequence(self):
+        spec = importlib.util.spec_from_file_location("fuzz_retry_agent", ROOT / "agent/agent.py")
+        cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli)
+
+        first = """pragma solidity 0.8.24;
+        contract Exploit { function run(address) external payable {} receive() external payable {} }
+        """
+        second = """pragma solidity 0.8.24;
+        contract Exploit {
+            function run(address t) external payable { (bool ok,) = t.call(\"\"); ok; }
+            receive() external payable {}
+        }
+        """
+
+        def stream(*args, **kwargs):
+            yield "fuzz", "sequence-one", first
+            yield "fuzz", "sequence-two", second
+
+        engine = SimpleNamespace(iter_engine_candidates=stream)
+        rejected = SimpleNamespace(tuple=lambda: (False, "", "forge"), profit=None)
+        proven = SimpleNamespace(tuple=lambda: (True, "ownerUnchanged", "forge"), profit=None)
+        target = ROOT / "targets/BoundedOwner"
+        with tempfile.TemporaryDirectory() as td, \
+                patch.object(cli, "_load_engine", return_value=engine), \
+                patch.object(cli, "verify_full", side_effect=[rejected, proven]), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = cli.main([
+                "--contract", str(target / "src/BoundedOwner.sol"),
+                "--invariants", str(target / "Invariants.sol"),
+                "--manifest", str(target / "manifest.json"),
+                "--out", td, "--max-attempts", "5", "--timeout", "30",
+            ])
+            payload = json.loads((Path(td) / "result.json").read_text())
+        self.assertEqual(cli.EXIT_FOUND, rc)
+        self.assertEqual(2, payload["attempts"])
+        self.assertEqual("sequence-two", payload["strategy"])
+        self.assertEqual(2, payload["metrics"]["verified"])
+        self.assertEqual(1, payload["metrics"]["rejected"])
+
     def test_search_exception_is_inconclusive_after_healthy_baseline(self):
         spec = importlib.util.spec_from_file_location("search_error_agent", ROOT / "agent/agent.py")
         cli = importlib.util.module_from_spec(spec)
