@@ -8,7 +8,9 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PATH="/opt/foundry/bin:${PATH}" \
     TRUST404_HARNESS_DIR=/work/harness \
-    TRUST404_FORGE_STD=/work/lib/forge-std
+    TRUST404_FORGE_STD=/work/lib/forge-std \
+    TRUST404_VERIFIER=forge \
+    TRUST404_ENABLE_LLM=0
 
 WORKDIR /work
 
@@ -51,5 +53,6 @@ RUN chmod +x /work/agent/docker-entry.sh \
 
 # Both backends use /opt/solc via solcx. verify.py passes the exact local
 # executable to Forge with --use; an empty ~/.svm cache needs no download.
-# Default CLI is still py-evm. Forge path: TRUST404_VERIFIER=forge
+# The submitted container defaults to the official Foundry verifier and keeps
+# remote LLM generation disabled for deterministic, network-free scoring.
 ENTRYPOINT ["/work/agent/docker-entry.sh"]

