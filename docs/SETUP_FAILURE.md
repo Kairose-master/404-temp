@@ -3,7 +3,7 @@
 `deploy.setup` is a mandatory deployment path, not a best-effort hint. This
 policy supersedes older architecture notes describing a zero-argument fallback.
 
-For py-evm:
+The fail-closed rule applies to both verifier backends. For py-evm:
 
 - Absent `deploy.setup`: preserve helper deployment, constructor ABI coercion,
   placeholders and `value_wei` in the existing direct-constructor path.
@@ -24,31 +24,33 @@ the Setup declaration or making the Setup return successfully still permits
 the same target/exploit to be proven. Tests also exercise missing/invalid Setup
 metadata, Setup constructor failure and the CLI error contract.
 
-This change does not add Foundry cheatcodes to py-evm. A valid Setup requiring
-`vm.deal`, `vm.prank` or other HEVM behavior still needs the real Forge backend
-(`TRUST404_VERIFIER=forge`); the verifier must not manufacture a replacement
-world to compensate. Forge code and its existing result classification are
-unchanged by this patch.
+This policy also applies to Forge process failures. Candidate construction or
+`run()` reverts are caught inside the temporary test and become a normal failed
+candidate. Compilation, Setup, target deployment, and the initial invariant
+check happen outside that boundary; any failure there raises
+`SetupDeploymentError`/`VerifyUnavailable` and the CLI exits 2.
+
+The py-evm backend emulates the Setup cheatcodes used by the fixtures:
+`vm.deal`, `vm.prank`, `vm.addr`, `vm.roll`, and `vm.warp`. A Setup requiring
+another Foundry cheatcode still needs the real Forge backend
+(`TRUST404_VERIFIER=forge`); the verifier does not manufacture a replacement
+world to compensate.
 
 ## ApprovalMirage compatibility correction
 
-The first real Docker run with this policy exposed that the original
-`ApprovalMirage/Setup.s.sol` calls HEVM `vm.addr` and reverts under py-evm.
-Its earlier NOT_PROVEN status depended on silently falling back to the target
-constructor. That is not a valid reason to retain the fallback. The original
-fixture is unchanged and now explicitly expects SetupDeploymentError in
-py-evm, while Forge must still produce its real NOT_PROVEN result.
+The first fail-closed Docker run exposed that the original
+`ApprovalMirage/Setup.s.sol` calls HEVM `vm.addr`. The py-evm HEVM surface now
+implements that selector, so the declared Setup completes and both backends
+reach the real invariant check. Both must produce NOT_PROVEN; neither may use a
+constructor fallback.
 
 `ApprovalMiragePlainSetup` is a separate, explicitly named control with the
 same target, exploit, invariant and manifest. Its Setup resolves just the known
 `alice` label to the target's existing constant address without using HEVM.
 It retains `makeAddr("alice")` and asserts zero allowance. Both backends must
 produce a real NOT_PROVEN result for this control. It is never substituted
-by the verifier for the original Setup; no original test fixture is deleted.
+by the verifier for the original Setup.
 
-Other known divergences, tracked in `tests/python/test_remaining_holes.py`, are
-not repaired here. In particular, `_deploy_via_setup` still assumes the target
-is Setup's first CREATE child instead of decoding the actual `run()` return
-value; multiple CREATEs/CREATE2/existing-address returns are not generally
-supported. Block/time/HEVM-in-run differences also remain. Passing the new
-regression and Docker checks is not a claim of full harness equivalence.
+The Python Setup emulator still cannot cover every Foundry cheatcode. Such
+targets must use the Forge backend; they are never silently replaced with a
+constructor-only world.

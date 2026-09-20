@@ -5,13 +5,13 @@ module does not import them (that would pull solc at import time). It names
 them and declares which capability tags they need, so `iter_engine_candidates`
 can skip compile/deploy when the source cannot possibly match.
 
-`needs` is an OR-set: any overlapping feature is enough. This keeps
-generalization wide (a gasleft%N gate on an unnamed contract still fires
-the Gatekeeper-One *family*) while dropping SafeVault-style false work.
+Providers can declare legacy `needs`/explicit `any_of`, mandatory `all_of`,
+and exclusionary `none_of` features. Multi-part exploit families only run
+when every prerequisite is present.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import FrozenSet, Iterable, List, Optional, Set
 
 
@@ -22,6 +22,9 @@ class Provider:
     stage: str           # "synth" | "fuzz"
     needs: FrozenSet[str]
     note: str
+    any_of: FrozenSet[str] = field(default_factory=frozenset)
+    all_of: FrozenSet[str] = field(default_factory=frozenset)
+    none_of: FrozenSet[str] = field(default_factory=frozenset)
 
 
 # Keep in lockstep with the `for fn in (...)` list in api/prove.py
@@ -29,13 +32,15 @@ class Provider:
 PROVIDERS: List[Provider] = [
     Provider("_storage_attempt", "private_slot_oracle", "synth",
              frozenset({"private_unlock", "bytes32_secret"}),
-             "private 슬롯을 읽어 게이트를 여는 계열 (Vault/Privacy 일반화)"),
+             "private 슬롯을 읽어 게이트를 여는 계열 (Vault/Privacy 일반화)",
+             all_of=frozenset({"private_unlock", "bytes32_secret"})),
     Provider("_proxy_attempt", "fallback_delegatecall_proxy", "synth",
              frozenset({"fallback_delegatecall", "delegatecall_param"}),
              "fallback→delegatecall 배선 (Delegation 일반화)"),
     Provider("_multiblock_attempt", "block_entropy_runner", "synth",
              frozenset({"block_entropy"}),
-             "블록 엔트로피 복제 다중 블록 러너 (CoinFlip 일반화)"),
+             "블록 엔트로피 복제 다중 블록 러너 (CoinFlip 일반화)",
+             none_of=frozenset({"mixed_entropy", "commit_reveal"})),
     Provider("_synth_storage_collision", "delegatecall_slot_collision", "synth",
              frozenset({"delegatecall_stored_lib"}),
              "저장된 라이브러리 포인터 delegatecall 2단계 충돌 (Preservation 일반화)"),
@@ -50,25 +55,30 @@ PROVIDERS: List[Provider] = [
              "price() 이중 호출 조작"),
     Provider("_synth_lockup_bypass", "alternate_transfer_path", "synth",
              frozenset({"approve_transferFrom", "lockup"}),
-             "락업된 transfer 를 approve+transferFrom 으로 우회 (NaughtCoin 일반화)"),
+             "락업된 transfer 를 approve+transferFrom 으로 우회 (NaughtCoin 일반화)",
+             all_of=frozenset({"approve_transferFrom", "lockup"})),
     Provider("_synth_gas_griefing", "unbounded_callback_dos", "synth",
              frozenset({"withdraw_to_partner", "unbounded_loop"}),
-             "수신자 콜백 가스 소진 DoS (Denial 일반화)"),
+             "수신자 콜백 가스 소진 DoS (Denial 일반화)",
+             all_of=frozenset({"withdraw_to_partner", "unbounded_loop"})),
     Provider("_synth_force", "forced_ether", "synth",
              frozenset({"no_receive", "selfdestruct"}),
              "selfdestruct 강제 ETH 주입 (Force 일반화)"),
     Provider("_synth_gatekeeper_two", "constructor_extcodesize_gate", "synth",
              frozenset({"extcodesize_zero", "xor_extcodehash_key"}),
-             "생성자 호출(extcodesize=0) + XOR 키 (Gatekeeper Two 일반화)"),
+             "생성자 호출(extcodesize=0) + XOR 키 (Gatekeeper Two 일반화)",
+             all_of=frozenset({"extcodesize_zero", "xor_extcodehash_key"})),
     Provider("_synth_gatekeeper_one", "gas_modulo_origin_gate", "synth",
              frozenset({"gasleft_modulo", "tx_origin_mask"}),
-             "gasleft()%N 브루트포스 + tx.origin 키 (Gatekeeper One 일반화)"),
+             "gasleft()%N 브루트포스 + tx.origin 키 (Gatekeeper One 일반화)",
+             all_of=frozenset({"gasleft_modulo", "tx_origin_mask"})),
     Provider("_synth_magicnumber", "runtime_bytecode_constraint", "synth",
              frozenset({"solver_size_gate"}),
              "런타임 바이트코드 크기 제약 solver"),
     Provider("_synth_higher_order", "calldata_width_confusion", "synth",
              frozenset({"calldata_fullword_sstore", "narrow_abi_param"}),
-             "좁은 ABI 타입 vs 전체 calldataload sstore (HigherOrder 일반화)"),
+             "좁은 ABI 타입 vs 전체 calldataload sstore (HigherOrder 일반화)",
+             all_of=frozenset({"calldata_fullword_sstore", "narrow_abi_param"})),
     Provider("_synth_switch", "calldata_offset_selector_check", "synth",
              frozenset({"selector_offset_check"}),
              "고정 오프셋 셀렉터 검사를 calldata 배치로 우회 (Switch 일반화)"),
@@ -77,7 +87,8 @@ PROVIDERS: List[Provider] = [
              "동적 배열 length 언더플로 → 슬롯 0 기록 (AlienCodex 일반화)"),
     Provider("_synth_dex_two_drain", "unverified_token_swap", "synth",
              frozenset({"swap_unverified_token", "dex_spot_swap"}),
-             "토큰 미검증 스왑 (DexTwo 일반화)"),
+             "토큰 미검증 스왑 (DexTwo 일반화)",
+             all_of=frozenset({"swap_unverified_token", "dex_spot_swap"})),
     Provider("_synth_dex_drain", "spot_amm_drain", "synth",
              frozenset({"dex_spot_swap", "spot_price", "swap"}),
              "스팟 가격 반복 스왑으로 풀 소진 (Dex 일반화)"),
@@ -86,19 +97,22 @@ PROVIDERS: List[Provider] = [
              "커스텀 에러 catch → remainder 인출 (GoodSamaritan 일반화)"),
     Provider("_synth_eip7702_reentrancy", "origin_gated_hook_reentrancy", "synth",
              frozenset({"tx_origin_eoa_gate", "receiver_hook_before_mint", "receiver_hook"}),
-             "tx.origin EOA 게이트 + 민트 전 수신자 훅 (EIP-7702 일반화)"),
+             "tx.origin EOA 게이트 + 민트 전 수신자 훅 (EIP-7702 일반화)",
+             all_of=frozenset({"tx_origin_eoa_gate", "receiver_hook_before_mint"})),
     Provider("_synth_gatekeeper_three", "typo_init_and_send_gate", "synth",
              frozenset({"construct0r", "send_gate", "unguarded_initialize"}),
              "오타 initializer + send 게이트 (Gatekeeper Three 일반화)"),
     Provider("_synth_stake_accounting", "fake_token_accounting", "synth",
              frozenset({"fake_weth", "stake"}),
-             "가짜 ERC20 회계로 실자산 인출 (Stake 일반화)"),
+             "가짜 ERC20 회계로 실자산 인출 (Stake 일반화)",
+             all_of=frozenset({"fake_weth", "stake"})),
     Provider("_synth_uninitialized", "unguarded_initializer", "synth",
              frozenset({"unguarded_initialize"}),
              "미보호 initialize 로 특권 선점 (Motorbike 일반화)"),
     Provider("_synth_puzzle_wallet", "proxy_wallet_slot_collision", "synth",
              frozenset({"proxy_admin", "nested_multicall", "slot_alias_max_balance"}),
-             "프록시/구현 슬롯 충돌 + 중첩 multicall (PuzzleWallet 일반화)"),
+             "프록시/구현 슬롯 충돌 + 중첩 multicall (PuzzleWallet 일반화)",
+             all_of=frozenset({"proxy_admin", "nested_multicall", "slot_alias_max_balance"})),
     Provider("_synth_ecdsa_malleability", "ecdsa_s_malleability", "synth",
              frozenset({"ecrecover"}),
              "ecrecover s-malleability (Impersonator 일반화)"),
@@ -123,25 +137,30 @@ PROVIDERS: List[Provider] = [
              "execute 후 schedule 검사 (Climber timelock)"),
     Provider("twap_as_spot", "twap_as_spot", "synth",
              frozenset({"twap_oracle", "twap_falls_to_spot"}),
-             "한 run() 안에서 스팟으로 붕괴하는 TWAP (Puppet v1/가짜 v3)"),
+             "한 run() 안에서 스팟으로 붕괴하는 TWAP (Puppet v1/가짜 v3)",
+             all_of=frozenset({"twap_oracle", "twap_falls_to_spot"})),
     Provider("twap_window", "twap_window", "synth",
              frozenset({"windowed_twap"}),
              "Observation[] 윈도우: skew → warp → borrow (HEVM / phased)"),
     Provider("cross_getter_drain", "cross_getter_drain", "synth",
              frozenset({"sibling_getter", "multi_contract_unit", "address_ctor"}),
-             "public getter 로 형제 컨트랙트 주소 회수 후 drain"),
+             "public getter 로 형제 컨트랙트 주소 회수 후 drain",
+             all_of=frozenset({"sibling_getter", "multi_contract_unit"})),
     Provider("victim_approve", "victim_approve", "synth",
              frozenset({"victim_approve", "victim_getter"}),
-             "피해자 approve 선행 (prank / 두번째 EOA)"),
+             "피해자 approve 선행 (prank / 두번째 EOA)",
+             all_of=frozenset({"victim_approve", "victim_getter"})),
     Provider("seeded_allowance_drain", "seeded_allowance_drain", "synth",
              frozenset({"setup_seeded_allowance", "victim_getter"}),
-             "Setup/world.txs 가 이미 approve 한 잔여 승인 drain (치트코드 없음)"),
+             "Setup/world.txs 가 이미 approve 한 잔여 승인 drain (치트코드 없음)",
+             all_of=frozenset({"setup_seeded_allowance", "victim_getter"})),
     Provider("cross_chain_bridge", "cross_chain_bridge", "synth",
              frozenset({"cross_chain_bridge"}),
              "같은 EVM 안의 메신저/LZ/OP relay 콜백"),
     Provider("liquidate_other", "liquidate_other", "synth",
              frozenset({"liquidate_other", "no_key_path"}),
-             "키 없는 피해자: liquidate(address)/skim/rescue (Handsel MiniVault)"),
+             "키 없는 피해자: liquidate(address)/skim/rescue (Handsel MiniVault)",
+             all_of=frozenset({"liquidate_other", "no_key_path"})),
     Provider("imported_protocol", "imported_protocol", "synth",
              frozenset({"imported_amm", "imported_lending"}),
              "import 된 Uni/Aave 인터페이스 — 게터로 접음"),
@@ -153,7 +172,8 @@ PROVIDERS: List[Provider] = [
              "ERC4626 첫 입금 인플레이션"),
     Provider("hook_reentrancy", "hook_reentrancy", "synth",
              frozenset({"hook_reentrancy", "receiver_hook"}),
-             "ERC777/721 tokensReceived 훅 재진입"),
+             "ERC777/721 tokensReceived 훅 재진입",
+             all_of=frozenset({"hook_reentrancy"})),
     Provider("sig_replay", "sig_replay", "synth",
              frozenset({"sig_replay"}),
              "nonce/deadline 없는 ecrecover 재사용"),
@@ -168,7 +188,8 @@ PROVIDERS: List[Provider] = [
              "소스 없는 형제: ERC-20/2612/4626/3156/UniV2 셀렉터"),
     Provider("owner_slot_hijack", "owner_slot_hijack", "synth",
              frozenset({"owner_not_slot0", "delegatecall_param"}),
-             "owner/admin 이 슬롯 0이 아니면 패딩 후 delegatecall 탈취"),
+             "owner/admin 이 슬롯 0이 아니면 패딩 후 delegatecall 탈취",
+             all_of=frozenset({"owner_not_slot0", "delegatecall_param"})),
     Provider("mixed_entropy", "mixed_entropy", "synth",
              frozenset({"mixed_entropy"}),
              "block.* ⊕ public nonce/seed — 게터를 읽어 같은 식을 복제"),
@@ -193,9 +214,14 @@ def should_run(fn_name: str, features: Optional[Set[str]]) -> bool:
     spec = _BY_FN.get(fn_name)
     if spec is None:
         return True
-    if not spec.needs:
-        return True
-    return bool(spec.needs & features)
+    if spec.none_of & features:
+        return False
+    if spec.all_of and not spec.all_of.issubset(features):
+        return False
+    alternatives = spec.any_of or spec.needs
+    if alternatives and not (alternatives & features):
+        return False
+    return True
 
 
 def skipped(fn_names: Iterable[str], features: Set[str]) -> List[str]:

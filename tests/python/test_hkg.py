@@ -8,11 +8,18 @@ sys.path.insert(0, str(ROOT))
 
 from trust404.features import extract_features
 from trust404.hkg import lift, order_by_hkg
+from trust404.hkg import should_run_hkg
 from trust404.registry import should_run
 from trust404.targets import load_all
 
 
 class HKG(unittest.TestCase):
+    def test_graph_ranking_cannot_bypass_required_provider_features(self):
+        self.assertFalse(should_run_hkg(
+            "_synth_gatekeeper_one", {"gasleft_modulo"}))
+        self.assertTrue(should_run_hkg(
+            "_synth_gatekeeper_one", {"gasleft_modulo", "tx_origin_mask"}))
+
     def test_reentrant_vault_is_vault_cei(self):
         src = load_all()["ReentrantVault"]["src"]
         feats = extract_features(src, "ReentrantVault")

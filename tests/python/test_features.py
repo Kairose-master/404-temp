@@ -30,6 +30,33 @@ class FeatureIR(unittest.TestCase):
         self.assertIn("value_call", re_f)
         # SafeVault still has a value call, but mutex + CEI order
         self.assertIn("reentrancy_mutex", safe_f)
+        self.assertNotIn("cei_violation", safe_f)
+
+    def test_payouts_are_not_cei_violations_without_late_ledger_effect(self):
+        for name in ("PredictableLottery", "CommitLottery", "BoundedOwner",
+                     "GuardedInitializer"):
+            self.assertNotIn("cei_violation", extract_features(self.src(name), name), name)
+
+    def test_mutex_is_not_a_private_storage_unlock(self):
+        safe_f = extract_features(self.src("SafeVault"), "SafeVault")
+        self.assertNotIn("private_unlock", safe_f)
+        vault = """
+        contract Vault {
+            bool public locked = true;
+            bytes32 private password;
+            function unlock(bytes32 key) external {
+                if (key == password) locked = false;
+            }
+        }
+        """
+        self.assertIn("private_unlock", extract_features(vault, "Vault"))
+
+    def test_reentrancy_synth_requires_the_same_cei_evidence(self):
+        from api.prove import _synth_reentrancy
+
+        self.assertTrue(_synth_reentrancy(self.src("ReentrantVault")))
+        self.assertEqual([], _synth_reentrancy(self.src("SafeVault")))
+        self.assertEqual([], _synth_reentrancy(self.src("PredictableLottery")))
 
     def test_delegate_param_vs_immutable(self):
         dv = extract_features(self.src("DelegateVault"), "DelegateVault")
@@ -83,6 +110,26 @@ class FeatureIR(unittest.TestCase):
     def test_none_features_runs_all(self):
         self.assertTrue(should_run("_synth_gatekeeper_one", None))
 
+    def test_multi_part_providers_require_all_capabilities(self):
+        self.assertFalse(should_run("_synth_gatekeeper_one", {"gasleft_modulo"}))
+        self.assertFalse(should_run("_synth_gatekeeper_one", {"tx_origin_mask"}))
+        self.assertTrue(should_run(
+            "_synth_gatekeeper_one", {"gasleft_modulo", "tx_origin_mask"}))
+
+        self.assertFalse(should_run("_synth_lockup_bypass", {"approve_transferFrom"}))
+        self.assertTrue(should_run(
+            "_synth_lockup_bypass", {"approve_transferFrom", "lockup"}))
+
+        self.assertFalse(should_run("owner_slot_hijack", {"owner_not_slot0"}))
+        self.assertTrue(should_run(
+            "owner_slot_hijack", {"owner_not_slot0", "delegatecall_param"}))
+
+    def test_provider_exclusions_defer_to_the_specialized_family(self):
+        self.assertTrue(should_run("_multiblock_attempt", {"block_entropy"}))
+        self.assertFalse(should_run(
+            "_multiblock_attempt", {"block_entropy", "mixed_entropy"}))
+        self.assertTrue(should_run("mixed_entropy", {"mixed_entropy"}))
+
 
 class ScannerParity(unittest.TestCase):
     @classmethod
@@ -106,6 +153,59 @@ class ScannerParity(unittest.TestCase):
                              self.targets[safe]["manifest"])["scores"]
             self.assertGreater(vs.get(fam, 0), 0, f"{vuln} should score {fam}")
             self.assertLessEqual(ss.get(fam, 0), 0, f"{safe} should not score {fam}")
+
+    def test_track_targets_only_emit_supported_template_families(self):
+        expected = {
+            "ReentrantVault": {"reentrancy"},
+            "OpenVault": {"access_control"},
+            "BadAccounting": {"integer_underflow"},
+            "NaiveOracle": {"oracle_manipulation"},
+            "DelegateVault": {"delegatecall_hijack"},
+            "PredictableLottery": {"weak_randomness"},
+            "OpenInitializer": {"unprotected_init"},
+            "SafeVault": set(),
+            "BoundedOwner": set(),
+            "LibraryVault": set(),
+            "CommitLottery": set(),
+            "GuardedInitializer": set(),
+        }
+        for name, families in expected.items():
+            target = self.targets[name]
+            scores = scan_target(target["src"], target["inv"], target["manifest"])["scores"]
+            self.assertEqual(families, {family for family, score in scores.items() if score > 0}, name)
+
+    def test_admin_role_guard_and_lottery_payout_are_not_open_drains(self):
+        safe = """
+        contract Treasury {
+            address public admin;
+            function sweep(address to, uint256 amount) external {
+                require(msg.sender == admin, "admin only");
+                (bool ok,) = to.call{value: amount}("");
+                require(ok);
+            }
+            function play(uint256 guess) external {
+                if (guess == 7) {
+                    (bool ok,) = msg.sender.call{value: 1 ether}("");
+                    require(ok);
+                }
+            }
+        }
+        """
+        scores = scan_target(safe, "", {"invariants": {"predicates": []}})["scores"]
+        self.assertEqual(0, scores["access_control"])
+        self.assertEqual(0, scores["reentrancy"])
+
+    def test_unguarded_parameterized_drain_is_access_control(self):
+        vulnerable = """
+        contract Treasury {
+            function rescue(address to, uint256 amount) external {
+                (bool ok,) = to.call{value: amount}("");
+                require(ok);
+            }
+        }
+        """
+        scores = scan_target(vulnerable, "", {"invariants": {"predicates": []}})["scores"]
+        self.assertGreater(scores["access_control"], 0)
 
 
 class TargetsFromDisk(unittest.TestCase):

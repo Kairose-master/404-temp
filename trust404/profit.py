@@ -68,8 +68,12 @@ def report_from_snaps(
     before_target: Optional[BalanceSnap] = None,
     after_target: Optional[BalanceSnap] = None,
     invariant_broken: bool = False,
+    external_funding_wei: int = 0,
 ) -> ProfitReport:
-    native = after_attacker.native_wei - before_attacker.native_wei
+    # run{value: funding}(target) transfers harness-supplied working capital to
+    # the exploit contract.  That capital is an input, not extracted profit.
+    native = (after_attacker.native_wei - before_attacker.native_wei
+              - max(0, int(external_funding_wei or 0)))
     tokens: Dict[str, int] = {}
     keys = set(before_attacker.tokens) | set(after_attacker.tokens)
     for k in keys:
@@ -135,10 +139,15 @@ def measure_evm(
     before_attacker: Optional[BalanceSnap] = None,
     before_target: Optional[BalanceSnap] = None,
     invariant_broken: bool = False,
+    external_funding_wei: int = 0,
 ) -> ProfitReport:
     """Call after the exploit tx. Pass the pre-snaps taken before run()."""
     ba = before_attacker or BalanceSnap(native_wei=0)
     bt = before_target or BalanceSnap(native_wei=0)
     aa = snapshot(w3, attacker, token_addrs)
     at = snapshot(w3, target, token_addrs)
-    return report_from_snaps(ba, aa, bt, at, invariant_broken=invariant_broken)
+    return report_from_snaps(
+        ba, aa, bt, at,
+        invariant_broken=invariant_broken,
+        external_funding_wei=external_funding_wei,
+    )

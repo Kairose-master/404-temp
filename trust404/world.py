@@ -131,16 +131,15 @@ def plan_world(
                                "batch includes schedule(self)+role grant"))
         reason_bits.append("timelock execute-before-schedule")
 
-    if not steps:
-        steps.append(WorldStep("attacker", "$target", "run", "single-contract fallback"))
-        reason_bits.append("no cross-contract shape; single run(address)")
-
-    folded = _fold_exploit(src, target_name, feats, cs, steps)
+    # A second contract or a collection of getters is context, not an attack.
+    # Do not manufacture a no-op world candidate merely to prove that the
+    # verifier can execute Solidity; agent.py owns that explicit baseline.
+    folded = _fold_exploit(src, target_name, feats, cs, steps) if steps else ""
     return WorldPlan(
         contracts=cs,
         steps=steps,
         cross_contract=cross or any(s.on != "$target" and s.on != "$gov" for s in steps),
-        reason="; ".join(reason_bits),
+        reason="; ".join(reason_bits) or "no actionable cross-contract attack shape",
         folded_exploit=folded,
     )
 
@@ -259,5 +258,5 @@ def iter_world_candidates(
     src: str, target_name: str, features: Optional[Set[str]] = None
 ) -> Iterator[Tuple[str, str]]:
     plan = plan_world(src, target_name, features)
-    if plan.folded_exploit.strip():
+    if plan.steps and plan.folded_exploit.strip():
         yield ("world:" + ("cross" if plan.cross_contract else "single"), plan.folded_exploit)

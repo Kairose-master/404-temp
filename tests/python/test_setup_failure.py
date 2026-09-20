@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -168,3 +169,13 @@ class SetupFailureEVM(unittest.TestCase):
             self.assertFalse(payload["proven"])
             self.assertFalse(payload["verifier_available"])
             self.assertIn("Setup.run reverted", (Path(td) / "attempts.log").read_text())
+
+
+@unittest.skipUnless(_installed_solc() and shutil.which("forge"),
+                     "forge/solc unavailable")
+class SetupFailureForge(unittest.TestCase):
+    def test_real_setup_revert_is_inconclusive(self):
+        with patch.dict(os.environ, {"TRUST404_VERIFIER": "forge"}):
+            with self.assertRaisesRegex(verify.SetupDeploymentError,
+                                        "declared Setup/initial state"):
+                verify.verify_full(**_inputs())

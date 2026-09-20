@@ -36,6 +36,28 @@ class ProfitOracle(unittest.TestCase):
         d = r.as_dict()
         self.assertEqual(d["extractable_wei"], 12)
 
+    def test_harness_funding_is_not_profit(self):
+        before = BalanceSnap(native_wei=10 * 10**18)
+        after = BalanceSnap(native_wei=20 * 10**18)
+        r = report_from_snaps(
+            before, after, invariant_broken=False,
+            external_funding_wei=10 * 10**18,
+        )
+        self.assertEqual(r.attacker_native_delta, 0)
+        self.assertEqual(r.extractable_wei, 0)
+        self.assertEqual(r.classification, NONE)
+
+    def test_only_value_above_harness_funding_is_profit(self):
+        before = BalanceSnap(native_wei=10 * 10**18)
+        after = BalanceSnap(native_wei=25 * 10**18)
+        r = report_from_snaps(
+            before, after, invariant_broken=True,
+            external_funding_wei=10 * 10**18,
+        )
+        self.assertEqual(r.attacker_native_delta, 5 * 10**18)
+        self.assertEqual(r.extractable_wei, 5 * 10**18)
+        self.assertEqual(r.classification, THEFT)
+
     def test_intended_arb_fixture_expect(self):
         import json
         man = json.loads(

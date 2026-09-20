@@ -169,38 +169,167 @@ def resolve_placeholders(args: Sequence[Any], helpers: dict) -> list:
 
 
 def load_extra_sources(manifest_path, contract_path, manifest) -> dict:
-    """Sibling .sol files + Setup.s.sol next to the manifest.
+    """Load every Solidity source unit belonging to the target bundle.
 
     Hidden-set targets with constructor arrays / multiple contracts use
-    `deploy.setup` and extra sources in `src/`. The agent used to compile
-    only `--contract`, which is how those die.
+    `deploy.setup` and extra sources in `src/`.  Source-unit keys are always
+    POSIX paths relative to the manifest directory so solc can resolve the
+    target's relative imports without basename aliases.
     """
     from pathlib import Path
     extras = {}
-    man_dir = Path(manifest_path).parent
-    setup = (manifest.get("deploy") or {}).get("setup")
-    if setup:
-        p = man_dir / setup
-        if p.is_file():
-            extras[setup] = p.read_text(encoding="utf-8")
-    cpath = Path(contract_path)
-    src_dir = cpath.parent
-    seen = {cpath.resolve()}
-    if src_dir.is_dir():
-        for p in sorted(src_dir.rglob("*.sol")):
-            if p.resolve() in seen:
+    man_dir = Path(manifest_path).resolve().parent
+    cpath = Path(contract_path).resolve()
+    seen = {cpath}
+    invariant_key = Path((manifest.get("invariants") or {}).get("contract")
+                         or "Invariants.sol").as_posix()
+
+    # The manifest directory is the source-unit root used by both verifiers.
+    # Include imported bases/interfaces even when they live beside src/.
+    if man_dir.is_dir():
+        for p in sorted(man_dir.rglob("*.sol")):
+            rp = p.resolve()
+            if rp in seen or any(part in {".git", "out", "cache", "node_modules"}
+                                 for part in p.parts):
                 continue
-            seen.add(p.resolve())
-            try:
-                rel = p.relative_to(man_dir)
-            except ValueError:
-                rel = Path("src") / p.name
-            extras[str(rel)] = p.read_text(encoding="utf-8")
+            rel = p.relative_to(man_dir).as_posix()
+            if rel == invariant_key or p.name == "Exploit.sol":
+                continue
+            seen.add(rp)
+            extras[rel] = p.read_text(encoding="utf-8")
+
+    # If --contract is outside the manifest directory, preserve its sibling
+    # tree under the manifest target.src directory.
+    src_dir = cpath.parent
+    target_key = Path((manifest.get("target") or {}).get("src") or cpath.name)
+    if src_dir.is_dir() and man_dir not in cpath.parents:
+        for p in sorted(src_dir.rglob("*.sol")):
+            rp = p.resolve()
+            if rp in seen:
+                continue
+            seen.add(rp)
+            rel = target_key.parent / p.relative_to(src_dir)
+            extras[rel.as_posix()] = p.read_text(encoding="utf-8")
+
     for rel in ((manifest.get("world") or {}).get("files") or []):
         p = man_dir / rel
         if p.is_file():
-            extras[str(rel)] = p.read_text(encoding="utf-8")
+            extras[Path(rel).as_posix()] = p.read_text(encoding="utf-8")
     return extras
+
+
+def combine_analysis_sources(target_src: str, extra_sources: Optional[dict] = None,
+                             excluded_paths: Optional[Sequence[str]] = None) -> str:
+    """Build the deterministic text view used by scanners and generators.
+
+    Setup and invariant contracts establish/observe the world; treating their
+    privileged functions as target attack surfaces creates false candidates.
+    Imported protocol contracts and interfaces remain visible.
+    """
+    excluded = {str(path).replace("\\", "/").lstrip("./").lower()
+                for path in (excluded_paths or []) if path}
+    chunks = [target_src or ""]
+    for rel, source in sorted((extra_sources or {}).items()):
+        normalized = rel.replace("\\", "/").lstrip("./").lower()
+        name = normalized.rsplit("/", 1)[-1]
+        if normalized in excluded:
+            continue
+        if name in {"setup.s.sol", "invariants.sol", "exploit.sol"}:
+            continue
+        chunks.append(f"\n// ---- source unit: {rel} ----\n{source}")
+    return "\n".join(chunks)
+
+
+def _contract_declarations(src: str) -> dict:
+    """Return contract declarations with their direct inheritance names."""
+    out = {}
+    pat = re.compile(r"\b(?:abstract\s+)?contract\s+(\w+)\b([^;{]*)\{")
+    for match in pat.finditer(src or ""):
+        start = match.start()
+        brace = match.end() - 1
+        depth = 0
+        end = len(src or "")
+        for idx in range(brace, len(src or "")):
+            if src[idx] == "{":
+                depth += 1
+            elif src[idx] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = idx + 1
+                    break
+        header = match.group(2)
+        inherited = re.search(r"\bis\b(.*)", header, re.S)
+        inheritance = inherited.group(1) if inherited else ""
+        out[match.group(1)] = {
+            "source": (src or "")[start:end],
+            "base_tokens": re.findall(r"\b[A-Za-z_]\w*\b", inheritance),
+        }
+    return out
+
+
+def target_analysis_source(target_src: str, extra_sources: Optional[dict],
+                           target_name: str) -> str:
+    """Keep the target source unit plus only imported contracts it inherits.
+
+    Same-unit siblings remain available for protocol attacks, while an
+    unrelated helper in another source file cannot become the target's attack
+    surface. Imported base contracts remain visible because their external
+    functions are callable through the deployed target.
+    """
+    target_defs = _contract_declarations(target_src or "")
+    if target_name not in target_defs:
+        return target_src or ""
+    definitions = dict(target_defs)
+    origins = {name: "target" for name in target_defs}
+    for rel, source in sorted((extra_sources or {}).items()):
+        for name, declaration in _contract_declarations(source).items():
+            if name not in definitions:
+                definitions[name] = declaration
+                origins[name] = rel
+
+    queue = [target_name]
+    processed = set()
+    inherited = []
+    while queue:
+        name = queue.pop(0)
+        if name in processed or name not in definitions:
+            continue
+        processed.add(name)
+        declaration = definitions[name]
+        if origins.get(name) != "target":
+            inherited.append(
+                f"\n// ---- inherited contract: {origins[name]}::{name} ----\n"
+                + declaration["source"])
+        for token in declaration["base_tokens"]:
+            if token in definitions and token not in processed:
+                queue.append(token)
+    return (target_src or "") + "\n".join(inherited)
+
+
+def analysis_source_views(target_src: str, extra_sources: Optional[dict],
+                          manifest: dict) -> Tuple[str, str]:
+    """Return `(target_surface, protocol_context)` for generation.
+
+    Verification still receives the untouched `extra_sources`; these views
+    affect candidate selection only.
+    """
+    deploy = manifest.get("deploy") or {}
+    invariants = manifest.get("invariants") or {}
+    excluded = [deploy.get("setup"), invariants.get("contract")]
+    context = combine_analysis_sources(target_src, extra_sources, excluded)
+    filtered = {}
+    excluded_norm = {str(path).replace("\\", "/").lstrip("./").lower()
+                     for path in excluded if path}
+    for rel, source in (extra_sources or {}).items():
+        normalized = rel.replace("\\", "/").lstrip("./").lower()
+        name = normalized.rsplit("/", 1)[-1]
+        if normalized in excluded_norm or name in {
+                "setup.s.sol", "invariants.sol", "exploit.sol"}:
+            continue
+        filtered[rel] = source
+    target_name = (manifest.get("target") or {}).get("name") or ""
+    surface = target_analysis_source(target_src, filtered, target_name)
+    return surface, context
 
 
 def parse_structs(src: str) -> dict:
