@@ -76,6 +76,38 @@ done
 `exit 2`와 `INCONCLUSIVE (verifier unavailable)`은 취약점 판정이 아니라 검증기
 준비 실패다. 위의 solc 확인 명령이 `0.8.24`를 출력하는지 먼저 확인한다.
 
+## 비공개 타깃 실행
+
+비공개 번들에 `Target.sol`·`Invariants.sol`·`manifest.json`이 모두 있으면 표준
+증명 CLI를 사용한다. `--out`이 결과 폴더이며, 아래 명령은 저장소의
+`out/private/MyVault/`에 세 파일을 만든다.
+
+```bash
+TRUST404_VERIFIER=evm python agent/agent.py \
+  --contract /absolute/path/MyVault/src/MyVault.sol \
+  --invariants /absolute/path/MyVault/Invariants.sol \
+  --manifest /absolute/path/MyVault/manifest.json \
+  --out out/private/MyVault --timeout 300 --seed 42 --max-attempts 24
+```
+
+| 생성 위치 | 내용 |
+|---|---|
+| `out/private/MyVault/Exploit.sol` | 증명된 PoC, 또는 미발견 시 마지막 후보 |
+| `out/private/MyVault/result.json` | 판정, 위반 불변식, 전략, 시도 수와 실행 trace |
+| `out/private/MyVault/attempts.log` | 후보 생성·검증·단계 격상 로그 |
+
+소스만 있고 불변식·매니페스트가 없으면 `audit` 모드를 사용한다. 이 모드는
+`result.json` 대신 `audit/private/report.json`, `report.md`, `report.sarif`와
+증명된 계약별 `exploits/<Contract>.sol`을 만든다.
+
+```bash
+python agent/audit.py /absolute/path/private-target \
+  --out audit/private --seed 42 --include-safe
+```
+
+비공개 번들의 폴더 구조, 매니페스트 예제, Docker 마운트와 두 실행 모드의 전체
+설명은 [`QUICKSTART.md`](./QUICKSTART.md)에 있다.
+
 CLI·검증기 두 경로(내장 EVM / forge)와 Docker 실행: [`agent/README.md`](./agent/README.md).
 
 ```bash
