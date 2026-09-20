@@ -72,14 +72,26 @@ def concrete_contracts(src, eng):
 
 
 def synth_ctor_args(eng, src, contract):
-    """타깃 생성자 시그니처를 읽어 배포용 기본 인자를 합성한다. 문자열/바이트/배열/
-    구조체가 필요하면 None(분석 불가)을 돌려준다."""
-    body = eng._contract_bodies(eng._strip_comments(src)).get(contract, "")
+    """타깃 생성자 시그니처를 읽어 배포용 기본 인자를 합성한다.
+
+    Solidity contract/interface/library parameters are encoded as ``address``
+    in the ABI. Keep the cheap source-level parser, but recognize those
+    user-defined reference types so helper contracts such as ``Pool(Token,
+    Token)`` do not turn a complete directory audit into an infrastructure
+    error. Unsupported structs and other composite types still fail closed.
+    """
+    stripped = eng._strip_comments(src)
+    body = eng._contract_bodies(stripped).get(contract, "")
+    address_like = set(re.findall(
+        r"\b(?:contract|interface|library)\s+(\w+)", stripped))
+    dummy_address = "0x000000000000000000000000000000000000dEaD"
     m = re.search(r"constructor\s*\(([^)]*)\)", body)
     if not m or not m.group(1).strip():
         return []
     def default_for(t):
-        if t == "address": return "0x000000000000000000000000000000000000dEaD"
+        base = t.rsplit(".", 1)[-1]
+        if t == "address" or base in address_like:
+            return dummy_address
         if t.startswith("uint") or t.startswith("int"): return 10**18
         if t == "bool": return False
         if t == "bytes32": return "0x" + "11" * 32
@@ -93,27 +105,17 @@ def synth_ctor_args(eng, src, contract):
         if not toks:
             continue
         t = toks[0]
-        arr = re.fullmatch(r"([a-z0-9]+)\[(\d+)\]", t)
+        arr = re.fullmatch(r"(.+)\[(\d+)\]", t)
         if arr:
             elem = default_for(arr.group(1))
             if elem is None:
                 return None
             args.append([elem] * int(arr.group(2)))
             continue
-        if t == "address":
-            args.append("0x000000000000000000000000000000000000dEaD")  # 유효한 20-byte 테스트 주소
-        elif t.startswith("uint") or t.startswith("int"):
-            args.append(10**18)
-        elif t == "bool":
-            args.append(False)
-        elif t == "bytes32":
-            args.append("0x" + "11" * 32)   # 알려진 값(자체 배포이므로 우리가 안다)
-        elif t == "string":
-            args.append("trust404")
-        elif t == "bytes":
-            args.append("0x")
-        else:
+        value = default_for(t)
+        if value is None:
             return None  # 배열/구조체 등 → 안전하게 분석 스킵
+        args.append(value)
     return args
 
 
@@ -379,7 +381,7 @@ def analyze_source(eng, src, contract, invariants, seed_eth, seed):
     cargs = synth_ctor_args(eng, src, contract)
     if cargs is None:
         return {"name": contract, "proven": False,
-                "error": "constructor needs string/bytes/array args (auto-deploy unsupported)",
+                "error": "constructor contains unsupported parameter types for auto-deploy",
                 "steps": [{"step": "scan", "scores": {}}]}
     manifest["deploy"]["constructor_args"] = cargs
     do_verify = bool(invariants)
@@ -412,6 +414,7 @@ def build_report(findings, args, total_analyzed=None):
             "proven_vulnerabilities": len(proven),
             "heuristic_flags": len(heur),
             "clean": len(clean),
+            "analysis_errors": sum(1 for f in findings if f["res"].get("error")),
             "severity_counts": counts,
         },
         "findings": [],
@@ -578,15 +581,209 @@ def contract_priority(eng, src, contract):
     return score
 
 
+_TARGET_SKIP = ("/lib/", "/node_modules/", "/out/", "/.git/",
+                "/test/", "/tests/", "/script/", "/scripts/")
+
+
 def gather_files(path):
     p = Path(path)
     if p.is_file():
         return [p]
     if p.is_dir():
-        skip = ("/lib/", "/node_modules/", "/out/", "/.git/", "/test/", "/tests/")
         return sorted(f for f in p.rglob("*.sol")
-                      if not any(sk in str(f).replace("\\", "/") + "/" for sk in skip))
+                      if not any(sk in str(f).replace("\\", "/") + "/" for sk in _TARGET_SKIP))
     raise SystemExit(f"error: path not found: {path}")
+
+
+def prepare_input(path):
+    """입력 경로를 (분석 루트, 정리 함수) 로 정규화한다.
+
+    - `.zip` 이거나 zip 시그니처면 임시 디렉터리로 안전하게 푼다(zip-slip 방지).
+      압축 안에 최상위 폴더 하나만 있으면 그 폴더를 루트로 삼는다.
+    - 그 외에는 경로를 그대로 쓴다.
+    반환한 정리 함수를 마지막에 호출해 임시 디렉터리를 지운다.
+    """
+    import shutil
+    import tempfile
+    import zipfile
+
+    p = Path(path)
+    if not p.exists():
+        raise SystemExit(f"error: path not found: {path}")
+    if p.is_file() and (p.suffix.lower() == ".zip" or zipfile.is_zipfile(p)):
+        tmp = Path(tempfile.mkdtemp(prefix="t404-audit-"))
+        root = tmp.resolve()
+        with zipfile.ZipFile(p) as zf:
+            members = zf.infolist()
+            total_size = sum(m.file_size for m in members)
+            if len(members) > 10_000 or total_size > 256 * 1024 * 1024:
+                raise SystemExit("error: zip exceeds extraction limits")
+            for member in members:
+                if member.file_size > 32 * 1024 * 1024:
+                    raise SystemExit(f"error: zip member too large: {member.filename}")
+                # zip-slip 방지: 목적지가 루트 밖이면 거부.
+                dest = (root / member.filename).resolve()
+                if dest != root and not str(dest).startswith(str(root) + os.sep):
+                    raise SystemExit(f"error: unsafe path in zip: {member.filename}")
+                if member.is_dir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                with zf.open(member) as srcf, open(dest, "wb") as outf:
+                    shutil.copyfileobj(srcf, outf)
+        # 최상위에 폴더 하나뿐이면 그 안을 루트로.
+        entries = [e for e in root.iterdir() if e.name != "__MACOSX"]
+        if len(entries) == 1 and entries[0].is_dir():
+            root = entries[0]
+        return root, (lambda: shutil.rmtree(tmp, ignore_errors=True))
+    return p, (lambda: None)
+
+
+# import "..."; / import {A} from "..."; / import * as X from "..."; / import "..." as X;
+_IMPORT_RE = re.compile(
+    r'^\s*import\s+(?:[^"\';]*\bfrom\b\s*)?["\']([^"\']+)["\'][^;]*;',
+    re.MULTILINE)
+_SPDX_RE = re.compile(r'^\s*//\s*SPDX-License-Identifier:.*$', re.MULTILINE)
+_PRAGMA_RE = re.compile(r'^\s*pragma\s+[^;]+;\s*$', re.MULTILINE)
+
+
+def build_source_index(root):
+    """루트 아래 모든 .sol 을 posix 절대경로로 색인한다(라이브러리 포함)."""
+    root = Path(root)
+    idx = []
+    if root.is_file():
+        idx.append(root.resolve())
+        root = root.parent
+    for f in root.rglob("*.sol"):
+        idx.append(f.resolve())
+    # 중복 제거, 결정론 정렬.
+    return sorted(set(idx), key=lambda x: str(x))
+
+
+def resolve_import(imp, importing_abs, index):
+    """import 경로 문자열을 실제 파일로 해석한다.
+
+    1) `./`·`../` 상대경로는 import 한 파일 기준으로 해석.
+    2) 아니면 색인에서 **가장 긴 경로 접미사**가 일치하는 파일을 고른다.
+       (`@openzeppelin/contracts/access/Ownable.sol` 같은 remapping 별칭도
+        `.../access/Ownable.sol` 접미사로 자동 매칭 — remappings.txt 불필요.)
+    최장 접미사가 같은 후보가 여러 개면 잘못된 라이브러리를 고르지 않고 실패한다.
+    """
+    imp = imp.strip().replace("\\", "/")
+    importing_abs = Path(importing_abs).resolve()
+    if imp.startswith("./") or imp.startswith("../"):
+        cand = (importing_abs.parent / imp).resolve()
+        if cand in index:
+            return cand
+        return None
+    # 접미사 매칭: import 경로의 뒤쪽 세그먼트가 많이 겹칠수록 우선.
+    imp_parts = [s for s in imp.split("/") if s not in ("", ".", "..")]
+    matches = []
+    for cand in index:
+        cparts = str(cand.as_posix()).split("/")
+        n = 0
+        while n < len(imp_parts) and n < len(cparts) and imp_parts[-1 - n] == cparts[-1 - n]:
+            n += 1
+        if n == 0:
+            continue
+        # 파일명(마지막 세그먼트)은 반드시 일치해야 함.
+        if imp_parts[-1] != cparts[-1]:
+            continue
+        matches.append((n, cand))
+    if not matches:
+        return None
+    best_n = max(n for n, _ in matches)
+    best = [cand for n, cand in matches if n == best_n]
+    if len(best) != 1:
+        names = ", ".join(str(p) for p in best[:4])
+        raise ValueError(f"ambiguous import {imp!r}: {names}")
+    return best[0]
+
+
+def _import_rewrites(statement):
+    """Return symbol and namespace rewrites needed after import flattening."""
+    symbols = []
+    namespaces = []
+    named = re.search(r"\{([^}]*)\}\s+from\b", statement, re.S)
+    if named:
+        for item in named.group(1).split(","):
+            bits = re.split(r"\s+as\s+", item.strip())
+            if len(bits) == 2 and bits[0] and bits[1]:
+                symbols.append((bits[1].strip(), bits[0].strip()))
+    ns = re.search(r"\bimport\s+\*\s+as\s+(\w+)\s+from\b", statement, re.S)
+    if not ns:
+        ns = re.search(r"\bimport\s+[\"'][^\"']+[\"']\s+as\s+(\w+)", statement, re.S)
+    if ns:
+        namespaces.append(ns.group(1))
+    return symbols, namespaces
+
+
+def flatten_sol(entry_abs, index, log=None):
+    """entry 파일과 그 import 를 후위 순회로 인라인해 자체완결 소스 1개를 만든다.
+
+    - SPDX/ pragma/ import 줄은 인라인 시 제거하고, 최종 결과 맨 위에 한 번만 둔다.
+    - 순환 import 와 중복 파일은 방문 집합으로 건너뛴다.
+    - 해석 실패한 import 는 주석으로 남기고 계속(부분 컴파일이라도 시도).
+    """
+    entry_abs = Path(entry_abs).resolve()
+    seen = set()
+    chunks = []
+    pragma_line = None
+    spdx_id = None
+
+    def strip_header(text):
+        nonlocal pragma_line, spdx_id
+        m = _SPDX_RE.search(text)
+        if m and spdx_id is None:
+            spdx_id = m.group(0).strip()
+        m = _PRAGMA_RE.search(text)
+        if m and pragma_line is None:
+            pragma_line = m.group(0).strip()
+        text = _SPDX_RE.sub("", text)
+        text = _PRAGMA_RE.sub("", text)
+        text = _IMPORT_RE.sub("", text)
+        return text.strip("\n")
+
+    def visit(path):
+        path = Path(path).resolve()
+        if path in seen:
+            return
+        seen.add(path)
+        try:
+            text = path.read_text(encoding="utf-8")
+        except Exception as e:
+            if log:
+                log(f"  import read failed: {path}: {e}")
+            raise RuntimeError(f"import read failed: {path}: {e}") from e
+        symbol_rewrites = []
+        namespace_rewrites = []
+        for m in _IMPORT_RE.finditer(text):
+            dep = resolve_import(m.group(1), path, index)
+            if dep is not None:
+                visit(dep)
+            else:
+                message = f"unresolved import '{m.group(1)}' in {path.name}"
+                if log:
+                    log(f"  {message}")
+                raise FileNotFoundError(message)
+            symbols, namespaces = _import_rewrites(m.group(0))
+            symbol_rewrites.extend(symbols)
+            namespace_rewrites.extend(namespaces)
+        body = strip_header(text)
+        for namespace in namespace_rewrites:
+            body = re.sub(rf"\b{re.escape(namespace)}\.(\w+)\b", r"\1", body)
+        for alias, original in symbol_rewrites:
+            body = re.sub(rf"\b{re.escape(alias)}\b", original, body)
+        chunks.append((f"// ── from {path.name} " + "─" * 20, body))
+
+    visit(entry_abs)
+    header = (spdx_id or "// SPDX-License-Identifier: MIT") + "\n" + \
+             (pragma_line or "pragma solidity ^0.8.0;") + "\n"
+    parts = [header]
+    for banner, body in chunks:
+        if body:
+            parts.append(banner + "\n" + body + "\n")
+    return "\n".join(parts)
 
 
 def main(argv=None):
@@ -612,7 +809,13 @@ def main(argv=None):
     else:
         os.environ.setdefault("TRUST404_MAX_SECONDS", "12")  # 단일 감사: 더 끈질기게
     inv_src = Path(args.invariants).read_text(encoding="utf-8") if args.invariants else None
-    files = gather_files(args.path)
+    # zip 이면 임시 폴더로 풀고, 그 안을 루트로 삼는다. 프로세스 종료 시 정리.
+    import atexit
+    input_root, _cleanup = prepare_input(args.path)
+    atexit.register(_cleanup)
+    files = gather_files(input_root)
+    # import 해석용 색인은 라이브러리 폴더까지 포함해 전체를 훑는다.
+    index = build_source_index(input_root)
     outdir = Path(args.out)
     (outdir / "exploits").mkdir(parents=True, exist_ok=True)
 
@@ -624,22 +827,40 @@ def main(argv=None):
     cands = []
     for fp in files:
         try:
-            src = fp.read_text(encoding="utf-8")
+            raw = fp.read_text(encoding="utf-8")
         except Exception as e:
             log(f"skip {fp}: {e}"); continue
-        for c in concrete_contracts(src, eng):
+        # import 가 있으면 의존 파일을 찾아 인라인(flatten)한 소스로 분석한다.
+        src = raw
+        preparation_error = None
+        if _IMPORT_RE.search(raw):
+            try:
+                src = flatten_sol(fp, index, log=(None if args.quiet else log))
+            except Exception as e:
+                preparation_error = f"import flatten failed: {e}"
+                log(f"flatten failed {fp}: {e}")
+        # 감사 대상은 '이 파일에 선언된' 구체 컨트랙트만 (import 로 끌려온 의존 제외).
+        for c in concrete_contracts(raw, eng):
             if args.only and c != args.only:
                 continue
-            cands.append((fp, src, c))
+            cands.append((fp, src, c, preparation_error))
     cands.sort(key=lambda t: contract_priority(eng, t[1], t[2]), reverse=True)
     if args.max_contracts > 0:
         cands = cands[:args.max_contracts]
 
     findings = []
     if True:
-        for fp, src, c in cands:
+        for fp, src, c, preparation_error in cands:
             log(f"analyzing {fp}:{c} …")
-            res = analyze_source(eng, src, c, inv_src, args.seed_eth, args.seed)
+            if preparation_error:
+                res = {
+                    "name": c,
+                    "proven": False,
+                    "error": preparation_error,
+                    "steps": [{"step": "input", "scores": {}}],
+                }
+            else:
+                res = analyze_source(eng, src, c, inv_src, args.seed_eth, args.seed)
             sev, evidence, is_finding = severity_for(res)
             # 동적 미성립 시: 정적 휴리스틱(예: EIP-7702 receiver-callback 재진입)을 소견으로 승격
             heur_cls = None
@@ -683,7 +904,11 @@ def main(argv=None):
                              "line": hot_ln, "decl_line": decl_ln})
 
     if not args.include_safe:
-        findings_out = [f for f in findings if not (f["severity"] == "INFO" and not f["res"].get("proven"))]
+        findings_out = [
+            f for f in findings
+            if f["res"].get("error")
+            or not (f["severity"] == "INFO" and not f["res"].get("proven"))
+        ]
     else:
         findings_out = findings
     # 요약 카운트는 표시 대상 기준
@@ -700,6 +925,8 @@ def main(argv=None):
 
     worst = max((SEV_ORDER[f["severity"]] for f in shown), default=0)
     proven_n = s["proven_vulnerabilities"]
+    if s.get("analysis_errors", 0) > 0:
+        return EXIT_ERROR
     if args.fail_on == "proven" and proven_n > 0:
         return EXIT_FINDINGS
     if args.fail_on == "high" and worst >= SEV_ORDER["HIGH"]:

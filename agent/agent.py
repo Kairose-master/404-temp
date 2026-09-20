@@ -4,18 +4,19 @@
 # 자기검증 루프(Self-validation Loop)가 핵심이다. 타깃/불변식/매니페스트를 읽어
 #   탐색 → 생성 → 검증 → (불변식 미위반 시) 더 강한 방법으로 탐색·생성 반복
 # 을 --max-attempts / --timeout 예산 안에서 돈다. 후보 생성은 단계별로 격상한다:
-#   0) llm(선택) → 1) 계열 템플릿 → 2) 합성(synth) → 3) 범용 퍼저(fuzz)
+#   0) llm(명시적 개발 모드) → 1) 계열 템플릿 → 2) 합성(synth) → 3) 범용 퍼저(fuzz)
 # 각 후보는 하네스 _prove() 를 재현한 검증기(verify.py)로 실제 불변식 위반을 확인하고,
 # 실패하면 다음 후보/단계로 격상해 반복한다. template→synth→fuzz 후보는 실무 감사
 # 엔진(api/prove.py)의 iter_engine_candidates 로부터 지연 생성된다.
 #
 # 검증기는 두 경로를 가진다:
-#   - forge 가 있으면 참가 번들의 harness/src/Harness.sol 을 재사용해 forge test 로 검증
-#   - 없으면 내장 EVM(solc 0.8.24 + eth-tester/py-evm)으로 동일한 _prove 절차를 재현
+#   - 제출 Docker: 참가 번들의 harness/src/Harness.sol 을 재사용해 forge test 로 검증
+#   - 로컬 보조: TRUST404_VERIFIER=evm 이면 내장 EVM으로 같은 _prove 절차를 재현
 # 두 경로 모두 오프라인에서 동작한다(네트워크 차단 샌드박스 전제).
 #
-# LLM: ANTHROPIC_API_KEY(또는 LLM_API_KEY)가 있으면 1차 후보로 LLM 초안을
-# 요청하고, 없거나 실패하면 내장 휴리스틱 템플릿으로 degrade 한다(키 없이도 동작).
+# LLM: TRUST404_ENABLE_LLM=1 과 API 설정을 함께 준 개발 모드에서만 LLM 초안을
+# 요청한다. 제출 Docker는 이를 끈 채 휴리스틱/합성/퍼저만 사용해 생성 결정론을
+# 보장한다.
 #
 # 표준 CLI:
 #   agent.py --contract <path> --invariants <path> --manifest <path> --out <dir>
@@ -33,7 +34,7 @@ import time
 from pathlib import Path
 
 from scanner import scan_target
-from strategies import STRATEGY_ORDER, build_exploit, seeded_order
+from strategies import STRATEGY_ORDER, build_exploit
 from verify import verify_candidate, verify_full, VerifyUnavailable
 
 try:
@@ -73,6 +74,18 @@ def _load_engine():
 EXIT_FOUND = 0
 EXIT_NOT_FOUND = 1
 EXIT_ERROR = 2
+
+
+def _llm_enabled():
+    """Keep the standard scoring path deterministic even if a key leaks in.
+
+    Temperature zero does not make a remote model bit-for-bit deterministic.
+    Requiring a separate opt-in prevents ambient API credentials from changing
+    candidate order or the final Exploit.sol in the submitted container.
+    """
+    return os.environ.get("TRUST404_ENABLE_LLM", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def parse_args(argv):
@@ -134,31 +147,40 @@ def main(argv=None):
     target_name = manifest["target"]["name"]
     extra_sources = {}
     try:
-        from trust404.abi import load_extra_sources
+        from trust404.abi import analysis_source_views, load_extra_sources
         extra_sources = load_extra_sources(args.manifest, args.contract, manifest)
         if extra_sources:
             note("# extra sources: " + ",".join(sorted(extra_sources)))
     except Exception as e:
         note(f"# extra sources skipped: {str(e)[:80]}")
+        analysis_source_views = None
+    if analysis_source_views:
+        analysis_src, world_src = analysis_source_views(
+            contract_src, extra_sources, manifest)
+    else:
+        analysis_src = world_src = contract_src
     note(f"# TRUST404 Track04 agent | target={target_name} seed={args.seed} "
          f"max_attempts={args.max_attempts} timeout={args.timeout}s")
 
     # ── 정적 분석 → 후보 유형 스코어링 ────────────────────────────────────────
-    findings = scan_target(contract_src, invariants_src, manifest)
-    scored = sorted(
-        STRATEGY_ORDER,
-        key=lambda fam: (-findings["scores"].get(fam, 0), fam),
+    findings = scan_target(analysis_src, invariants_src, manifest)
+    from trust404.candidates import (
+        candidate_fingerprint,
+        candidate_profile,
+        invariant_dependencies,
+        rank_template_families,
+        schedule_candidates,
     )
-    scored = seeded_order(scored, findings["scores"], args.seed)
+    invariant_deps = invariant_dependencies(invariants_src)
+    scored = rank_template_families(
+        STRATEGY_ORDER, findings, invariant_deps, args.seed)
     note(f"# scan scores: " + ", ".join(f"{k}={findings['scores'].get(k,0)}" for k in STRATEGY_ORDER))
     note(f"# strategy order: {scored}")
+    note("# invariant dependencies: " + ",".join(sorted(invariant_deps)))
     feats = set()
     if extract_features is not None:
         try:
-            blob = contract_src
-            if extra_sources:
-                blob = contract_src + "\n" + "\n".join(extra_sources.values())
-            feats = extract_features(blob, target_name)
+            feats = extract_features(analysis_src, target_name)
             note("# features: " + ",".join(sorted(feats)[:40]))
             if hkg_lift is not None:
                 hkg = hkg_lift(feats)
@@ -166,7 +188,7 @@ def main(argv=None):
                 note("# hkg causes: " + ",".join(hkg.causes[:8]))
                 note("# hkg ranked: " + ",".join(hkg.ranked_primitives[:8]))
             if plan_world is not None:
-                wp = plan_world(contract_src, target_name, feats)
+                wp = plan_world(world_src, target_name, feats)
                 note(f"# world cross={wp.cross_contract} reason={wp.reason[:160]}")
         except Exception as e:
             note(f"# feature extract failed: {str(e)[:80]}")
@@ -176,50 +198,137 @@ def main(argv=None):
     # 소비되므로, PoC 가 불변식을 위반하지 못하면 더 강한 방법으로 탐색·생성을 반복한다.
     #   0) llm      — (선택) 로컬/원격 LLM 초안
     #   1) template — 계열별 결정론 템플릿(정적 스코어 순)
-    #   2) synth    — 재진입/AMM/플래시론/스토리지/프록시/다중블록/스토리지충돌/DoS/콜백 합성
+    #   2) synth    — 재진입/AMM/플래시론/스토리지/프록시/스토리지충돌/DoS/콜백 합성
     #   3) fuzz     — 범용 호출 시퀀스 탐색(미공개 타깃 일반화 축)
+    metrics = {
+        "generated": 0,
+        "deduplicated": 0,
+        "deferred": 0,
+        "verified": 0,
+        "rejected": 0,
+        "verification_errors": 0,
+        "provider_skipped": 0,
+        "provider_errored": 0,
+        "fuzz_executions": 0,
+        "fuzz_candidates": 0,
+        "minimization_verifications": 0,
+    }
+    search_errors = []
+
+    def metrics_snapshot():
+        return {key: int(metrics[key]) for key in sorted(metrics)}
+
+    def note_metrics():
+        snapshot = metrics_snapshot()
+        note("# metrics " + " ".join(f"{key}={snapshot[key]}" for key in snapshot))
+
     def candidate_stream():
-        # 0) LLM (로컬 LLM_BASE_URL 또는 API 키가 있을 때만)
+        seen_candidates = set()
+
+        def register(stage, label, source, metadata=None):
+            metrics["generated"] += 1
+            fp = candidate_fingerprint(source)
+            if fp in seen_candidates:
+                metrics["deduplicated"] += 1
+                note(f"# duplicate candidate skipped [{stage}/{label}]")
+                return None
+            seen_candidates.add(fp)
+            profile = candidate_profile(
+                stage, label, findings, invariant_deps, feats)
+            if metadata:
+                profile["discovery"] = metadata.get("discovery", metadata)
+            note(
+                f"# candidate [{stage}/{label}] confidence={profile['confidence']:.3f} "
+                f"cost={profile['cost']} overlap={','.join(profile['invariant_overlap']) or '-'} "
+                f"evidence={','.join(profile['evidence']) or '-'}"
+            )
+            return stage, label, source, profile
+
+        # 0) LLM (명시적 opt-in + 로컬 LLM_BASE_URL 또는 API 키가 있을 때만)
         llm_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("LLM_API_KEY")
         llm_base = os.environ.get("LLM_BASE_URL")
-        if llm_key or llm_base:
+        if _llm_enabled() and (llm_key or llm_base):
             try:
                 from llm import propose_exploit  # optional
-                draft = propose_exploit(contract_src, invariants_src, findings, llm_key)
+                draft = propose_exploit(analysis_src, invariants_src, findings, llm_key)
                 if draft:
                     note(f"# LLM draft obtained ({'local:'+llm_base if llm_base else 'anthropic'})")
-                    yield ("llm", "llm", draft)
+                    item = register("llm", "llm", draft)
+                    if item:
+                        yield item
             except Exception as e:  # network blocked / parse fail → degrade
                 note(f"# LLM unavailable, degrading to heuristics: {str(e)[:120]}")
+        elif _llm_enabled():
+            note("# LLM enabled but no endpoint/key configured; offline mode")
         else:
-            note("# no LLM configured; offline heuristic/synthesis/fuzz mode")
-        # 1~3) 엔진(api/prove.py)의 단계별 생성기 — 없으면 로컬 템플릿으로 degrade
+            note("# LLM disabled; deterministic offline heuristic/synthesis/fuzz mode")
+        # Always generate the deterministic templates from the complete source
+        # view first.  This catches inherited attack surfaces even when deeper
+        # engine stages cannot execute a multi-source target internally.
+        for fam in scored:
+            try:
+                src = build_exploit(fam, findings)
+            except Exception as e:
+                metrics["provider_errored"] += 1
+                search_errors.append({
+                    "stage": "template", "provider": fam,
+                    "error": str(e)[:300],
+                })
+                continue
+            if src:
+                item = register("template", fam, src)
+                if item:
+                    yield item
+
+        # 1~3) 엔진(api/prove.py)의 단계별 생성기
         engine = _load_engine()
         if engine is not None and hasattr(engine, "iter_engine_candidates"):
             note("# engine loaded: template → synth → fuzz stages")
             try:
-                for stage, label, src in engine.iter_engine_candidates(
-                        target_name, contract_src, invariants_src, manifest, do_verify=True):
-                    yield (stage, label, src)
+                for generated in engine.iter_engine_candidates(
+                        target_name, contract_src, invariants_src, manifest,
+                        do_verify=True, analysis_src=analysis_src,
+                        seed=args.seed, deadline=started + args.timeout,
+                        include_templates=False, world_src=world_src,
+                        metrics=metrics, search_errors=search_errors,
+                        extra_sources=extra_sources or None):
+                    if len(generated) == 4:
+                        stage, label, src, metadata = generated
+                    else:
+                        stage, label, src = generated
+                        metadata = None
+                    item = register(stage, label, src, metadata)
+                    if item:
+                        yield item
             except Exception as e:
+                metrics["provider_errored"] += 1
+                search_errors.append({
+                    "stage": "engine", "provider": "candidate-stream",
+                    "error": str(e)[:300],
+                })
                 note(f"# engine candidate stream error: {str(e)[:140]}")
         else:
+            metrics["provider_errored"] += 1
+            search_errors.append({
+                "stage": "engine", "provider": "loader",
+                "error": "engine unavailable",
+            })
             note("# engine unavailable; local template stage only")
-            for fam in scored:
-                src = build_exploit(fam, findings)
-                if src:
-                    yield ("template", fam, src)
+            return
 
     # ── 자기검증 루프 (Self-validation Loop) ──────────────────────────────────
     # 생성 → 검증 → (불변식 미위반 시) 다음 후보로 탐색·생성 반복. 이 루프가 트랙의 핵심.
     last_source = _fallback_stub()
     attempts = 0
     verifier_ok = True
+    verified_attempts = 0
+    verification_errors = []
     stages_seen = []
     held_invariants = {}  # 실패한 시도에서 '유지된' 불변식 관찰(피드백)
     critiques = []
     critique_llm_done = False
-    for stage, label, source in candidate_stream():
+    for stage, label, source, profile in schedule_candidates(
+            candidate_stream(), args.max_attempts, metrics):
         if attempts >= args.max_attempts:
             note(f"# budget exhausted after {attempts} attempts (max={args.max_attempts})")
             break
@@ -233,6 +342,7 @@ def main(argv=None):
         last_source = source
         # ① 검증(불변식 위반 여부) — 참가 하네스 _prove() 재현
         try:
+            remaining_timeout = max(1, args.timeout - int(time.time() - started))
             result = verify_full(
                 target_name=target_name,
                 target_src=contract_src,
@@ -241,14 +351,21 @@ def main(argv=None):
                 manifest=manifest,
                 seed=args.seed,
                 extra_sources=extra_sources or None,
+                timeout_sec=remaining_timeout,
             )
             proven, first_violated, detail = result.tuple()
+            verified_attempts += 1
+            metrics["verified"] += 1
         except VerifyUnavailable as e:
             verifier_ok = False
             note(f"attempt {attempts} [{stage}/{label}]: verifier unavailable ({e}); emitting best candidate")
             break
         except Exception as e:
-            note(f"attempt {attempts} [{stage}/{label}]: verify error → refine ({str(e)[:140]})")
+            err = str(e)[:400]
+            verification_errors.append({"attempt": attempts, "stage": stage,
+                                        "strategy": label, "error": err})
+            metrics["verification_errors"] += 1
+            note(f"attempt {attempts} [{stage}/{label}]: verify error → refine ({err[:140]})")
             continue
 
         intent_cls = None
@@ -264,28 +381,150 @@ def main(argv=None):
         except Exception:
             intent_cls = None
 
+        # A fuzz path is first reduced cheaply in the search EVM.  Recheck
+        # deletion variants with the selected final verifier as well, so the
+        # submitted source is 1-minimal under the actual scoring semantics.
+        if proven and stage == "fuzz":
+            discovery = profile.get("discovery") or {}
+            trace = discovery.get("trace") or {}
+            reproducer = trace.get("reproducer") or []
+            engine = _load_engine()
+            if reproducer and engine is not None and hasattr(engine, "_fuzz_codegen"):
+                current_calls = [(index, dict(call))
+                                 for index, call in enumerate(reproducer)]
+                original_count = len(current_calls)
+                removed = []
+                minimization_errors = []
+                index = 0
+                while len(current_calls) > 1 and index < len(current_calls):
+                    if time.time() - started >= args.timeout:
+                        minimization_errors.append("timeout before deletion replay completed")
+                        break
+                    trial_calls = current_calls[:index] + current_calls[index + 1:]
+                    codegen_calls = [{
+                        "name": call.get("function", "raw"),
+                        "signature": call.get("function", "raw"),
+                        "args": call.get("arguments") or [],
+                        "value": int(call.get("value_wei") or 0),
+                        "encoded_data": call.get("calldata") or "0x",
+                        "address_patches": call.get("address_patches") or [],
+                    } for _, call in trial_calls]
+                    trial_source = engine._fuzz_codegen(codegen_calls, {})
+                    try:
+                        remaining_timeout = max(
+                            1, args.timeout - int(time.time() - started))
+                        trial_result = verify_full(
+                            target_name=target_name,
+                            target_src=contract_src,
+                            invariants_src=invariants_src,
+                            exploit_src=trial_source,
+                            manifest=manifest,
+                            seed=args.seed,
+                            extra_sources=extra_sources or None,
+                            timeout_sec=remaining_timeout,
+                        )
+                        metrics["minimization_verifications"] += 1
+                    except Exception as exc:
+                        minimization_errors.append(str(exc)[:240])
+                        break
+                    if (trial_result.proven
+                            and trial_result.violated == first_violated):
+                        removed.append(current_calls[index][1].get(
+                            "function", "raw"))
+                        current_calls = trial_calls
+                        source = trial_source
+                        result = trial_result
+                        detail = trial_result.detail
+                        index = 0
+                        continue
+                    index += 1
+
+                final_reproducer = [call for _, call in current_calls]
+                kept_indices = {original for original, _ in current_calls}
+                final_events = []
+                for event in trace.get("calls") or []:
+                    if event.get("index") in kept_indices:
+                        event = dict(event)
+                        event["index"] = len(final_events)
+                        final_events.append(event)
+                official_minimization = {
+                    "algorithm": "final-verifier-call-deletion",
+                    "original_calls": original_count,
+                    "final_calls": len(current_calls),
+                    "removed": removed,
+                    "replay_verifications": metrics["minimization_verifications"],
+                    "one_minimal": (
+                        len(current_calls) <= 1
+                        or (not minimization_errors and index >= len(current_calls))
+                    ),
+                }
+                if minimization_errors:
+                    official_minimization["errors"] = minimization_errors
+                trace["official_minimization"] = official_minimization
+                trace["reproducer"] = final_reproducer
+                trace["calls"] = final_events
+                trace["sequence"] = json.dumps(
+                    [{
+                        "function": call.get("function", "raw"),
+                        "arguments": call.get("arguments") or [],
+                        "value_wei": call.get("value_wei", "0"),
+                    } for call in final_reproducer],
+                    ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                )
+                label = "fuzz(" + " → ".join(
+                    call.get("function", "raw").split("(", 1)[0]
+                    for call in final_reproducer) + ")"
+
         if proven:
             note(f"attempt {attempts} [{stage}/{label}]: PROVEN — invariant violated: {first_violated}")
+            discovery = profile.get("discovery") or {}
+            trace = discovery.get("trace") or {}
+            if trace:
+                route = " → ".join(
+                    call.get("function", "raw")
+                    for call in trace.get("reproducer", []))
+                if route:
+                    note(f"# proven call trace: {route}")
+                minimized = (trace.get("official_minimization")
+                             or trace.get("minimization") or {})
+                if minimized:
+                    note(
+                        "# minimization "
+                        f"calls={minimized.get('original_calls')}→{minimized.get('final_calls')} "
+                        f"one_minimal={minimized.get('one_minimal')}"
+                    )
             if getattr(result, "profit", None) is not None:
                 note(f"# profit {result.profit.classification} extractable_wei={result.profit.extractable_wei}")
             write_exploit(out_dir, source)
+            candidate_summary = {
+                key: value for key, value in profile.items()
+                if key != "discovery"
+            }
             payload = {
                 "proven": True, "target": target_name, "stage": stage, "strategy": label,
                 "invariant_violated": first_violated,
-                "how": _explain(label, first_violated),
+                "how": _explain(label, first_violated, profile),
+                "derivation": _describe_derivation(stage, label, profile),
+                "verification_detail": detail,
                 "attempts": attempts, "stages": stages_seen,
                 "seed": args.seed, "elapsed_s": round(time.time() - started, 2),
+                "candidate": candidate_summary,
+                "metrics": metrics_snapshot(),
             }
+            if discovery:
+                payload["exploit_trace"] = discovery
             if getattr(result, "profit", None) is not None:
                 payload["profit"] = result.profit.as_dict()
             if intent_cls:
                 payload["classification"] = intent_cls
             _write_result(out_dir, payload)
+            note_metrics()
             write_log(out_dir, log)
             print(f"PROVEN target={target_name} strategy={label} violated={first_violated}")
             return EXIT_FOUND
         # ② 실패 → 피드백 기록(어느 불변식이 유지됐는지) 후 다음 후보/단계로 반복
         held_invariants[label] = detail
+        metrics["rejected"] += 1
         note(f"attempt {attempts} [{stage}/{label}]: NOT PROVEN — invariants held ({detail}); "
              f"→ escalate search/generation")
         if Critique is not None:
@@ -295,7 +534,8 @@ def main(argv=None):
                 features=sorted(feats)[:24],
             ))
         # PoCo/A1: 실패를 LLM 재시도의 탐색 신호로 (키가 있을 때만, 1회)
-        if (not critique_llm_done and format_for_llm is not None and critiques
+        if (_llm_enabled() and not critique_llm_done
+                and format_for_llm is not None and critiques
                 and (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("LLM_API_KEY")
                      or os.environ.get("LLM_BASE_URL"))):
             critique_llm_done = True
@@ -313,11 +553,16 @@ def main(argv=None):
                     if attempts < args.max_attempts:
                         attempts += 1
                         last_source = draft
+                        remaining_timeout = max(
+                            1, args.timeout - int(time.time() - started))
                         proven2, fv2, d2 = verify_candidate(
                             target_name=target_name, target_src=contract_src,
                             invariants_src=invariants_src, exploit_src=draft,
                             manifest=manifest, seed=args.seed,
-                            extra_sources=extra_sources or None)
+                            extra_sources=extra_sources or None,
+                            timeout_sec=remaining_timeout)
+                        metrics["generated"] += 1
+                        metrics["verified"] += 1
                         if proven2:
                             note(f"attempt {attempts} [llm/critique]: PROVEN — {fv2}")
                             write_exploit(out_dir, draft)
@@ -325,33 +570,106 @@ def main(argv=None):
                                 "proven": True, "target": target_name, "stage": "llm",
                                 "strategy": "llm-critique", "invariant_violated": fv2,
                                 "how": _explain("llm-critique", fv2),
+                                "verification_detail": d2,
                                 "attempts": attempts, "stages": stages_seen + ["llm"],
                                 "seed": args.seed,
                                 "elapsed_s": round(time.time() - started, 2),
                                 "critiques": [c.as_dict() for c in critiques],
+                                "metrics": metrics_snapshot(),
                             })
+                            note_metrics()
                             write_log(out_dir, log)
                             print(f"PROVEN target={target_name} strategy=llm-critique violated={fv2}")
                             return EXIT_FOUND
                         held_invariants["llm-critique"] = d2
+                        metrics["rejected"] += 1
                         note(f"attempt {attempts} [llm/critique]: NOT PROVEN ({d2})")
             except Exception as e:
                 note(f"# critique LLM retry skipped: {str(e)[:120]}")
 
+    # No attack candidate is a valid outcome for a healthy target.  Run one
+    # explicit no-op candidate so Setup, deployment, the initial invariant and
+    # the Forge result channel are still exercised before reporting exit 1.
+    if (attempts == 0 and args.max_attempts > 0
+            and time.time() - started <= args.timeout):
+        baseline = _fallback_stub()
+        profile = candidate_profile(
+            "baseline", "verifier-health", findings, invariant_deps, feats)
+        attempts = 1
+        metrics["generated"] += 1
+        last_source = baseline
+        stages_seen.append("baseline")
+        note("# --- stage escalation: baseline ---")
+        note(
+            f"# candidate [baseline/verifier-health] confidence={profile['confidence']:.3f} "
+            f"cost={profile['cost']} overlap={','.join(profile['invariant_overlap']) or '-'}"
+        )
+        try:
+            remaining_timeout = max(1, args.timeout - int(time.time() - started))
+            result = verify_full(
+                target_name=target_name,
+                target_src=contract_src,
+                invariants_src=invariants_src,
+                exploit_src=baseline,
+                manifest=manifest,
+                seed=args.seed,
+                extra_sources=extra_sources or None,
+                timeout_sec=remaining_timeout,
+            )
+            proven, first_violated, detail = result.tuple()
+            metrics["verified"] += 1
+            if proven:
+                verification_errors.append({
+                    "attempt": attempts, "stage": "baseline",
+                    "strategy": "verifier-health",
+                    "error": f"no-op unexpectedly violated {first_violated}",
+                })
+                verifier_ok = False
+                note(f"attempt {attempts} [baseline/verifier-health]: unexpected invariant violation: {first_violated}")
+            else:
+                verified_attempts = 1
+                metrics["rejected"] += 1
+                held_invariants["verifier-health"] = detail
+                note(f"attempt {attempts} [baseline/verifier-health]: NOT PROVEN — verifier healthy ({detail})")
+        except VerifyUnavailable as e:
+            verifier_ok = False
+            note(f"attempt {attempts} [baseline/verifier-health]: verifier unavailable ({e})")
+        except Exception as e:
+            verifier_ok = False
+            verification_errors.append({
+                "attempt": attempts, "stage": "baseline",
+                "strategy": "verifier-health", "error": str(e)[:400],
+            })
+            metrics["verification_errors"] += 1
+            note(f"attempt {attempts} [baseline/verifier-health]: verify error ({str(e)[:140]})")
+
     # ── 예산 내 미발견 ────────────────────────────────────────────────────────
     write_exploit(out_dir, last_source)
+    if verified_attempts == 0:
+        verifier_ok = False
+        note("# no candidate completed verification; refusing to report NOT_PROVEN")
+    search_ok = not search_errors
+    if not search_ok:
+        note("# search incomplete due to internal errors; refusing to report NOT_PROVEN")
+    note_metrics()
     _write_result(out_dir, {
         "proven": False, "target": target_name,
         "attempts": attempts, "stages": stages_seen,
         "verifier_available": verifier_ok,
+        "search_available": search_ok,
+        "verified_attempts": verified_attempts,
+        "verification_errors": verification_errors,
+        "search_errors": search_errors,
+        "metrics": metrics_snapshot(),
         "feedback": held_invariants,
         "critiques": [c.as_dict() for c in critiques] if critiques else [],
         "features": sorted(feats),
         "seed": args.seed, "elapsed_s": round(time.time() - started, 2),
     })
     write_log(out_dir, log)
-    if not verifier_ok:
-        print(f"INCONCLUSIVE target={target_name} (verifier unavailable)")
+    if not verifier_ok or not search_ok:
+        reason = "verifier unavailable" if not verifier_ok else "search incomplete"
+        print(f"INCONCLUSIVE target={target_name} ({reason})")
         return EXIT_ERROR
     print(f"NOT_PROVEN target={target_name} within budget")
     return EXIT_NOT_FOUND
@@ -363,8 +681,33 @@ def _write_result(out_dir, obj):
         json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _explain(label, first_violated):
+def _explain(label, first_violated, profile=None):
     """어느 불변식을 '어떻게' 위반했는지에 대한 사람용 설명(출력 규약)."""
+    discovery = (profile or {}).get("discovery") or {}
+    trace = discovery.get("trace") or {}
+    reproducer = trace.get("reproducer") or []
+    if reproducer:
+        route = " → ".join(call.get("function", "raw") for call in reproducer)
+        outcomes = trace.get("calls") or []
+        succeeded = sum(1 for call in outcomes if call.get("success"))
+        minimization = (trace.get("official_minimization")
+                        or trace.get("minimization") or {})
+        minimal = ""
+        if minimization:
+            original = minimization.get("original_calls", len(reproducer))
+            final = minimization.get("final_calls", len(reproducer))
+            if final < original:
+                minimal = f" 호출 삭제 재검증으로 {original}개에서 {final}개로 축약한 뒤"
+            elif final == 1:
+                minimal = " 단일 호출 경로로 더 줄일 수 없음을 확인한 뒤"
+            elif minimization.get("one_minimal"):
+                minimal = f" 각 호출의 삭제를 재검증해 {final}개 호출이 모두 필요함을 확인한 뒤"
+        return (
+            f"현재 타깃 ABI에서 탐색한 호출 경로 '{route}'를 실행했고,"
+            f" {len(outcomes)}개 호출 중 {succeeded}개가 성공했다.{minimal} "
+            f"실행 전 checkAll=true에서 실행 후 checkAll=false로 바뀌어 "
+            f"불변식 '{first_violated}' 위반을 재현함."
+        )
     base = (label or "").split(":")[0].split(" ")[0]
     how = {
         "reentrancy": "외부 호출 뒤 상태 갱신(CEI 위반)을 재진입으로 악용해",
@@ -383,8 +726,41 @@ def _explain(label, first_violated):
         "storage": "private 슬롯 값을 스토리지에서 읽어",
         "king-dos": "revert 하는 receive 로 특권 역할을 영구 락(그리핑 DoS)해",
         "callback-inconsistency": "외부 콜백을 false→true 로 조작해",
-    }.get(base, "생성된 PoC 실행으로")
-    return f"{how} 불변식 '{first_violated}' 을(를) 위반함."
+    }.get(base, f"전략 '{label or 'generated'}'의 PoC 호출 경로를 실행해")
+    return f"{how} 불변식 '{first_violated}' 위반을 재현함."
+
+
+def _describe_derivation(stage, label, profile=None):
+    """Explain why this candidate came from the current input, not a target id."""
+    profile = profile or {}
+    discovery = profile.get("discovery") or {}
+    trace = discovery.get("trace") or {}
+    if trace.get("reproducer"):
+        functions = [call.get("function", "raw")
+                     for call in trace["reproducer"]]
+        return {
+            "method": "input-derived ABI sequence search",
+            "target_name_dispatch": False,
+            "source_evidence": [
+                item for item in (profile.get("evidence") or [])
+                if not str(item).startswith("no_")
+            ],
+            "invariant_overlap": profile.get("invariant_overlap") or [],
+            "call_path": functions,
+            "round": discovery.get("round"),
+            "depth": discovery.get("depth"),
+            "minimization": (trace.get("official_minimization")
+                             or trace.get("minimization") or {}),
+        }
+    return {
+        "method": "source capability hypothesis",
+        "target_name_dispatch": False,
+        "stage": stage,
+        "strategy": label,
+        "source_evidence": profile.get("evidence") or [],
+        "estimated_effect": profile.get("estimated_effect") or [],
+        "invariant_overlap": profile.get("invariant_overlap") or [],
+    }
 
 
 def _fallback_stub():

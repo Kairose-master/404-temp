@@ -11,7 +11,7 @@ ROOT = Path(__file__).resolve().parents[2]
 class CompilerEnvironment(unittest.TestCase):
     def check_import(self, overrides, expected):
         env = os.environ.copy()
-        for key in ("VERCEL", "SOLCX_BINARY_PATH"):
+        for key in ("VERCEL", "AWS_LAMBDA_FUNCTION_NAME", "SOLCX_BINARY_PATH"):
             env.pop(key, None)
         env.update(overrides)
         result = subprocess.run(
@@ -26,6 +26,7 @@ class CompilerEnvironment(unittest.TestCase):
 
     def test_serverless_uses_writable_cache(self):
         self.check_import({"VERCEL": "1"}, "/tmp/solcx-bin")
+        self.check_import({"AWS_LAMBDA_FUNCTION_NAME": "trust404"}, "/tmp/solcx-bin")
 
     def test_explicit_cache_is_preserved(self):
         for runtime in ("0", "1"):

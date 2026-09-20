@@ -94,15 +94,109 @@ def _contract_bodies(src):
     return out
 
 
+_PRIVILEGED_NAME = (
+    r"(?:owner|admin|administrator|governor|governance|guardian|operator|"
+    r"manager|controller|authority|authorized|maintainer|upgrader|role|"
+    r"minter|pauser|proposer|executor|keeper)"
+)
+_PRIVILEGED_WRITE = re.compile(
+    rf"\b({_PRIVILEGED_NAME})\b\s*=", re.I
+)
+_INIT_NAME = re.compile(r"^(?:initialize|init|initializer|__init)\w*$", re.I)
+
+
+def _has_privilege_guard(fn, src):
+    """Recognize common owner/admin/role gates on an externally callable path."""
+    head = fn.get("head", "")
+    body = fn.get("body", "")
+    if re.search(
+        r"\b(?:only(?:owner|admin|administrator|governor|governance|guardian|"
+        r"operator|manager|controller|authority|authorized|maintainer|upgrader|"
+        r"role|minter|pauser|proposer|executor|keeper)\w*|auth(?:orized)?|"
+        r"requiresAuth)\b",
+        head, re.I,
+    ):
+        return True
+    privileged = _PRIVILEGED_NAME
+    if re.search(rf"require\s*\(\s*msg\.sender\s*==\s*\w*{privileged}\w*\b", body, re.I):
+        return True
+    if re.search(rf"require\s*\(\s*\w*{privileged}\w*\s*==\s*msg\.sender\b", body, re.I):
+        return True
+    if re.search(rf"if\s*\(\s*msg\.sender\s*!=\s*\w*{privileged}\w*\s*\)\s*revert", body, re.I):
+        return True
+    if re.search(r"(?:hasRole|_checkRole)\s*\([^;{}]*msg\.sender", body):
+        return True
+    if re.search(r"(?:authorized|isAdmin|isOwner|operators?)\s*\[\s*msg\.sender\s*\]", body, re.I):
+        return True
+    return False
+
+
 def _has_owner_guard(fn, src):
-    b = fn["body"]
-    if re.search(r"only\w*[Oo]wner", fn["head"]):
+    """Backward-compatible name used by the older API surface."""
+    return _has_privilege_guard(fn, src)
+
+
+def _has_reentrancy_guard(fn):
+    head = fn.get("head", "")
+    body = fn.get("body", "")
+    if re.search(r"\bnonReentrant\b|\breentrancyGuard\b", head, re.I):
         return True
-    if re.search(r"require\s*\(\s*msg\.sender\s*==\s*owner", b):
-        return True
-    if re.search(r"only\w+", fn["head"]) and "owner" in src.lower():
-        # custom modifier referencing owner elsewhere
-        return True
+    return bool(
+        re.search(r"require\s*\(\s*!?\s*\w*(?:lock|entered|status)\w*", body, re.I)
+        and re.search(r"\b\w*(?:lock|entered|status)\w*\s*=", body, re.I)
+    )
+
+
+def _reentrancy_vulnerable(fn, src=""):
+    """Return true for a concrete caller-ledger CEI violation.
+
+    A payout alone is not reentrancy evidence. The function must pay the
+    caller, read that caller's ledger before the call, and clear/decrement the
+    same ledger only after the call, without a mutex on the entry point.
+    """
+    if not fn.get("external") or _has_reentrancy_guard(fn):
+        return False
+    body = fn.get("body", "")
+    call = re.search(
+        r"(?:payable\s*\(\s*)?msg\.sender(?:\s*\))?\s*\.\s*call\s*"
+        r"\{\s*value\s*:",
+        body,
+    )
+    if not call:
+        return False
+    before, after = body[:call.start()], body[call.end():]
+    ledgers = set(re.findall(r"\b(\w+)\s*\[\s*msg\.sender\s*\]", before))
+    for ledger in ledgers:
+        slot = rf"\b{re.escape(ledger)}\s*\[\s*msg\.sender\s*\]"
+        effect = rf"(?:{slot}\s*(?:=\s*0|-=)|delete\s+{slot})"
+        if not re.search(effect, before) and re.search(effect, after):
+            return True
+    return False
+
+
+def _attacker_controlled_value_call(fn):
+    """Identify an unguarded administrative drain, not an ordinary payout."""
+    body = fn.get("body", "")
+    address_args = {name for typ, name in fn.get("args", []) if typ == "address" and name}
+    uint_args = {name for typ, name in fn.get("args", []) if typ.startswith("uint") and name}
+    privileged_name = bool(re.search(
+        r"(?:admin|emergency|sweep|rescue|recover|drain|withdrawAll)",
+        fn.get("name", ""), re.I,
+    ))
+    for call in re.finditer(
+        r"(?P<receiver>(?:payable\s*\([^)]*\)|[A-Za-z_]\w*|msg\.sender))\s*"
+        r"\.\s*call\s*\{\s*value\s*:\s*(?P<value>[^}]+)\}",
+        body,
+    ):
+        receiver, value = call.group("receiver"), call.group("value")
+        receiver_controlled = any(re.search(rf"\b{re.escape(arg)}\b", receiver)
+                                  for arg in address_args)
+        amount_controlled = any(re.search(rf"\b{re.escape(arg)}\b", value)
+                                for arg in uint_args)
+        full_balance = bool(re.search(
+            r"(?:address\s*\(\s*this\s*\)|this)\s*\.\s*balance", value))
+        if (receiver_controlled and amount_controlled) or full_balance or privileged_name:
+            return True
     return False
 
 
@@ -116,29 +210,12 @@ def scan_target(contract_src, invariants_src, manifest):
     sig = {"functions": fns}
 
     # ── Reentrancy ────────────────────────────────────────────────────────────
-    # A function that sends value to the caller and does NOT clear the caller's
-    # ledger entry BEFORE the external call is a CEI violation — whether the
-    # zeroing happens after the call (classic) or in a separate function called
-    # afterwards (cross-function reentrancy). Any ledger name is accepted, not
-    # just `balance*`. A reentrancy mutex removes the score.
-    has_mutex = bool(re.search(r"nonReentrant|locked\s*==\s*1|_status", src))
-    # match a caller-ledger clear like `credit[msg.sender] = 0` or `... -=`
-    _clear = r"\w+\[\s*msg\.sender\s*\]\s*(=\s*0|-=)"
+    # Require a concrete caller-ledger CEI violation. Lottery payouts and
+    # guarded/CEI-compliant withdrawals are not attack candidates.
     for fn in fns:
-        b = fn["body"]
-        call_m = re.search(r"\.call\s*\{\s*value\s*:", b)
-        if not call_m:
-            continue
-        pays_sender = bool(re.search(r"call\s*\{\s*value\s*:\s*\w+\s*\}\s*\(\s*\"\"\s*\)", b)) or "msg.sender.call" in b
-        if not pays_sender:
-            continue
-        before = b[:call_m.start()]
-        cleared_before = re.search(_clear, before)
-        if not cleared_before:                 # CEI violated (classic or cross-function)
+        if _reentrancy_vulnerable(fn, src):
             scores[FAM_REENTRANCY] += 5
             sig.setdefault("reentrancy_withdraw", fn)
-    if has_mutex:
-        scores[FAM_REENTRANCY] -= 4  # guarded → likely safe
     # a payable deposit that credits msg.sender (any ledger name) — needed for the PoC
     for fn in fns:
         if fn["payable"] and re.search(r"\w+\[\s*msg\.sender\s*\]\s*\+=\s*msg\.value", fn["body"]):
@@ -149,17 +226,13 @@ def scan_target(contract_src, invariants_src, manifest):
         if not fn["external"]:
             continue
         b = fn["body"]
-        moves_value = re.search(r"\.call\s*\{\s*value\s*:", b)
-        sets_owner = re.search(r"\bowner\s*=", b)
-        if (moves_value or sets_owner) and not _has_owner_guard(fn, src):
-            # ignore the normal user withdraw that checks its own balance
-            checks_self_balance = re.search(r"balance[sf]?\w*\[\s*msg\.sender\s*\]", b)
-            if moves_value and checks_self_balance and not sets_owner:
-                continue
+        sets_privilege = bool(_PRIVILEGED_WRITE.search(b)) and not _INIT_NAME.match(fn["name"])
+        moves_value = _attacker_controlled_value_call(fn)
+        if (moves_value or sets_privilege) and not _has_privilege_guard(fn, src):
             scores[FAM_ACCESS] += 5
             if moves_value:
                 sig["access_drain"] = fn
-            if sets_owner:
+            if sets_privilege:
                 sig["access_setowner"] = fn
 
     # ── Integer underflow ─────────────────────────────────────────────────────
@@ -236,13 +309,12 @@ def scan_target(contract_src, invariants_src, manifest):
     # An initializer that sets owner/admin with neither an `initialized` guard
     # nor access control lets the first caller seize the contract. A guarded
     # initializer (require(!initialized) / initializer modifier) is safe.
-    init_name = re.compile(r"^(initialize|init|initializer|__init)\w*$", re.I)
     for fn in fns:
         if not fn["external"]:
             continue
         b = fn["body"]
         head = fn["head"]
-        looks_init = bool(init_name.match(fn["name"]))
+        looks_init = bool(_INIT_NAME.match(fn["name"]))
         sets_privilege_to_sender = bool(
             re.search(r"\b(owner|admin)\b\s*=\s*msg\.sender", b))
         sets_privilege_to_param = bool(

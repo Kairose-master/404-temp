@@ -97,23 +97,39 @@ class ForgeInvocation(unittest.TestCase):
         result, _ = self.invoke('emit ProofResult(false, "")')
         self.assertFalse(result[0])
 
-    def test_reverted_proof_event_cannot_be_accepted(self):
-        result, _ = self.invoke('emit ProofResult(true, "forged")\nFailing tests:', code=1)
-        self.assertFalse(result[0])
-        self.assertEqual(result[1], "")
+    def test_failed_forge_process_is_inconclusive_not_negative(self):
+        with self.assertRaisesRegex(verify.VerifyUnavailable, "infrastructure failed"):
+            self.invoke('emit ProofResult(true, "forged")\nFailing tests:', code=1)
 
     def test_success_without_proof_result_is_an_error_not_a_negative(self):
         with self.assertRaisesRegex(RuntimeError, "without ProofResult"):
             self.invoke("1 test passed")
 
     def test_compiler_failure_is_an_environment_error(self):
-        with self.assertRaisesRegex(RuntimeError, "infrastructure failed"):
+        with self.assertRaisesRegex(verify.VerifyUnavailable, "infrastructure failed"):
             self.invoke("Compiler run failed: solc not found", code=1)
+
+    def test_generated_exploit_compile_failure_rejects_only_candidate(self):
+        with self.assertRaisesRegex(RuntimeError, "candidate Exploit compilation failed"):
+            self.invoke(
+                "Compiler run failed:\nError: undeclared identifier "
+                "--> src/Exploit.sol:4:9", code=1)
+
+    def test_failed_setup_process_is_setup_error(self):
+        manifest = {"target": {"solc": "0.8.24"},
+                    "deploy": {"setup": "Setup.s.sol"}}
+        with patch("subprocess.run", return_value=CompletedProcess(
+                [], 1, "Failing tests: SETUP_REVERT_SENTINEL", "")):
+            with self.assertRaisesRegex(verify.SetupDeploymentError,
+                                        "declared Setup/initial state"):
+                verify._verify_forge("Target", "// target", "// inv", "// exploit",
+                                     manifest)
 
     def test_timeout_is_an_error(self):
         with patch("subprocess.run", side_effect=TimeoutExpired("forge", 180)):
-            with self.assertRaisesRegex(RuntimeError, "timed out"):
-                verify._verify_forge("Target", "", "", "", {"target": {}})
+            with self.assertRaisesRegex(verify.VerifyUnavailable, "timed out after 7s"):
+                verify._verify_forge("Target", "", "", "", {"target": {}},
+                                     timeout_sec=7)
 
 
 if __name__ == "__main__":

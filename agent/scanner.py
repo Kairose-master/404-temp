@@ -19,7 +19,9 @@ from trust404.scan import (  # noqa: F401
     _contract_bodies,
     _extract_block,
     _functions,
+    _has_privilege_guard,
     _has_owner_guard,
+    _reentrancy_vulnerable,
     _strip_comments,
     scan_target,
 )

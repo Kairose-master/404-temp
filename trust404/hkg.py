@@ -207,15 +207,17 @@ def should_run_hkg(fn_name: str, features: Optional[Set[str]]) -> bool:
     """
     if features is None:
         return True
-    from .registry import _BY_FN
+    from .registry import _BY_FN, should_run
     spec = _BY_FN.get(fn_name)
     if spec is None:
         return True
+    if not should_run(fn_name, features):
+        return False
     m = lift(features)
     if fn_name in m.ranked_primitives:
         return True
-    # fall back to flat OR so we don't regress Ethernaut 32
-    return bool(spec.needs & features)
+    # Fall back to the provider's precise any/all/none capability gate.
+    return True
 
 
 def order_by_hkg(fn_names: Sequence[str], features: Optional[Set[str]]) -> List[str]:

@@ -12,6 +12,7 @@ interface Vm {
     function warp(uint256) external;
     function deal(address, uint256) external;
     function deployCode(string calldata) external returns (address);
+    function deployCode(string calldata, uint256) external returns (address);
     function parseJsonString(string calldata, string calldata) external returns (string memory);
     function parseJsonUint(string calldata, string calldata) external returns (uint256);
     function keyExistsJson(string calldata, string calldata) external returns (bool);
