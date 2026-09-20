@@ -34,7 +34,7 @@ import time
 from pathlib import Path
 
 from scanner import scan_target
-from strategies import STRATEGY_ORDER, build_exploit, seeded_order
+from strategies import STRATEGY_ORDER, build_exploit
 from verify import verify_candidate, verify_full, VerifyUnavailable
 
 try:
@@ -164,13 +164,19 @@ def main(argv=None):
 
     # ── 정적 분석 → 후보 유형 스코어링 ────────────────────────────────────────
     findings = scan_target(analysis_src, invariants_src, manifest)
-    scored = sorted(
-        STRATEGY_ORDER,
-        key=lambda fam: (-findings["scores"].get(fam, 0), fam),
+    from trust404.candidates import (
+        candidate_fingerprint,
+        candidate_profile,
+        invariant_dependencies,
+        rank_template_families,
+        schedule_candidates,
     )
-    scored = seeded_order(scored, findings["scores"], args.seed)
+    invariant_deps = invariant_dependencies(invariants_src)
+    scored = rank_template_families(
+        STRATEGY_ORDER, findings, invariant_deps, args.seed)
     note(f"# scan scores: " + ", ".join(f"{k}={findings['scores'].get(k,0)}" for k in STRATEGY_ORDER))
     note(f"# strategy order: {scored}")
+    note("# invariant dependencies: " + ",".join(sorted(invariant_deps)))
     feats = set()
     if extract_features is not None:
         try:
@@ -194,12 +200,46 @@ def main(argv=None):
     #   1) template — 계열별 결정론 템플릿(정적 스코어 순)
     #   2) synth    — 재진입/AMM/플래시론/스토리지/프록시/다중블록/스토리지충돌/DoS/콜백 합성
     #   3) fuzz     — 범용 호출 시퀀스 탐색(미공개 타깃 일반화 축)
+    metrics = {
+        "generated": 0,
+        "deduplicated": 0,
+        "deferred": 0,
+        "verified": 0,
+        "rejected": 0,
+        "verification_errors": 0,
+        "provider_skipped": 0,
+        "provider_errored": 0,
+        "fuzz_executions": 0,
+    }
+    search_errors = []
+
+    def metrics_snapshot():
+        return {key: int(metrics[key]) for key in sorted(metrics)}
+
+    def note_metrics():
+        snapshot = metrics_snapshot()
+        note("# metrics " + " ".join(f"{key}={snapshot[key]}" for key in snapshot))
+
     def candidate_stream():
-        try:
-            from trust404.candidates import candidate_fingerprint
-        except Exception:
-            candidate_fingerprint = lambda src: src
         seen_candidates = set()
+
+        def register(stage, label, source):
+            metrics["generated"] += 1
+            fp = candidate_fingerprint(source)
+            if fp in seen_candidates:
+                metrics["deduplicated"] += 1
+                note(f"# duplicate candidate skipped [{stage}/{label}]")
+                return None
+            seen_candidates.add(fp)
+            profile = candidate_profile(
+                stage, label, findings, invariant_deps, feats)
+            note(
+                f"# candidate [{stage}/{label}] confidence={profile['confidence']:.3f} "
+                f"cost={profile['cost']} overlap={','.join(profile['invariant_overlap']) or '-'} "
+                f"evidence={','.join(profile['evidence']) or '-'}"
+            )
+            return stage, label, source, profile
+
         # 0) LLM (명시적 opt-in + 로컬 LLM_BASE_URL 또는 API 키가 있을 때만)
         llm_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("LLM_API_KEY")
         llm_base = os.environ.get("LLM_BASE_URL")
@@ -209,10 +249,9 @@ def main(argv=None):
                 draft = propose_exploit(analysis_src, invariants_src, findings, llm_key)
                 if draft:
                     note(f"# LLM draft obtained ({'local:'+llm_base if llm_base else 'anthropic'})")
-                    fp = candidate_fingerprint(draft)
-                    if fp not in seen_candidates:
-                        seen_candidates.add(fp)
-                        yield ("llm", "llm", draft)
+                    item = register("llm", "llm", draft)
+                    if item:
+                        yield item
             except Exception as e:  # network blocked / parse fail → degrade
                 note(f"# LLM unavailable, degrading to heuristics: {str(e)[:120]}")
         elif _llm_enabled():
@@ -223,13 +262,19 @@ def main(argv=None):
         # view first.  This catches inherited attack surfaces even when deeper
         # engine stages cannot execute a multi-source target internally.
         for fam in scored:
-            src = build_exploit(fam, findings)
+            try:
+                src = build_exploit(fam, findings)
+            except Exception as e:
+                metrics["provider_errored"] += 1
+                search_errors.append({
+                    "stage": "template", "provider": fam,
+                    "error": str(e)[:300],
+                })
+                continue
             if src:
-                fp = candidate_fingerprint(src)
-                if fp in seen_candidates:
-                    continue
-                seen_candidates.add(fp)
-                yield ("template", fam, src)
+                item = register("template", fam, src)
+                if item:
+                    yield item
 
         # 1~3) 엔진(api/prove.py)의 단계별 생성기
         engine = _load_engine()
@@ -240,16 +285,24 @@ def main(argv=None):
                         target_name, contract_src, invariants_src, manifest,
                         do_verify=True, analysis_src=analysis_src,
                         seed=args.seed, deadline=started + args.timeout,
-                        include_templates=False, world_src=world_src):
-                    fp = candidate_fingerprint(src)
-                    if fp in seen_candidates:
-                        note(f"# duplicate candidate skipped [{stage}/{label}]")
-                        continue
-                    seen_candidates.add(fp)
-                    yield (stage, label, src)
+                        include_templates=False, world_src=world_src,
+                        metrics=metrics, search_errors=search_errors):
+                    item = register(stage, label, src)
+                    if item:
+                        yield item
             except Exception as e:
+                metrics["provider_errored"] += 1
+                search_errors.append({
+                    "stage": "engine", "provider": "candidate-stream",
+                    "error": str(e)[:300],
+                })
                 note(f"# engine candidate stream error: {str(e)[:140]}")
         else:
+            metrics["provider_errored"] += 1
+            search_errors.append({
+                "stage": "engine", "provider": "loader",
+                "error": "engine unavailable",
+            })
             note("# engine unavailable; local template stage only")
             return
 
@@ -264,7 +317,8 @@ def main(argv=None):
     held_invariants = {}  # 실패한 시도에서 '유지된' 불변식 관찰(피드백)
     critiques = []
     critique_llm_done = False
-    for stage, label, source in candidate_stream():
+    for stage, label, source, profile in schedule_candidates(
+            candidate_stream(), args.max_attempts, metrics):
         if attempts >= args.max_attempts:
             note(f"# budget exhausted after {attempts} attempts (max={args.max_attempts})")
             break
@@ -291,6 +345,7 @@ def main(argv=None):
             )
             proven, first_violated, detail = result.tuple()
             verified_attempts += 1
+            metrics["verified"] += 1
         except VerifyUnavailable as e:
             verifier_ok = False
             note(f"attempt {attempts} [{stage}/{label}]: verifier unavailable ({e}); emitting best candidate")
@@ -299,6 +354,7 @@ def main(argv=None):
             err = str(e)[:400]
             verification_errors.append({"attempt": attempts, "stage": stage,
                                         "strategy": label, "error": err})
+            metrics["verification_errors"] += 1
             note(f"attempt {attempts} [{stage}/{label}]: verify error → refine ({err[:140]})")
             continue
 
@@ -327,17 +383,21 @@ def main(argv=None):
                 "verification_detail": detail,
                 "attempts": attempts, "stages": stages_seen,
                 "seed": args.seed, "elapsed_s": round(time.time() - started, 2),
+                "candidate": profile,
+                "metrics": metrics_snapshot(),
             }
             if getattr(result, "profit", None) is not None:
                 payload["profit"] = result.profit.as_dict()
             if intent_cls:
                 payload["classification"] = intent_cls
             _write_result(out_dir, payload)
+            note_metrics()
             write_log(out_dir, log)
             print(f"PROVEN target={target_name} strategy={label} violated={first_violated}")
             return EXIT_FOUND
         # ② 실패 → 피드백 기록(어느 불변식이 유지됐는지) 후 다음 후보/단계로 반복
         held_invariants[label] = detail
+        metrics["rejected"] += 1
         note(f"attempt {attempts} [{stage}/{label}]: NOT PROVEN — invariants held ({detail}); "
              f"→ escalate search/generation")
         if Critique is not None:
@@ -374,6 +434,8 @@ def main(argv=None):
                             manifest=manifest, seed=args.seed,
                             extra_sources=extra_sources or None,
                             timeout_sec=remaining_timeout)
+                        metrics["generated"] += 1
+                        metrics["verified"] += 1
                         if proven2:
                             note(f"attempt {attempts} [llm/critique]: PROVEN — {fv2}")
                             write_exploit(out_dir, draft)
@@ -386,11 +448,14 @@ def main(argv=None):
                                 "seed": args.seed,
                                 "elapsed_s": round(time.time() - started, 2),
                                 "critiques": [c.as_dict() for c in critiques],
+                                "metrics": metrics_snapshot(),
                             })
+                            note_metrics()
                             write_log(out_dir, log)
                             print(f"PROVEN target={target_name} strategy=llm-critique violated={fv2}")
                             return EXIT_FOUND
                         held_invariants["llm-critique"] = d2
+                        metrics["rejected"] += 1
                         note(f"attempt {attempts} [llm/critique]: NOT PROVEN ({d2})")
             except Exception as e:
                 note(f"# critique LLM retry skipped: {str(e)[:120]}")
@@ -401,10 +466,17 @@ def main(argv=None):
     if (attempts == 0 and args.max_attempts > 0
             and time.time() - started <= args.timeout):
         baseline = _fallback_stub()
+        profile = candidate_profile(
+            "baseline", "verifier-health", findings, invariant_deps, feats)
         attempts = 1
+        metrics["generated"] += 1
         last_source = baseline
         stages_seen.append("baseline")
         note("# --- stage escalation: baseline ---")
+        note(
+            f"# candidate [baseline/verifier-health] confidence={profile['confidence']:.3f} "
+            f"cost={profile['cost']} overlap={','.join(profile['invariant_overlap']) or '-'}"
+        )
         try:
             remaining_timeout = max(1, args.timeout - int(time.time() - started))
             result = verify_full(
@@ -418,6 +490,7 @@ def main(argv=None):
                 timeout_sec=remaining_timeout,
             )
             proven, first_violated, detail = result.tuple()
+            metrics["verified"] += 1
             if proven:
                 verification_errors.append({
                     "attempt": attempts, "stage": "baseline",
@@ -428,6 +501,7 @@ def main(argv=None):
                 note(f"attempt {attempts} [baseline/verifier-health]: unexpected invariant violation: {first_violated}")
             else:
                 verified_attempts = 1
+                metrics["rejected"] += 1
                 held_invariants["verifier-health"] = detail
                 note(f"attempt {attempts} [baseline/verifier-health]: NOT PROVEN — verifier healthy ({detail})")
         except VerifyUnavailable as e:
@@ -439,6 +513,7 @@ def main(argv=None):
                 "attempt": attempts, "stage": "baseline",
                 "strategy": "verifier-health", "error": str(e)[:400],
             })
+            metrics["verification_errors"] += 1
             note(f"attempt {attempts} [baseline/verifier-health]: verify error ({str(e)[:140]})")
 
     # ── 예산 내 미발견 ────────────────────────────────────────────────────────
@@ -446,20 +521,28 @@ def main(argv=None):
     if verified_attempts == 0:
         verifier_ok = False
         note("# no candidate completed verification; refusing to report NOT_PROVEN")
+    search_ok = not search_errors
+    if not search_ok:
+        note("# search incomplete due to internal errors; refusing to report NOT_PROVEN")
+    note_metrics()
     _write_result(out_dir, {
         "proven": False, "target": target_name,
         "attempts": attempts, "stages": stages_seen,
         "verifier_available": verifier_ok,
+        "search_available": search_ok,
         "verified_attempts": verified_attempts,
         "verification_errors": verification_errors,
+        "search_errors": search_errors,
+        "metrics": metrics_snapshot(),
         "feedback": held_invariants,
         "critiques": [c.as_dict() for c in critiques] if critiques else [],
         "features": sorted(feats),
         "seed": args.seed, "elapsed_s": round(time.time() - started, 2),
     })
     write_log(out_dir, log)
-    if not verifier_ok:
-        print(f"INCONCLUSIVE target={target_name} (verifier unavailable)")
+    if not verifier_ok or not search_ok:
+        reason = "verifier unavailable" if not verifier_ok else "search incomplete"
+        print(f"INCONCLUSIVE target={target_name} ({reason})")
         return EXIT_ERROR
     print(f"NOT_PROVEN target={target_name} within budget")
     return EXIT_NOT_FOUND

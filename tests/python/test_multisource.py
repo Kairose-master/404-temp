@@ -146,6 +146,34 @@ class MultiSourceForge(unittest.TestCase):
 
 
 class VerificationAccounting(unittest.TestCase):
+    def test_search_exception_is_inconclusive_after_healthy_baseline(self):
+        spec = importlib.util.spec_from_file_location("search_error_agent", ROOT / "agent/agent.py")
+        cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli)
+
+        def broken_stream(*args, **kwargs):
+            raise RuntimeError("fuzz backend exploded")
+            yield  # pragma: no cover
+
+        engine = SimpleNamespace(iter_engine_candidates=broken_stream)
+        healthy = SimpleNamespace(tuple=lambda: (False, "", "forge"), profit=None)
+        target = ROOT / "targets/BoundedOwner"
+        with tempfile.TemporaryDirectory() as td, \
+                patch.object(cli, "_load_engine", return_value=engine), \
+                patch.object(cli, "verify_full", return_value=healthy), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = cli.main([
+                "--contract", str(target / "src/BoundedOwner.sol"),
+                "--invariants", str(target / "Invariants.sol"),
+                "--manifest", str(target / "manifest.json"),
+                "--out", td, "--max-attempts", "5", "--timeout", "30",
+            ])
+            payload = json.loads((Path(td) / "result.json").read_text())
+        self.assertEqual(cli.EXIT_ERROR, rc)
+        self.assertTrue(payload["verifier_available"])
+        self.assertFalse(payload["search_available"])
+        self.assertEqual("candidate-stream", payload["search_errors"][0]["provider"])
+
     def test_all_candidate_errors_are_inconclusive(self):
         spec = importlib.util.spec_from_file_location("error_agent", ROOT / "agent/agent.py")
         cli = importlib.util.module_from_spec(spec)
