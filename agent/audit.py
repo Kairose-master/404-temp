@@ -412,6 +412,7 @@ def build_report(findings, args, total_analyzed=None):
             "proven_vulnerabilities": len(proven),
             "heuristic_flags": len(heur),
             "clean": len(clean),
+            "analysis_errors": sum(1 for f in findings if f["res"].get("error")),
             "severity_counts": counts,
         },
         "findings": [],
@@ -611,7 +612,13 @@ def prepare_input(path):
         tmp = Path(tempfile.mkdtemp(prefix="t404-audit-"))
         root = tmp.resolve()
         with zipfile.ZipFile(p) as zf:
-            for member in zf.infolist():
+            members = zf.infolist()
+            total_size = sum(m.file_size for m in members)
+            if len(members) > 10_000 or total_size > 256 * 1024 * 1024:
+                raise SystemExit("error: zip exceeds extraction limits")
+            for member in members:
+                if member.file_size > 32 * 1024 * 1024:
+                    raise SystemExit(f"error: zip member too large: {member.filename}")
                 # zip-slip 방지: 목적지가 루트 밖이면 거부.
                 dest = (root / member.filename).resolve()
                 if dest != root and not str(dest).startswith(str(root) + os.sep):
@@ -658,7 +665,7 @@ def resolve_import(imp, importing_abs, index):
     2) 아니면 색인에서 **가장 긴 경로 접미사**가 일치하는 파일을 고른다.
        (`@openzeppelin/contracts/access/Ownable.sol` 같은 remapping 별칭도
         `.../access/Ownable.sol` 접미사로 자동 매칭 — remappings.txt 불필요.)
-    동점이면 루트에 가까운(경로 짧은) 파일을 결정론적으로 택한다.
+    최장 접미사가 같은 후보가 여러 개면 잘못된 라이브러리를 고르지 않고 실패한다.
     """
     imp = imp.strip().replace("\\", "/")
     importing_abs = Path(importing_abs).resolve()
@@ -666,11 +673,10 @@ def resolve_import(imp, importing_abs, index):
         cand = (importing_abs.parent / imp).resolve()
         if cand in index:
             return cand
-        # 상대경로가 색인에 없으면 접미사 매칭으로 폴백.
+        return None
     # 접미사 매칭: import 경로의 뒤쪽 세그먼트가 많이 겹칠수록 우선.
     imp_parts = [s for s in imp.split("/") if s not in ("", ".", "..")]
-    best = None
-    best_score = 0
+    matches = []
     for cand in index:
         cparts = str(cand.as_posix()).split("/")
         n = 0
@@ -681,10 +687,33 @@ def resolve_import(imp, importing_abs, index):
         # 파일명(마지막 세그먼트)은 반드시 일치해야 함.
         if imp_parts[-1] != cparts[-1]:
             continue
-        score = (n, -len(cparts))  # 더 많이 겹치고 더 짧은 경로 우선
-        if best is None or score > best_score:
-            best, best_score = cand, score
-    return best
+        matches.append((n, cand))
+    if not matches:
+        return None
+    best_n = max(n for n, _ in matches)
+    best = [cand for n, cand in matches if n == best_n]
+    if len(best) != 1:
+        names = ", ".join(str(p) for p in best[:4])
+        raise ValueError(f"ambiguous import {imp!r}: {names}")
+    return best[0]
+
+
+def _import_rewrites(statement):
+    """Return symbol and namespace rewrites needed after import flattening."""
+    symbols = []
+    namespaces = []
+    named = re.search(r"\{([^}]*)\}\s+from\b", statement, re.S)
+    if named:
+        for item in named.group(1).split(","):
+            bits = re.split(r"\s+as\s+", item.strip())
+            if len(bits) == 2 and bits[0] and bits[1]:
+                symbols.append((bits[1].strip(), bits[0].strip()))
+    ns = re.search(r"\bimport\s+\*\s+as\s+(\w+)\s+from\b", statement, re.S)
+    if not ns:
+        ns = re.search(r"\bimport\s+[\"'][^\"']+[\"']\s+as\s+(\w+)", statement, re.S)
+    if ns:
+        namespaces.append(ns.group(1))
+    return symbols, namespaces
 
 
 def flatten_sol(entry_abs, index, log=None):
@@ -723,14 +752,26 @@ def flatten_sol(entry_abs, index, log=None):
         except Exception as e:
             if log:
                 log(f"  import read failed: {path}: {e}")
-            return
+            raise RuntimeError(f"import read failed: {path}: {e}") from e
+        symbol_rewrites = []
+        namespace_rewrites = []
         for m in _IMPORT_RE.finditer(text):
             dep = resolve_import(m.group(1), path, index)
             if dep is not None:
                 visit(dep)
-            elif log:
-                log(f"  unresolved import '{m.group(1)}' in {path.name} (left as comment)")
+            else:
+                message = f"unresolved import '{m.group(1)}' in {path.name}"
+                if log:
+                    log(f"  {message}")
+                raise FileNotFoundError(message)
+            symbols, namespaces = _import_rewrites(m.group(0))
+            symbol_rewrites.extend(symbols)
+            namespace_rewrites.extend(namespaces)
         body = strip_header(text)
+        for namespace in namespace_rewrites:
+            body = re.sub(rf"\b{re.escape(namespace)}\.(\w+)\b", r"\1", body)
+        for alias, original in symbol_rewrites:
+            body = re.sub(rf"\b{re.escape(alias)}\b", original, body)
         chunks.append((f"// ── from {path.name} " + "─" * 20, body))
 
     visit(entry_abs)
@@ -789,25 +830,35 @@ def main(argv=None):
             log(f"skip {fp}: {e}"); continue
         # import 가 있으면 의존 파일을 찾아 인라인(flatten)한 소스로 분석한다.
         src = raw
+        preparation_error = None
         if _IMPORT_RE.search(raw):
             try:
                 src = flatten_sol(fp, index, log=(None if args.quiet else log))
             except Exception as e:
-                log(f"flatten failed {fp}: {e}; using raw"); src = raw
+                preparation_error = f"import flatten failed: {e}"
+                log(f"flatten failed {fp}: {e}")
         # 감사 대상은 '이 파일에 선언된' 구체 컨트랙트만 (import 로 끌려온 의존 제외).
         for c in concrete_contracts(raw, eng):
             if args.only and c != args.only:
                 continue
-            cands.append((fp, src, c))
+            cands.append((fp, src, c, preparation_error))
     cands.sort(key=lambda t: contract_priority(eng, t[1], t[2]), reverse=True)
     if args.max_contracts > 0:
         cands = cands[:args.max_contracts]
 
     findings = []
     if True:
-        for fp, src, c in cands:
+        for fp, src, c, preparation_error in cands:
             log(f"analyzing {fp}:{c} …")
-            res = analyze_source(eng, src, c, inv_src, args.seed_eth, args.seed)
+            if preparation_error:
+                res = {
+                    "name": c,
+                    "proven": False,
+                    "error": preparation_error,
+                    "steps": [{"step": "input", "scores": {}}],
+                }
+            else:
+                res = analyze_source(eng, src, c, inv_src, args.seed_eth, args.seed)
             sev, evidence, is_finding = severity_for(res)
             # 동적 미성립 시: 정적 휴리스틱(예: EIP-7702 receiver-callback 재진입)을 소견으로 승격
             heur_cls = None
@@ -851,7 +902,11 @@ def main(argv=None):
                              "line": hot_ln, "decl_line": decl_ln})
 
     if not args.include_safe:
-        findings_out = [f for f in findings if not (f["severity"] == "INFO" and not f["res"].get("proven"))]
+        findings_out = [
+            f for f in findings
+            if f["res"].get("error")
+            or not (f["severity"] == "INFO" and not f["res"].get("proven"))
+        ]
     else:
         findings_out = findings
     # 요약 카운트는 표시 대상 기준
@@ -868,6 +923,8 @@ def main(argv=None):
 
     worst = max((SEV_ORDER[f["severity"]] for f in shown), default=0)
     proven_n = s["proven_vulnerabilities"]
+    if s.get("analysis_errors", 0) > 0:
+        return EXIT_ERROR
     if args.fail_on == "proven" and proven_n > 0:
         return EXIT_FINDINGS
     if args.fail_on == "high" and worst >= SEV_ORDER["HIGH"]:
