@@ -60,9 +60,12 @@ def build_exploit(fam, findings):
 
 
 def _reentrancy(findings):
-    deposit = _fn_name(findings, "reentrancy_deposit", "deposit")
+    deposit_fn = findings.get("reentrancy_deposit")
     wfn = findings.get("reentrancy_withdraw")
-    withdraw = wfn["name"] if wfn else "withdraw"
+    if not deposit_fn or not wfn:
+        return None
+    deposit = deposit_fn["name"]
+    withdraw = wfn["name"]
     # withdraw may take a uint amount or no args
     wargs = wfn["args"] if wfn else []
     takes_amount = any(t.startswith("uint") for t, _ in wargs)
@@ -157,8 +160,12 @@ def _access(findings):
 
 
 def _integer(findings):
-    transfer = _fn_name(findings, "integer_transfer", "transfer")
-    redeem = _fn_name(findings, "integer_redeem", "redeem")
+    transfer_fn = findings.get("integer_transfer")
+    redeem_fn = findings.get("integer_redeem")
+    if not transfer_fn or not redeem_fn:
+        return None
+    transfer = transfer_fn["name"]
+    redeem = redeem_fn["name"]
     body = (
         "// Strategy: integer underflow (unchecked) — underflow the caller's\n"
         "// balance to ~2**256 via transfer, then redeem the entire ETH float.\n"
@@ -179,10 +186,11 @@ def _integer(findings):
 
 
 def _oracle(findings):
-    faucet = _fn_name(findings, "oracle_faucet", "faucet")
-    swap = _fn_name(findings, "oracle_swap", "swapBorForCol")
-    deposit = _fn_name(findings, "oracle_deposit", "depositCollateral")
-    borrow = _fn_name(findings, "oracle_borrow", "borrow")
+    required = [findings.get(key) for key in (
+        "oracle_faucet", "oracle_swap", "oracle_deposit", "oracle_borrow")]
+    if not all(required):
+        return None
+    faucet, swap, deposit, borrow = (fn["name"] for fn in required)
     body = (
         "// Strategy: spot-price oracle manipulation — mint free BOR from the\n"
         "// faucet, swap it to drain COL reserves and spike the spot price, then\n"

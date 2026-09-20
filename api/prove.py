@@ -773,6 +773,12 @@ def scan_target(contract_src, invariants_src, manifest):
     return sig
 
 
+# Keep the API and Track CLI on the same scanner rules. The embedded scanner
+# above remains only as a serverless fallback reference; the shipped bundle
+# always includes trust404.scan.
+from trust404.scan import scan_target as scan_target
+
+
 # TRUST404 Track04 — strategy selection + Exploit.sol templates.
 # 각 취약 유형에 대해, scanner 가 뽑은 함수 시그니처를 채워 Exploit.sol 을
 # 결정론적으로 생성한다. 함수 이름을 하드코딩하지 않고 스캔 결과에서 가져오되,
@@ -1821,6 +1827,8 @@ def _synth_reentrancy(target_src):
     """소스에서 (payable 예치, ETH를 되돌려주는 인출) 함수 쌍을 열거해, 악성
     receive() 로 인출을 재진입하는 공격 컨트랙트를 합성한다. 스캐너가 재진입
     계열을 스코어링하지 못한 경우에도 퍼저가 재진입을 직접 성립시키는 경로."""
+    from trust404.scan import _reentrancy_vulnerable
+
     src = _strip_comments(target_src)
     fns = _functions(src)
     deposits, withdraws = [], []
@@ -1840,7 +1848,7 @@ def _synth_reentrancy(target_src):
             elif credits_sender:
                 deposits.append({"fn": f, "form": "self"})
         # 인출 후보: 값을 보내는 external 함수 (수신자·금액 표현식 무관). 무인자 또는 uint 1개.
-        if re.search(r"\.call\s*\{\s*value\s*:", b):
+        if _reentrancy_vulnerable(f, src):
             if len(f["args"]) == 0 or (len(f["args"]) == 1 and f["args"][0][0].startswith("uint")):
                 withdraws.append(f)
     out = []

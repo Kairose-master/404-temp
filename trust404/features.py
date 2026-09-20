@@ -13,7 +13,15 @@ from __future__ import annotations
 import re
 from typing import Iterable, Set
 
-from .scan import _functions, _strip_comments, _contract_bodies
+from .scan import (
+    _INIT_NAME,
+    _PRIVILEGED_WRITE,
+    _contract_bodies,
+    _functions,
+    _has_privilege_guard,
+    _reentrancy_vulnerable,
+    _strip_comments,
+)
 
 
 def extract_features(src: str, name: str | None = None) -> Set[str]:
@@ -32,24 +40,25 @@ def extract_features(src: str, name: str | None = None) -> Set[str]:
     def has(pat: str, text: str = s, flags=0) -> bool:
         return bool(re.search(pat, text, flags))
 
+    def target_has(pat: str, flags=0) -> bool:
+        return bool(re.search(pat, tb, flags))
+
     # ── classic 4 + wargame 3 (scanner families) ──────────────────────────
-    if has(r"\.call\s*\{\s*value\s*:"):
+    if target_has(r"\.call\s*\{\s*value\s*:"):
         feats.add("value_call")
-    if has(r"nonReentrant|locked\s*==\s*1|_status"):
+    if target_has(r"nonReentrant|locked\s*==\s*1|_status"):
         feats.add("reentrancy_mutex")
-    # CEI violation: value call with ledger clear AFTER the call
+    # CEI violation requires a caller-ledger effect after the caller payout.
     for fn in fns:
-        m = re.search(r"\.call\s*\{\s*value\s*:", fn["body"])
-        if not m:
-            continue
-        before, after = fn["body"][: m.start()], fn["body"][m.start() :]
-        cleared_before = re.search(r"\w+\[\s*msg\.sender\s*\]\s*(=\s*0|-=)", before)
-        cleared_after = re.search(r"\w+\[\s*msg\.sender\s*\]\s*(=\s*0|-=)", after)
-        if not cleared_before and (cleared_after or True):
+        if _reentrancy_vulnerable(fn, tb):
             feats.add("cei_violation")
             break
-    if has(r"\bowner\s*=") and not has(r"only\w*[Oo]wner"):
-        feats.add("unguarded_owner_write")
+    for fn in fns:
+        if (fn["external"] and not _INIT_NAME.match(fn["name"])
+                and _PRIVILEGED_WRITE.search(fn["body"])
+                and not _has_privilege_guard(fn, tb)):
+            feats.add("unguarded_owner_write")
+            break
     if has(r"unchecked\s*\{"):
         feats.add("unchecked_arithmetic")
     if has(r"spotPrice|getPrice|reserve[0-9A-Za-z]*") and has(r"\bborrow\b|\bswap"):
@@ -217,10 +226,21 @@ def extract_features(src: str, name: str | None = None) -> Set[str]:
     if has(r"_safeMint|_mint") and has(r"onERC721Received|onERC1155Received"):
         feats.add("receiver_hook_before_mint")
 
-    # Vault / Privacy: private password unlock
-    if has(r"private") and has(r"unlock|locked|password"):
-        feats.add("private_unlock")
-        feats.add("bytes32_secret")
+    # Vault / Privacy: an external unlock compares a bytes key against private
+    # storage. A private mutex named `locked` is not a storage-secret exploit.
+    private_secrets = set(re.findall(
+        r"\bbytes(?:\d+)?(?:\s*\[[^\]]*\])?\s+private\s+(\w+)", tb))
+    for fn in fns:
+        byte_args = [name for typ, name in fn["args"]
+                     if typ.startswith("bytes") and name]
+        body = fn["body"]
+        compares_secret = any(secret in body for secret in private_secrets) and any(
+            re.search(rf"\b{re.escape(arg)}\b", body) for arg in byte_args)
+        if (fn["external"] and re.search(r"unlock|open", fn["name"], re.I)
+                and compares_secret and re.search(r"==|keccak256", body)):
+            feats.add("private_unlock")
+            feats.add("bytes32_secret")
+            break
 
     # selfdestruct present (Recovery / Force / Motorbike engine)
     if has(r"selfdestruct|suicide"):
