@@ -5212,7 +5212,8 @@ def _fuzz_fallback_impl(name, target_src, invariants_src, manifest, do_verify, s
     return None
 
 def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify=True,
-                           analysis_src=None, seed=42, deadline=None):
+                           analysis_src=None, seed=42, deadline=None,
+                           include_templates=True):
     """트랙 자기검증 루프(agent.py)용 후보 생성기.
 
     탐색·생성 단계를 지연(lazy) 산출해 (stage, label, exploit_src) 로 내보낸다. 각 단계는
@@ -5235,16 +5236,19 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
         feats = extract_features(search_src, name)
     except Exception:
         feats = None
-    # 1) 템플릿 단계
-    for fam in order:
-        if deadline is not None and time.time() >= deadline:
-            return
-        try:
-            src = build_exploit(fam, findings)
-        except Exception:
-            src = None
-        if src:
-            yield ("template", fam, src)
+    # 1) 템플릿 단계. Track agent already has a canonical outer template
+    # stage, so it passes include_templates=False instead of verifying the
+    # same call plan twice through this legacy API implementation.
+    if include_templates:
+        for fam in order:
+            if deadline is not None and time.time() >= deadline:
+                return
+            try:
+                src = build_exploit(fam, findings)
+            except Exception:
+                src = None
+            if src:
+                yield ("template", fam, src)
     # 2) 합성 단계 — 소스를 여러 개 낼 수 있는 생성기
     t0 = time.time(); scan_step = {"step":"scan","scores":findings["scores"],
                                   "features":sorted(feats) if feats else []}

@@ -192,7 +192,11 @@ def main(argv=None):
     #   2) synth    — 재진입/AMM/플래시론/스토리지/프록시/다중블록/스토리지충돌/DoS/콜백 합성
     #   3) fuzz     — 범용 호출 시퀀스 탐색(미공개 타깃 일반화 축)
     def candidate_stream():
-        seen_sources = set()
+        try:
+            from trust404.candidates import candidate_fingerprint
+        except Exception:
+            candidate_fingerprint = lambda src: src
+        seen_candidates = set()
         # 0) LLM (명시적 opt-in + 로컬 LLM_BASE_URL 또는 API 키가 있을 때만)
         llm_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("LLM_API_KEY")
         llm_base = os.environ.get("LLM_BASE_URL")
@@ -202,8 +206,10 @@ def main(argv=None):
                 draft = propose_exploit(analysis_src, invariants_src, findings, llm_key)
                 if draft:
                     note(f"# LLM draft obtained ({'local:'+llm_base if llm_base else 'anthropic'})")
-                    seen_sources.add(draft)
-                    yield ("llm", "llm", draft)
+                    fp = candidate_fingerprint(draft)
+                    if fp not in seen_candidates:
+                        seen_candidates.add(fp)
+                        yield ("llm", "llm", draft)
             except Exception as e:  # network blocked / parse fail → degrade
                 note(f"# LLM unavailable, degrading to heuristics: {str(e)[:120]}")
         elif _llm_enabled():
@@ -215,8 +221,11 @@ def main(argv=None):
         # engine stages cannot execute a multi-source target internally.
         for fam in scored:
             src = build_exploit(fam, findings)
-            if src and src not in seen_sources:
-                seen_sources.add(src)
+            if src:
+                fp = candidate_fingerprint(src)
+                if fp in seen_candidates:
+                    continue
+                seen_candidates.add(fp)
                 yield ("template", fam, src)
 
         # 1~3) 엔진(api/prove.py)의 단계별 생성기
@@ -227,10 +236,13 @@ def main(argv=None):
                 for stage, label, src in engine.iter_engine_candidates(
                         target_name, contract_src, invariants_src, manifest,
                         do_verify=True, analysis_src=analysis_src,
-                        seed=args.seed, deadline=started + args.timeout):
-                    if src in seen_sources:
+                        seed=args.seed, deadline=started + args.timeout,
+                        include_templates=False):
+                    fp = candidate_fingerprint(src)
+                    if fp in seen_candidates:
+                        note(f"# duplicate candidate skipped [{stage}/{label}]")
                         continue
-                    seen_sources.add(src)
+                    seen_candidates.add(fp)
                     yield (stage, label, src)
             except Exception as e:
                 note(f"# engine candidate stream error: {str(e)[:140]}")
@@ -379,6 +391,52 @@ def main(argv=None):
                         note(f"attempt {attempts} [llm/critique]: NOT PROVEN ({d2})")
             except Exception as e:
                 note(f"# critique LLM retry skipped: {str(e)[:120]}")
+
+    # No attack candidate is a valid outcome for a healthy target.  Run one
+    # explicit no-op candidate so Setup, deployment, the initial invariant and
+    # the Forge result channel are still exercised before reporting exit 1.
+    if (attempts == 0 and args.max_attempts > 0
+            and time.time() - started <= args.timeout):
+        baseline = _fallback_stub()
+        attempts = 1
+        last_source = baseline
+        stages_seen.append("baseline")
+        note("# --- stage escalation: baseline ---")
+        try:
+            remaining_timeout = max(1, args.timeout - int(time.time() - started))
+            result = verify_full(
+                target_name=target_name,
+                target_src=contract_src,
+                invariants_src=invariants_src,
+                exploit_src=baseline,
+                manifest=manifest,
+                seed=args.seed,
+                extra_sources=extra_sources or None,
+                timeout_sec=remaining_timeout,
+            )
+            proven, first_violated, detail = result.tuple()
+            if proven:
+                verification_errors.append({
+                    "attempt": attempts, "stage": "baseline",
+                    "strategy": "verifier-health",
+                    "error": f"no-op unexpectedly violated {first_violated}",
+                })
+                verifier_ok = False
+                note(f"attempt {attempts} [baseline/verifier-health]: unexpected invariant violation: {first_violated}")
+            else:
+                verified_attempts = 1
+                held_invariants["verifier-health"] = detail
+                note(f"attempt {attempts} [baseline/verifier-health]: NOT PROVEN — verifier healthy ({detail})")
+        except VerifyUnavailable as e:
+            verifier_ok = False
+            note(f"attempt {attempts} [baseline/verifier-health]: verifier unavailable ({e})")
+        except Exception as e:
+            verifier_ok = False
+            verification_errors.append({
+                "attempt": attempts, "stage": "baseline",
+                "strategy": "verifier-health", "error": str(e)[:400],
+            })
+            note(f"attempt {attempts} [baseline/verifier-health]: verify error ({str(e)[:140]})")
 
     # ── 예산 내 미발견 ────────────────────────────────────────────────────────
     write_exploit(out_dir, last_source)

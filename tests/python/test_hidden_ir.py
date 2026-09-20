@@ -121,9 +121,24 @@ class CrossContract(unittest.TestCase):
         f = extract_features(self.SRC, "Desk")
         wp = plan_world(self.SRC, "Desk", f)
         self.assertTrue(wp.cross_contract)
-        self.assertIn("function pool()", wp.folded_exploit)
+        # Merely having sibling getters is not an executable attack plan.
+        self.assertEqual(wp.steps, [])
+        self.assertEqual(wp.folded_exploit, "")
         labels = [l for l, _ in iter_defi_families(self.SRC, "Desk")]
         self.assertTrue(any(l.startswith("cross-getter") for l in labels))
+
+    def test_world_emits_only_with_actionable_steps(self):
+        src = self.SRC.replace(
+            "function borrow(uint256 n) external {}",
+            "uint256 public reserve0; uint256 public reserve1; "
+            "function spotPrice() external view returns (uint256) { "
+            "return reserve1 * 1e18 / reserve0; } "
+            "function borrow(uint256 n) external {}",
+        )
+        f = extract_features(src, "Desk")
+        wp = plan_world(src, "Desk", f)
+        self.assertTrue(wp.steps)
+        self.assertIn("function pool()", wp.folded_exploit)
 
 
 class SafeVaultUnchanged(unittest.TestCase):
