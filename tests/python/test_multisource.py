@@ -142,6 +142,21 @@ class VerificationAccounting(unittest.TestCase):
         self.assertFalse(payload["verifier_available"])
         self.assertEqual(payload["verified_attempts"], 0)
 
+    def test_zero_attempt_budget_does_not_run_baseline(self):
+        spec = importlib.util.spec_from_file_location("zero_baseline_agent", ROOT / "agent/agent.py")
+        cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli)
+        with tempfile.TemporaryDirectory() as td, \
+                patch.object(cli, "verify_full") as verify, \
+                contextlib.redirect_stdout(io.StringIO()):
+            cli.main([
+                "--contract", str(FIX / "src/ImportedOwner.sol"),
+                "--invariants", str(FIX / "Invariants.sol"),
+                "--manifest", str(FIX / "manifest.json"),
+                "--out", td, "--max-attempts", "0", "--timeout", "30",
+            ])
+        verify.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
