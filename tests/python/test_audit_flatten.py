@@ -3,7 +3,10 @@
 
 Pure-Python: exercises agent/audit.py helpers without solc or the engine.
 """
+import contextlib
 import importlib.util
+import io
+import json
 import sys
 import tempfile
 import unittest
@@ -77,6 +80,54 @@ class Flatten(unittest.TestCase):
                         flat.index("contract Vault is VaultBase"))
         self.assertLess(flat.index("abstract contract Note"),
                         flat.index("contract Vault is VaultBase"))
+
+    def test_flatten_preserves_symbol_and_namespace_aliases(self):
+        alias = self.tmp / "src" / "AliasVault.sol"
+        alias.write_text(
+            "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n"
+            'import {VaultBase as LockedBase} from "./base/VaultBase.sol";\n'
+            'import * as Types from "./IVault.sol";\n'
+            "contract AliasVault is LockedBase, Types.IVault { "
+            "function f() external override {} }\n", encoding="utf-8")
+        flat = audit.flatten_sol(alias, audit.build_source_index(self.tmp))
+        self.assertIn("contract AliasVault is VaultBase, IVault", flat)
+        self.assertNotIn("LockedBase", flat)
+        self.assertNotIn("Types.IVault", flat)
+
+        try:
+            import solcx
+            solcx.set_solc_version("0.8.24")
+        except Exception:
+            self.skipTest("solc 0.8.24 unavailable")
+        compiled = solcx.compile_source(flat, output_values=["abi"])
+        self.assertTrue(any(name.endswith(":AliasVault") for name in compiled))
+
+    def test_ambiguous_suffix_import_fails_closed(self):
+        other = self.tmp / "vendor" / "contracts" / "utils"
+        other.mkdir(parents=True)
+        (other / "Note.sol").write_text(
+            "pragma solidity ^0.8.0; contract Note {}\n", encoding="utf-8")
+        index = audit.build_source_index(self.tmp)
+        with self.assertRaisesRegex(ValueError, "ambiguous import"):
+            audit.resolve_import("@alias/contracts/utils/Note.sol",
+                                 self.tmp / "src" / "Vault.sol", index)
+
+    def test_unresolved_relative_import_fails_closed(self):
+        broken = self.tmp / "src" / "Broken.sol"
+        broken.write_text(
+            "pragma solidity 0.8.24;\n"
+            'import {Missing} from "./Missing.sol";\n'
+            "contract Broken is Missing {}\n", encoding="utf-8")
+        with self.assertRaisesRegex(FileNotFoundError, "unresolved import"):
+            audit.flatten_sol(broken, audit.build_source_index(self.tmp))
+
+        out = self.tmp / "audit-output"
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            rc = audit.main([str(broken), "--out", str(out), "--quiet"])
+        self.assertEqual(rc, audit.EXIT_ERROR)
+        report = json.loads((out / "report.json").read_text())
+        self.assertEqual(report["summary"]["analysis_errors"], 1)
 
     def test_prepare_input_extracts_zip(self):
         zp = self.tmp.parent / (self.tmp.name + ".zip")

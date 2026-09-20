@@ -4,7 +4,11 @@
 # 실제 in-memory EVM 에서 배포->Exploit.sol 생성->실행->checkAll 재검사.
 import os, json, time, re, random, warnings, traceback
 warnings.filterwarnings("ignore")
-os.environ.setdefault("SOLCX_BINARY_PATH", "/tmp/solcx-bin")
+# Serverless filesystems require a writable compiler cache.  Local/CLI imports
+# must keep py-solc-x's normal install directory; mutating this globally at
+# import time makes an already installed compiler disappear mid-run.
+if os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
+    os.environ.setdefault("SOLCX_BINARY_PATH", "/tmp/solcx-bin")
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path as _Path
@@ -1142,7 +1146,9 @@ def _init(findings):
 
 def _ensure_solc():
     import solcx
-    os.makedirs(os.environ["SOLCX_BINARY_PATH"], exist_ok=True)
+    solcx_dir = os.environ.get("SOLCX_BINARY_PATH")
+    if solcx_dir:
+        os.makedirs(solcx_dir, exist_ok=True)
     try:
         solcx.install_solc(SOLC)  # idempotent; downloads to SOLCX_BINARY_PATH if missing
     except Exception:
@@ -1169,7 +1175,9 @@ def _resolve_solc(spec):
 def _solc_for(target_src):
     """타깃 pragma 로 solc 버전을 정해 설치·설정하고 (버전문자열, evmVersion) 반환."""
     import solcx
-    os.makedirs(os.environ["SOLCX_BINARY_PATH"], exist_ok=True)
+    solcx_dir = os.environ.get("SOLCX_BINARY_PATH")
+    if solcx_dir:
+        os.makedirs(solcx_dir, exist_ok=True)
     m = re.search(r"pragma\s+solidity\s+([^;]+);", target_src or "")
     ver = _resolve_solc(m.group(1) if m else SOLC)
     vs = ".".join(str(x) for x in ver)
@@ -5203,7 +5211,8 @@ def _fuzz_fallback_impl(name, target_src, invariants_src, manifest, do_verify, s
                 "ms":int((time.time()-t0)*1000)}
     return None
 
-def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify=True):
+def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify=True,
+                           analysis_src=None, seed=42, deadline=None):
     """트랙 자기검증 루프(agent.py)용 후보 생성기.
 
     탐색·생성 단계를 지연(lazy) 산출해 (stage, label, exploit_src) 로 내보낸다. 각 단계는
@@ -5216,17 +5225,20 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
       synth     → 재진입/AMM/플래시론/스토리지/프록시/다중블록/스토리지충돌/그리핑DoS/콜백 합성
       fuzz      → 범용 호출 시퀀스 탐색(SliSE 류 슬라이싱 우선순위) → codegen
     """
-    findings = scan_target(target_src, invariants_src or "", manifest)
+    search_src = analysis_src or target_src
+    findings = scan_target(search_src, invariants_src or "", manifest)
     order = seeded_order(sorted(STRATEGY_ORDER, key=lambda f: (-findings["scores"].get(f,0), f)),
-                         findings["scores"], 42)
+                         findings["scores"], seed)
     feats = None
     try:
         from trust404.features import extract_features
-        feats = extract_features(target_src, name)
+        feats = extract_features(search_src, name)
     except Exception:
         feats = None
     # 1) 템플릿 단계
     for fam in order:
+        if deadline is not None and time.time() >= deadline:
+            return
         try:
             src = build_exploit(fam, findings)
         except Exception:
@@ -5236,9 +5248,11 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     # 2) 합성 단계 — 소스를 여러 개 낼 수 있는 생성기
     t0 = time.time(); scan_step = {"step":"scan","scores":findings["scores"],
                                   "features":sorted(feats) if feats else []}
-    for gen in (lambda: _synth_reentrancy(target_src),
-                lambda: _synth_amm(target_src, name),
-                lambda: _synth_flashloan(target_src, name)):
+    for gen in (lambda: _synth_reentrancy(search_src),
+                lambda: _synth_amm(search_src, name),
+                lambda: _synth_flashloan(search_src, name)):
+        if deadline is not None and time.time() >= deadline:
+            return
         try:
             for label, ex in gen():
                 yield ("synth", label, ex)
@@ -5248,7 +5262,9 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     try:
         from trust404.synth_defi import iter_defi_families
         from trust404.registry import should_run as _sr_defi
-        for label, ex in iter_defi_families(target_src, name):
+        for label, ex in iter_defi_families(search_src, name):
+            if deadline is not None and time.time() >= deadline:
+                return
             fam = label.split(":")[0].replace("-", "_")
             if not _sr_defi(fam, feats):
                 continue
@@ -5258,7 +5274,9 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     # 2d) 교차 컨트랙트 월드 모델 — 시퀀스를 run(address) 로 접음 (ReX 약점)
     try:
         from trust404.world import iter_world_candidates
-        for label, ex in iter_world_candidates(target_src, name, feats):
+        for label, ex in iter_world_candidates(search_src, name, feats):
+            if deadline is not None and time.time() >= deadline:
+                return
             yield ("world", label, ex)
     except Exception:
         pass
@@ -5284,6 +5302,8 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     _ordered = _hkg_order([fn.__name__ for fn in _synth_fns], feats)
     _by = {fn.__name__: fn for fn in _synth_fns}
     for fn_name in _ordered:
+        if deadline is not None and time.time() >= deadline:
+            return
         fn = _by[fn_name]
         if not _should_run(fn.__name__, feats):
             continue
@@ -5295,7 +5315,8 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
             yield ("synth", r.get("strategy") or fn.__name__, r["exploit_src"])
     # 3) 범용 퍼저 단계
     try:
-        found = _fuzz_search(name, target_src, inv, manifest, bool(do_verify))
+        found = _fuzz_search(name, target_src, inv, manifest, bool(do_verify),
+                             deadline=deadline)
     except Exception:
         found = None
     if found:
