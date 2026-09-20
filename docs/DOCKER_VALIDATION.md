@@ -41,25 +41,22 @@ fresh container and must pass all its checks without skips:
 | --- | --- |
 | SetupOnlyOwner | PROVEN, ownerUnchanged |
 | PhasedGhost | NOT_PROVEN |
-| ApprovalMirage (original HEVM Setup) | INCONCLUSIVE on py-evm; NOT_PROVEN on Forge |
+| ApprovalMirage (original HEVM Setup) | NOT_PROVEN on both backends |
 | ApprovalMiragePlainSetup (separate control) | NOT_PROVEN on both backends |
 | DirectConstructor | PROVEN, unbroken |
 | HealthyNoop | NOT_PROVEN |
 | SetupZeroArgControl | PROVEN, unbroken (both backends) |
-| SetupRevertsZeroArg | SetupDeploymentError / INCONCLUSIVE (py-evm only) |
+| SetupRevertsZeroArg | SetupDeploymentError / INCONCLUSIVE (both backends) |
 
-The EVM gate runs eight checks (six proof results and two explicit deployment
-errors); the Forge gate runs seven proof checks. The EVM error checks require
-the specific Setup.run-reverted diagnostic, not any exception.
+Both gates run eight checks. The deployment-error check requires a
+backend-specific Setup diagnostic, not any exception.
 The zero-argument positive control changes only that Setup's revert into a successful return.
 
-The original ApprovalMirage Setup calls HEVM `vm.addr`. Before fail-closed
-handling, py-evm silently discarded that failed Setup and tested a direct
-constructor instead. Its old NOT_PROVEN result was therefore not an official
-Setup execution. The original files remain unchanged; its EVM error is tested
-separately from the plain-Setup control and its real Forge NOT_PROVEN result.
-This changes the reported EVM status intentionally; it does not restore a
-constructor fallback or count an infrastructure exception as a negative proof.
+The original ApprovalMirage Setup calls HEVM `vm.addr`. The py-evm backend now
+implements that selector, so its NOT_PROVEN result comes from the declared
+Setup and the real invariant check. The plain-Setup fixture remains a separate
+control. Neither path restores a constructor fallback or counts an
+infrastructure exception as a negative proof.
 
 Forge negative fixtures must reach the official `ProofResult` event, not just
 exit with an infrastructure error or reverted test. Forge requests `-vvvv`
@@ -76,6 +73,6 @@ This gate validates packaging and these selected proof paths, not all possible
 Setup programs or semantic equivalence of py-evm and Forge. A declared py-evm
 Setup now fails closed: it never falls back to the target constructor. See
 [Setup failure policy](SETUP_FAILURE.md) for the error contract and remaining
-limitations. Python dependencies still use the existing version ranges;
-byte-for-byte reproducible builds would additionally require a reviewed lock
-file and pinned base-image digest.
+limitations. Python dependencies are exact-version pinned. A pinned base-image
+digest and reviewed wheel hashes would be the remaining steps for byte-for-byte
+builds.
