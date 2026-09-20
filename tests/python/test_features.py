@@ -110,6 +110,26 @@ class FeatureIR(unittest.TestCase):
     def test_none_features_runs_all(self):
         self.assertTrue(should_run("_synth_gatekeeper_one", None))
 
+    def test_multi_part_providers_require_all_capabilities(self):
+        self.assertFalse(should_run("_synth_gatekeeper_one", {"gasleft_modulo"}))
+        self.assertFalse(should_run("_synth_gatekeeper_one", {"tx_origin_mask"}))
+        self.assertTrue(should_run(
+            "_synth_gatekeeper_one", {"gasleft_modulo", "tx_origin_mask"}))
+
+        self.assertFalse(should_run("_synth_lockup_bypass", {"approve_transferFrom"}))
+        self.assertTrue(should_run(
+            "_synth_lockup_bypass", {"approve_transferFrom", "lockup"}))
+
+        self.assertFalse(should_run("owner_slot_hijack", {"owner_not_slot0"}))
+        self.assertTrue(should_run(
+            "owner_slot_hijack", {"owner_not_slot0", "delegatecall_param"}))
+
+    def test_provider_exclusions_defer_to_the_specialized_family(self):
+        self.assertTrue(should_run("_multiblock_attempt", {"block_entropy"}))
+        self.assertFalse(should_run(
+            "_multiblock_attempt", {"block_entropy", "mixed_entropy"}))
+        self.assertTrue(should_run("mixed_entropy", {"mixed_entropy"}))
+
 
 class ScannerParity(unittest.TestCase):
     @classmethod

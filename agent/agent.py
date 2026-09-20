@@ -147,15 +147,18 @@ def main(argv=None):
     target_name = manifest["target"]["name"]
     extra_sources = {}
     try:
-        from trust404.abi import load_extra_sources, combine_analysis_sources
+        from trust404.abi import analysis_source_views, load_extra_sources
         extra_sources = load_extra_sources(args.manifest, args.contract, manifest)
         if extra_sources:
             note("# extra sources: " + ",".join(sorted(extra_sources)))
     except Exception as e:
         note(f"# extra sources skipped: {str(e)[:80]}")
-        combine_analysis_sources = None
-    analysis_src = (combine_analysis_sources(contract_src, extra_sources)
-                    if combine_analysis_sources else contract_src)
+        analysis_source_views = None
+    if analysis_source_views:
+        analysis_src, world_src = analysis_source_views(
+            contract_src, extra_sources, manifest)
+    else:
+        analysis_src = world_src = contract_src
     note(f"# TRUST404 Track04 agent | target={target_name} seed={args.seed} "
          f"max_attempts={args.max_attempts} timeout={args.timeout}s")
 
@@ -179,7 +182,7 @@ def main(argv=None):
                 note("# hkg causes: " + ",".join(hkg.causes[:8]))
                 note("# hkg ranked: " + ",".join(hkg.ranked_primitives[:8]))
             if plan_world is not None:
-                wp = plan_world(analysis_src, target_name, feats)
+                wp = plan_world(world_src, target_name, feats)
                 note(f"# world cross={wp.cross_contract} reason={wp.reason[:160]}")
         except Exception as e:
             note(f"# feature extract failed: {str(e)[:80]}")
@@ -237,7 +240,7 @@ def main(argv=None):
                         target_name, contract_src, invariants_src, manifest,
                         do_verify=True, analysis_src=analysis_src,
                         seed=args.seed, deadline=started + args.timeout,
-                        include_templates=False):
+                        include_templates=False, world_src=world_src):
                     fp = candidate_fingerprint(src)
                     if fp in seen_candidates:
                         note(f"# duplicate candidate skipped [{stage}/{label}]")

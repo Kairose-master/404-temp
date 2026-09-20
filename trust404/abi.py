@@ -218,20 +218,118 @@ def load_extra_sources(manifest_path, contract_path, manifest) -> dict:
     return extras
 
 
-def combine_analysis_sources(target_src: str, extra_sources: Optional[dict] = None) -> str:
+def combine_analysis_sources(target_src: str, extra_sources: Optional[dict] = None,
+                             excluded_paths: Optional[Sequence[str]] = None) -> str:
     """Build the deterministic text view used by scanners and generators.
 
     Setup and invariant contracts establish/observe the world; treating their
     privileged functions as target attack surfaces creates false candidates.
     Imported protocol contracts and interfaces remain visible.
     """
+    excluded = {str(path).replace("\\", "/").lstrip("./").lower()
+                for path in (excluded_paths or []) if path}
     chunks = [target_src or ""]
     for rel, source in sorted((extra_sources or {}).items()):
-        name = rel.replace("\\", "/").rsplit("/", 1)[-1].lower()
+        normalized = rel.replace("\\", "/").lstrip("./").lower()
+        name = normalized.rsplit("/", 1)[-1]
+        if normalized in excluded:
+            continue
         if name in {"setup.s.sol", "invariants.sol", "exploit.sol"}:
             continue
         chunks.append(f"\n// ---- source unit: {rel} ----\n{source}")
     return "\n".join(chunks)
+
+
+def _contract_declarations(src: str) -> dict:
+    """Return contract declarations with their direct inheritance names."""
+    out = {}
+    pat = re.compile(r"\b(?:abstract\s+)?contract\s+(\w+)\b([^;{]*)\{")
+    for match in pat.finditer(src or ""):
+        start = match.start()
+        brace = match.end() - 1
+        depth = 0
+        end = len(src or "")
+        for idx in range(brace, len(src or "")):
+            if src[idx] == "{":
+                depth += 1
+            elif src[idx] == "}":
+                depth -= 1
+                if depth == 0:
+                    end = idx + 1
+                    break
+        header = match.group(2)
+        inherited = re.search(r"\bis\b(.*)", header, re.S)
+        inheritance = inherited.group(1) if inherited else ""
+        out[match.group(1)] = {
+            "source": (src or "")[start:end],
+            "base_tokens": re.findall(r"\b[A-Za-z_]\w*\b", inheritance),
+        }
+    return out
+
+
+def target_analysis_source(target_src: str, extra_sources: Optional[dict],
+                           target_name: str) -> str:
+    """Keep the target source unit plus only imported contracts it inherits.
+
+    Same-unit siblings remain available for protocol attacks, while an
+    unrelated helper in another source file cannot become the target's attack
+    surface. Imported base contracts remain visible because their external
+    functions are callable through the deployed target.
+    """
+    target_defs = _contract_declarations(target_src or "")
+    if target_name not in target_defs:
+        return target_src or ""
+    definitions = dict(target_defs)
+    origins = {name: "target" for name in target_defs}
+    for rel, source in sorted((extra_sources or {}).items()):
+        for name, declaration in _contract_declarations(source).items():
+            if name not in definitions:
+                definitions[name] = declaration
+                origins[name] = rel
+
+    queue = [target_name]
+    processed = set()
+    inherited = []
+    while queue:
+        name = queue.pop(0)
+        if name in processed or name not in definitions:
+            continue
+        processed.add(name)
+        declaration = definitions[name]
+        if origins.get(name) != "target":
+            inherited.append(
+                f"\n// ---- inherited contract: {origins[name]}::{name} ----\n"
+                + declaration["source"])
+        for token in declaration["base_tokens"]:
+            if token in definitions and token not in processed:
+                queue.append(token)
+    return (target_src or "") + "\n".join(inherited)
+
+
+def analysis_source_views(target_src: str, extra_sources: Optional[dict],
+                          manifest: dict) -> Tuple[str, str]:
+    """Return `(target_surface, protocol_context)` for generation.
+
+    Verification still receives the untouched `extra_sources`; these views
+    affect candidate selection only.
+    """
+    deploy = manifest.get("deploy") or {}
+    invariants = manifest.get("invariants") or {}
+    excluded = [deploy.get("setup"), invariants.get("contract")]
+    context = combine_analysis_sources(target_src, extra_sources, excluded)
+    filtered = {}
+    excluded_norm = {str(path).replace("\\", "/").lstrip("./").lower()
+                     for path in excluded if path}
+    for rel, source in (extra_sources or {}).items():
+        normalized = rel.replace("\\", "/").lstrip("./").lower()
+        name = normalized.rsplit("/", 1)[-1]
+        if normalized in excluded_norm or name in {
+                "setup.s.sol", "invariants.sol", "exploit.sol"}:
+            continue
+        filtered[rel] = source
+    target_name = (manifest.get("target") or {}).get("name") or ""
+    surface = target_analysis_source(target_src, filtered, target_name)
+    return surface, context
 
 
 def parse_structs(src: str) -> dict:

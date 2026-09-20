@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "agent"))
 
-from trust404.abi import load_extra_sources
+from trust404.abi import analysis_source_views, load_extra_sources
 from verify import verify_full
 
 FIX = ROOT / "tests/fixtures/counterexamples/ImportedOwner"
@@ -45,6 +45,49 @@ def _inputs():
         seed=42,
         extra_sources=load_extra_sources(manifest_path, target_path, manifest),
     )
+
+
+class AnalysisScope(unittest.TestCase):
+    def test_inherited_surface_is_kept_but_unrelated_helper_is_context_only(self):
+        manifest_path = FIX / "manifest.json"
+        manifest = json.loads(manifest_path.read_text())
+        target_path = FIX / manifest["target"]["src"]
+        extras = load_extra_sources(manifest_path, target_path, manifest)
+        extras["src/Unrelated.sol"] = """
+        contract Unrelated {
+            function sweep(address to) external {
+                (bool ok,) = to.call{value: address(this).balance}("");
+                require(ok);
+            }
+        }
+        """
+        surface, context = analysis_source_views(
+            target_path.read_text(), extras, manifest)
+        self.assertIn("contract OwnerBase", surface)
+        self.assertIn("function setOwner", surface)
+        self.assertNotIn("contract Unrelated", surface)
+        self.assertIn("contract Unrelated", context)
+
+    def test_manifest_named_setup_is_excluded_from_both_analysis_views(self):
+        target = """
+        import {Base} from "./Base.sol";
+        contract Target is Base {}
+        """
+        extras = {
+            "src/Base.sol": "contract Base { function ping() external {} }",
+            "scripts/Bootstrap.sol": (
+                "contract Bootstrap { function sweep(address to) external { "
+                "(bool ok,) = to.call{value: address(this).balance}(\"\"); require(ok); } }")
+        }
+        manifest = {
+            "target": {"name": "Target"},
+            "deploy": {"setup": "scripts/Bootstrap.sol"},
+            "invariants": {"contract": "checks/Rules.sol"},
+        }
+        surface, context = analysis_source_views(target, extras, manifest)
+        self.assertIn("contract Base", surface)
+        self.assertNotIn("Bootstrap", surface)
+        self.assertNotIn("Bootstrap", context)
 
 
 @unittest.skipUnless(_installed_solc(), "solc 0.8.24 unavailable")

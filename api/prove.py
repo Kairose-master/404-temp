@@ -5221,7 +5221,7 @@ def _fuzz_fallback_impl(name, target_src, invariants_src, manifest, do_verify, s
 
 def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify=True,
                            analysis_src=None, seed=42, deadline=None,
-                           include_templates=True):
+                           include_templates=True, world_src=None):
     """트랙 자기검증 루프(agent.py)용 후보 생성기.
 
     탐색·생성 단계를 지연(lazy) 산출해 (stage, label, exploit_src) 로 내보낸다. 각 단계는
@@ -5235,6 +5235,7 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
       fuzz      → 범용 호출 시퀀스 탐색(SliSE 류 슬라이싱 우선순위) → codegen
     """
     search_src = analysis_src or target_src
+    context_src = world_src or search_src
     findings = scan_target(search_src, invariants_src or "", manifest)
     order = seeded_order(sorted(STRATEGY_ORDER, key=lambda f: (-findings["scores"].get(f,0), f)),
                          findings["scores"], seed)
@@ -5261,8 +5262,8 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     t0 = time.time(); scan_step = {"step":"scan","scores":findings["scores"],
                                   "features":sorted(feats) if feats else []}
     for gen in (lambda: _synth_reentrancy(search_src),
-                lambda: _synth_amm(search_src, name),
-                lambda: _synth_flashloan(search_src, name)):
+                lambda: _synth_amm(context_src, name),
+                lambda: _synth_flashloan(context_src, name)):
         if deadline is not None and time.time() >= deadline:
             return
         try:
@@ -5274,7 +5275,7 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     try:
         from trust404.synth_defi import iter_defi_families
         from trust404.registry import should_run as _sr_defi
-        for label, ex in iter_defi_families(search_src, name):
+        for label, ex in iter_defi_families(context_src, name):
             if deadline is not None and time.time() >= deadline:
                 return
             fam = label.split(":")[0].replace("-", "_")
@@ -5286,7 +5287,7 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     # 2d) 교차 컨트랙트 월드 모델 — 시퀀스를 run(address) 로 접음 (ReX 약점)
     try:
         from trust404.world import iter_world_candidates
-        for label, ex in iter_world_candidates(search_src, name, feats):
+        for label, ex in iter_world_candidates(context_src, name, feats):
             if deadline is not None and time.time() >= deadline:
                 return
             yield ("world", label, ex)
