@@ -4,18 +4,19 @@
 # 자기검증 루프(Self-validation Loop)가 핵심이다. 타깃/불변식/매니페스트를 읽어
 #   탐색 → 생성 → 검증 → (불변식 미위반 시) 더 강한 방법으로 탐색·생성 반복
 # 을 --max-attempts / --timeout 예산 안에서 돈다. 후보 생성은 단계별로 격상한다:
-#   0) llm(선택) → 1) 계열 템플릿 → 2) 합성(synth) → 3) 범용 퍼저(fuzz)
+#   0) llm(명시적 개발 모드) → 1) 계열 템플릿 → 2) 합성(synth) → 3) 범용 퍼저(fuzz)
 # 각 후보는 하네스 _prove() 를 재현한 검증기(verify.py)로 실제 불변식 위반을 확인하고,
 # 실패하면 다음 후보/단계로 격상해 반복한다. template→synth→fuzz 후보는 실무 감사
 # 엔진(api/prove.py)의 iter_engine_candidates 로부터 지연 생성된다.
 #
 # 검증기는 두 경로를 가진다:
-#   - forge 가 있으면 참가 번들의 harness/src/Harness.sol 을 재사용해 forge test 로 검증
-#   - 없으면 내장 EVM(solc 0.8.24 + eth-tester/py-evm)으로 동일한 _prove 절차를 재현
+#   - 제출 Docker: 참가 번들의 harness/src/Harness.sol 을 재사용해 forge test 로 검증
+#   - 로컬 보조: TRUST404_VERIFIER=evm 이면 내장 EVM으로 같은 _prove 절차를 재현
 # 두 경로 모두 오프라인에서 동작한다(네트워크 차단 샌드박스 전제).
 #
-# LLM: ANTHROPIC_API_KEY(또는 LLM_API_KEY)가 있으면 1차 후보로 LLM 초안을
-# 요청하고, 없거나 실패하면 내장 휴리스틱 템플릿으로 degrade 한다(키 없이도 동작).
+# LLM: TRUST404_ENABLE_LLM=1 과 API 설정을 함께 준 개발 모드에서만 LLM 초안을
+# 요청한다. 제출 Docker는 이를 끈 채 휴리스틱/합성/퍼저만 사용해 생성 결정론을
+# 보장한다.
 #
 # 표준 CLI:
 #   agent.py --contract <path> --invariants <path> --manifest <path> --out <dir>
@@ -73,6 +74,18 @@ def _load_engine():
 EXIT_FOUND = 0
 EXIT_NOT_FOUND = 1
 EXIT_ERROR = 2
+
+
+def _llm_enabled():
+    """Keep the standard scoring path deterministic even if a key leaks in.
+
+    Temperature zero does not make a remote model bit-for-bit deterministic.
+    Requiring a separate opt-in prevents ambient API credentials from changing
+    candidate order or the final Exploit.sol in the submitted container.
+    """
+    return os.environ.get("TRUST404_ENABLE_LLM", "0").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
 
 
 def parse_args(argv):
@@ -180,10 +193,10 @@ def main(argv=None):
     #   3) fuzz     — 범용 호출 시퀀스 탐색(미공개 타깃 일반화 축)
     def candidate_stream():
         seen_sources = set()
-        # 0) LLM (로컬 LLM_BASE_URL 또는 API 키가 있을 때만)
+        # 0) LLM (명시적 opt-in + 로컬 LLM_BASE_URL 또는 API 키가 있을 때만)
         llm_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("LLM_API_KEY")
         llm_base = os.environ.get("LLM_BASE_URL")
-        if llm_key or llm_base:
+        if _llm_enabled() and (llm_key or llm_base):
             try:
                 from llm import propose_exploit  # optional
                 draft = propose_exploit(analysis_src, invariants_src, findings, llm_key)
@@ -193,8 +206,10 @@ def main(argv=None):
                     yield ("llm", "llm", draft)
             except Exception as e:  # network blocked / parse fail → degrade
                 note(f"# LLM unavailable, degrading to heuristics: {str(e)[:120]}")
+        elif _llm_enabled():
+            note("# LLM enabled but no endpoint/key configured; offline mode")
         else:
-            note("# no LLM configured; offline heuristic/synthesis/fuzz mode")
+            note("# LLM disabled; deterministic offline heuristic/synthesis/fuzz mode")
         # Always generate the deterministic templates from the complete source
         # view first.  This catches inherited attack surfaces even when deeper
         # engine stages cannot execute a multi-source target internally.
@@ -317,7 +332,8 @@ def main(argv=None):
                 features=sorted(feats)[:24],
             ))
         # PoCo/A1: 실패를 LLM 재시도의 탐색 신호로 (키가 있을 때만, 1회)
-        if (not critique_llm_done and format_for_llm is not None and critiques
+        if (_llm_enabled() and not critique_llm_done
+                and format_for_llm is not None and critiques
                 and (os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("LLM_API_KEY")
                      or os.environ.get("LLM_BASE_URL"))):
             critique_llm_done = True

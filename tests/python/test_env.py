@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Environment gates from the Track 04 review. No solc, no forge."""
 import compileall
+import json
+import os
 import py_compile
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -33,7 +36,31 @@ class Env(unittest.TestCase):
         self.assertNotIn("foundryup --install 1.7.1", df)
         self.assertIn("COPY lib /work/lib", df)
         self.assertIn("compileall", df)
+        self.assertIn("TRUST404_VERIFIER=forge", df)
+        self.assertIn("TRUST404_ENABLE_LLM=0", df)
         self.assertTrue((ROOT / "harness" / "src" / "Harness.sol").is_file())
+
+    def test_llm_requires_explicit_opt_in(self):
+        from agent import _llm_enabled
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "ambient"}, clear=True):
+            self.assertFalse(_llm_enabled())
+        with patch.dict(os.environ, {"TRUST404_ENABLE_LLM": "1"}, clear=True):
+            self.assertTrue(_llm_enabled())
+
+    def test_access_poc_targets_first_ordered_invariant_only(self):
+        from scanner import scan_target
+        from strategies import build_exploit, FAM_ACCESS
+        base = ROOT / "targets" / "OpenVault"
+        manifest = json.loads((base / "manifest.json").read_text())
+        findings = scan_target(
+            (base / "src" / "OpenVault.sol").read_text(),
+            (base / "Invariants.sol").read_text(),
+            manifest,
+        )
+        exploit = build_exploit(FAM_ACCESS, findings)
+        self.assertIn("setOwner(address(this))", exploit)
+        self.assertNotIn("adminWithdraw", exploit)
+        self.assertNotIn("receive()", exploit)
 
     def test_safe_write_rejects_escape(self):
         from verify import _safe_write
