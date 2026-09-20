@@ -88,6 +88,24 @@ class CandidateRanking(unittest.TestCase):
         self.assertEqual(["t1", "t2", "t3", "s1", "t4"],
                          [candidate[1] for candidate in scheduled])
 
+    def test_full_budget_does_not_consume_more_expensive_candidates(self):
+        consumed = []
+
+        def stream():
+            for candidate in (
+                ("template", "t1", "1", {}),
+                ("synth", "s1", "2", {}),
+                ("fuzz", "f1", "3", {}),
+                ("fuzz", "f2", "4", {}),
+            ):
+                consumed.append(candidate[1])
+                yield candidate
+
+        scheduled = list(schedule_candidates(stream(), 3))
+        self.assertEqual(["t1", "s1", "f1"],
+                         [candidate[1] for candidate in scheduled])
+        self.assertEqual(["t1", "s1", "f1"], consumed)
+
 
 class WorldCandidateGate(unittest.TestCase):
     def test_helper_contract_alone_is_not_a_candidate(self):

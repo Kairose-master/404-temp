@@ -73,6 +73,81 @@ contract Invariants {
 }
 """
 
+ADDRESS_ARGUMENT_TARGET = """
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+contract AddressArgument {
+    struct Claim { address who; bool enabled; }
+    address public caller;
+    function seize(Claim calldata claim) external {
+        require(claim.who == msg.sender, "wrong caller argument");
+        require(claim.enabled, "disabled");
+        caller = claim.who;
+    }
+}
+"""
+
+ADDRESS_ARGUMENT_INVARIANTS = """
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+interface IAddressArgument { function caller() external view returns (address); }
+contract Invariants {
+    function checkAll(address target) external view returns (bool, string memory) {
+        if (IAddressArgument(target).caller() != address(0)) return (false, "healthy");
+        return (true, "");
+    }
+}
+"""
+
+COMPOSITE_TARGET = """
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+contract CompositeGate {
+    bool public broken;
+    function unlock(bytes4 key, int8 delta, uint256[] calldata path) external {
+        require(key == bytes4(0xffffffff), "key");
+        require(delta == -1, "delta");
+        require(path.length == 0, "path");
+        broken = true;
+    }
+}
+"""
+
+COMPOSITE_INVARIANTS = """
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+interface ICompositeGate { function broken() external view returns (bool); }
+contract Invariants {
+    function checkAll(address target) external view returns (bool, string memory) {
+        if (ICompositeGate(target).broken()) return (false, "healthy");
+        return (true, "");
+    }
+}
+"""
+
+SEQUENCE_TARGET = """
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+contract SequenceGate {
+    bool public armed;
+    bool public broken;
+    function arm() external { armed = true; }
+    function corrupt() external { require(armed, "not armed"); broken = true; }
+}
+"""
+
+SEQUENCE_INVARIANTS = """
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.24;
+interface ISequenceGate { function broken() external view returns (bool); }
+contract Invariants {
+    function checkAll(address target) external view returns (bool, string memory) {
+        if (ISequenceGate(target).broken()) return (false, "healthy");
+        return (true, "");
+    }
+}
+"""
+
 
 class FuzzCodegen(unittest.TestCase):
     def test_codegen_keeps_actions_inside_one_run_from_contract_caller(self):
@@ -99,6 +174,22 @@ class FuzzCodegen(unittest.TestCase):
         self.assertEqual(
             {"act(uint256)", "act(address)"},
             {function["signature"] for function in functions},
+        )
+
+    def test_composite_abi_types_are_searchable(self):
+        functions = prove._fuzz_fns([{
+            "type": "function", "name": "act", "stateMutability": "nonpayable",
+            "inputs": [
+                {"type": "int8"}, {"type": "bytes4"}, {"type": "string"},
+                {"type": "uint256[]"},
+                {"type": "tuple", "components": [
+                    {"type": "address"}, {"type": "bool"},
+                ]},
+            ],
+        }])
+        self.assertEqual(
+            "act(int8,bytes4,string,uint256[],(address,bool))",
+            functions[0]["signature"],
         )
 
     def test_multiblock_workflow_is_not_a_track_candidate(self):
@@ -132,6 +223,26 @@ class HarnessShapedFuzzing(unittest.TestCase):
             result = verify_full(
                 "CallerSensitive", CALLER_TARGET, CALLER_INVARIANTS,
                 exploit, manifest, 42,
+            )
+        self.assertTrue(result.proven, result.detail)
+
+    def test_symbolic_attacker_address_is_rebound_in_generated_calldata(self):
+        manifest = _manifest("AddressArgument")
+        sequence, payable_map, feedback = next(prove._iter_fuzz_candidates(
+            "AddressArgument", ADDRESS_ARGUMENT_TARGET,
+            ADDRESS_ARGUMENT_INVARIANTS, manifest, True,
+            budget=30, depth=1, max_candidates=1,
+        ))
+        self.assertEqual("attacker", sequence[0]["address_patches"][0]["symbol"])
+        exploit = prove._fuzz_codegen(sequence, payable_map)
+        self.assertIn("assembly { mstore", exploit)
+        self.assertIn("address()", exploit)
+
+        from verify import verify_full
+        with patch.dict(os.environ, {"TRUST404_VERIFIER": "evm"}):
+            result = verify_full(
+                "AddressArgument", ADDRESS_ARGUMENT_TARGET,
+                ADDRESS_ARGUMENT_INVARIANTS, exploit, manifest, 42,
             )
         self.assertTrue(result.proven, result.detail)
 
@@ -180,6 +291,54 @@ class HarnessShapedFuzzing(unittest.TestCase):
             result = verify_full(
                 "SetupTarget", target, invariants, exploit, manifest, 42,
                 extra_sources={"Setup.s.sol": setup},
+            )
+        self.assertTrue(result.proven, result.detail)
+
+    def test_dynamic_array_and_signed_inputs_reproduce_as_raw_calldata(self):
+        manifest = _manifest("CompositeGate")
+        candidate = next(prove._iter_fuzz_candidates(
+            "CompositeGate", COMPOSITE_TARGET, COMPOSITE_INVARIANTS,
+            manifest, True, budget=80, depth=1, pool_level=1,
+            max_candidates=1,
+        ))
+        sequence, payable_map, feedback = candidate
+        self.assertEqual("unlock", sequence[0]["name"])
+        self.assertIn("encoded_data", sequence[0])
+        self.assertEqual([], feedback["reproducer"][0]["arguments"][2])
+        exploit = prove._fuzz_codegen(sequence, payable_map)
+        self.assertIn("hex\"", exploit)
+
+        from verify import verify_full
+        with patch.dict(os.environ, {"TRUST404_VERIFIER": "evm"}):
+            result = verify_full(
+                "CompositeGate", COMPOSITE_TARGET, COMPOSITE_INVARIANTS,
+                exploit, manifest, 42,
+            )
+        self.assertTrue(result.proven, result.detail)
+
+    def test_state_only_two_call_path_is_found_and_one_minimal(self):
+        manifest = _manifest("SequenceGate")
+        candidate = next(prove._iter_fuzz_candidates(
+            "SequenceGate", SEQUENCE_TARGET, SEQUENCE_INVARIANTS,
+            manifest, True, budget=80, depth=2, max_candidates=1,
+        ))
+        sequence, payable_map, feedback = candidate
+        self.assertEqual(["arm", "corrupt"], [call["name"] for call in sequence])
+        self.assertEqual({
+            "original_calls": 2,
+            "final_calls": 2,
+            "one_minimal": True,
+        }, {
+            key: feedback["minimization"][key]
+            for key in ("original_calls", "final_calls", "one_minimal")
+        })
+
+        from verify import verify_full
+        exploit = prove._fuzz_codegen(sequence, payable_map)
+        with patch.dict(os.environ, {"TRUST404_VERIFIER": "evm"}):
+            result = verify_full(
+                "SequenceGate", SEQUENCE_TARGET, SEQUENCE_INVARIANTS,
+                exploit, manifest, 42,
             )
         self.assertTrue(result.proven, result.detail)
 

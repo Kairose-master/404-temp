@@ -1,5 +1,5 @@
 # TRUST404 Track04 — live prove endpoint (Vercel Python serverless).
-# GET  /api/prove?target=<Name>   : 내장 공개셋 6개
+# GET  /api/prove?target=<Name>   : targets/ 회귀 fixture
 # POST /api/prove  {contract, invariants?, manifest?, targetName?} : 임의 컨트랙트
 # 실제 in-memory EVM 에서 배포->Exploit.sol 생성->실행->checkAll 재검사.
 import os, json, time, re, random, warnings, traceback
@@ -23,425 +23,20 @@ DEFAULT_EXPLOIT_FUNDING_WEI = 10 * 10**18
 DEFAULT_SEED_WEI = 10 * 10**18
 MAX_SRC = 500000  # per-field source cap for custom uploads
 
-TARGETS = {
- "ReentrantVault": {
-  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Minimal ETH vault. Users deposit ETH and withdraw their own\n/// recorded balance later. The vault also starts with some ambient float\n/// liquidity seeded at deployment.\ncontract ReentrantVault {\n    mapping(address => uint256) public balances;\n\n    event Deposited(address indexed who, uint256 amount);\n    event Withdrawn(address indexed who, uint256 amount);\n\n    constructor() payable {}\n\n    function deposit() external payable {\n        require(msg.value > 0, \"zero deposit\");\n        balances[msg.sender] += msg.value;\n        emit Deposited(msg.sender, msg.value);\n    }\n\n    function withdraw() external {\n        uint256 bal = balances[msg.sender];\n        require(bal > 0, \"no balance\");\n\n        (bool sent, ) = msg.sender.call{value: bal}(\"\");\n        require(sent, \"transfer failed\");\n\n        balances[msg.sender] = 0;\n        emit Withdrawn(msg.sender, bal);\n    }\n\n    receive() external payable {}\n}\n",
-  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Invariant predicates for ReentrantVault.\n/// Each predicate is `view` and returns true = property holds (healthy),\n/// false = property violated (attack succeeded). checkAll bundles the\n/// individual predicates in the order declared in manifest.json.\ncontract Invariants {\n    /// @dev Must match manifest.json -> deploy.value_wei for this target.\n    uint256 constant SEED = 10 ether;\n\n    /// @notice The vault must always hold at least the ETH it was seeded\n    /// with. A single honest deposit+withdraw nets to zero change, so only\n    /// a genuine accounting bug can push the balance below the seed.\n    function vaultSolvent(address target) public view returns (bool) {\n        return target.balance >= SEED;\n    }\n\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!vaultSolvent(target)) return (false, \"vaultSolvent\");\n        return (true, \"\");\n    }\n}\n",
-  "manifest": {
-   "schema": "trust404.track04.manifest/0.1",
-   "target": {
-    "name": "ReentrantVault",
-    "src": "src/ReentrantVault.sol",
-    "solc": "0.8.24",
-    "evm_version": "cancun"
-   },
-   "deploy": {
-    "mode": "local",
-    "constructor_args": [],
-    "value_wei": "10000000000000000000",
-    "setup": "Setup.s.sol"
-   },
-   "determinism": {
-    "block_number": 21000000,
-    "block_timestamp": 1735689600,
-    "seed": 42
-   },
-   "invariants": {
-    "contract": "Invariants.sol",
-    "predicates": [
-     "vaultSolvent"
-    ]
-   },
-   "budget": {
-    "timeout_sec": 300,
-    "max_attempts": 5
-   }
-  }
- },
- "OpenVault": {
-  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice ETH vault with an administrative recovery path and an owner role.\ncontract OpenVault {\n    address public owner;\n    mapping(address => uint256) public balances;\n\n    event Deposited(address indexed who, uint256 amount);\n    event Withdrawn(address indexed who, uint256 amount);\n    event OwnerChanged(address indexed newOwner);\n\n    constructor(address initialOwner) payable {\n        owner = initialOwner;\n    }\n\n    function deposit() external payable {\n        require(msg.value > 0, \"zero deposit\");\n        balances[msg.sender] += msg.value;\n        emit Deposited(msg.sender, msg.value);\n    }\n\n    function withdraw(uint256 amount) external {\n        require(balances[msg.sender] >= amount, \"insufficient balance\");\n        balances[msg.sender] -= amount;\n\n        (bool ok, ) = msg.sender.call{value: amount}(\"\");\n        require(ok, \"transfer failed\");\n        emit Withdrawn(msg.sender, amount);\n    }\n\n    /// @notice Recovery hatch meant for the owner to rescue stuck funds.\n    function adminWithdraw(address to, uint256 amount) external {\n        (bool ok, ) = to.call{value: amount}(\"\");\n        require(ok, \"transfer failed\");\n    }\n\n    /// @notice Meant to let the owner hand off admin duties.\n    function setOwner(address newOwner) external {\n        owner = newOwner;\n        emit OwnerChanged(newOwner);\n    }\n\n    receive() external payable {}\n}\n",
-  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Invariant predicates for OpenVault.\n/// true = property holds (healthy), false = property violated.\ninterface IOpenVaultView {\n    function owner() external view returns (address);\n}\n\ncontract Invariants {\n    /// @dev Must match manifest.json -> deploy.constructor_args[0].\n    address constant EXPECTED_OWNER = address(0xA11CE);\n    /// @dev Must match manifest.json -> deploy.value_wei for this target.\n    uint256 constant SEED = 10 ether;\n\n    function ownerUnchanged(address target) public view returns (bool) {\n        return IOpenVaultView(target).owner() == EXPECTED_OWNER;\n    }\n\n    function vaultSolvent(address target) public view returns (bool) {\n        return target.balance >= SEED;\n    }\n\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!ownerUnchanged(target)) return (false, \"ownerUnchanged\");\n        if (!vaultSolvent(target)) return (false, \"vaultSolvent\");\n        return (true, \"\");\n    }\n}\n",
-  "manifest": {
-   "schema": "trust404.track04.manifest/0.1",
-   "target": {
-    "name": "OpenVault",
-    "src": "src/OpenVault.sol",
-    "solc": "0.8.24",
-    "evm_version": "cancun"
-   },
-   "deploy": {
-    "mode": "local",
-    "constructor_args": [
-     "0x00000000000000000000000000000000000a11ce"
-    ],
-    "value_wei": "10000000000000000000",
-    "setup": "Setup.s.sol"
-   },
-   "determinism": {
-    "block_number": 21000000,
-    "block_timestamp": 1735689600,
-    "seed": 42
-   },
-   "invariants": {
-    "contract": "Invariants.sol",
-    "predicates": [
-     "ownerUnchanged",
-     "vaultSolvent"
-    ]
-   },
-   "budget": {
-    "timeout_sec": 300,
-    "max_attempts": 5
-   }
-  }
- },
- "BadAccounting": {
-  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Internal ETH credit ledger. Users can transfer credit to one\n/// another and redeem their own credit for ETH held by the contract.\ncontract BadAccounting {\n    mapping(address => uint256) public balanceOf;\n\n    event Transferred(address indexed from, address indexed to, uint256 amount);\n    event Redeemed(address indexed who, uint256 amount);\n\n    constructor() payable {}\n\n    function transfer(address to, uint256 amount) external {\n        unchecked {\n            balanceOf[msg.sender] -= amount;\n            balanceOf[to] += amount;\n        }\n        emit Transferred(msg.sender, to, amount);\n    }\n\n    function redeem(uint256 amount) external {\n        require(balanceOf[msg.sender] >= amount, \"insufficient credit\");\n        balanceOf[msg.sender] -= amount;\n\n        (bool ok, ) = msg.sender.call{value: amount}(\"\");\n        require(ok, \"redeem failed\");\n        emit Redeemed(msg.sender, amount);\n    }\n}\n",
-  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Invariant predicates for BadAccounting.\n/// true = property holds (healthy), false = property violated.\ncontract Invariants {\n    /// @dev Must match manifest.json -> deploy.value_wei for this target.\n    uint256 constant SEED = 10 ether;\n\n    /// @notice No one is credited any balance at deploy time, so no one can\n    /// legitimately redeem anything yet. The contract's ETH balance must\n    /// therefore never drop below the seed float.\n    function vaultSolvent(address target) public view returns (bool) {\n        return target.balance >= SEED;\n    }\n\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!vaultSolvent(target)) return (false, \"vaultSolvent\");\n        return (true, \"\");\n    }\n}\n",
-  "manifest": {
-   "schema": "trust404.track04.manifest/0.1",
-   "target": {
-    "name": "BadAccounting",
-    "src": "src/BadAccounting.sol",
-    "solc": "0.8.24",
-    "evm_version": "cancun"
-   },
-   "deploy": {
-    "mode": "local",
-    "constructor_args": [],
-    "value_wei": "10000000000000000000",
-    "setup": "Setup.s.sol"
-   },
-   "determinism": {
-    "block_number": 21000000,
-    "block_timestamp": 1735689600,
-    "seed": 42
-   },
-   "invariants": {
-    "contract": "Invariants.sol",
-    "predicates": [
-     "vaultSolvent"
-    ]
-   },
-   "budget": {
-    "timeout_sec": 300,
-    "max_attempts": 5
-   }
-  }
- },
- "NaiveOracle": {
-  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Minimal mintable ERC20-like token used only inside this target.\n/// `mint` is restricted to the single address that deployed it.\ncontract Token {\n    string public name;\n    string public symbol;\n    uint8 public constant decimals = 18;\n\n    address public immutable minter;\n    uint256 public totalSupply;\n    mapping(address => uint256) public balanceOf;\n    mapping(address => mapping(address => uint256)) public allowance;\n\n    event Transfer(address indexed from, address indexed to, uint256 value);\n    event Approval(address indexed owner, address indexed spender, uint256 value);\n\n    constructor(string memory _name, string memory _symbol) {\n        name = _name;\n        symbol = _symbol;\n        minter = msg.sender;\n    }\n\n    function mint(address to, uint256 amount) external {\n        require(msg.sender == minter, \"not minter\");\n        totalSupply += amount;\n        balanceOf[to] += amount;\n        emit Transfer(address(0), to, amount);\n    }\n\n    function approve(address spender, uint256 amount) external returns (bool) {\n        allowance[msg.sender][spender] = amount;\n        emit Approval(msg.sender, spender, amount);\n        return true;\n    }\n\n    function transfer(address to, uint256 amount) external returns (bool) {\n        _transfer(msg.sender, to, amount);\n        return true;\n    }\n\n    function transferFrom(address from, address to, uint256 amount) external returns (bool) {\n        uint256 allowed = allowance[from][msg.sender];\n        require(allowed >= amount, \"allowance exceeded\");\n        if (allowed != type(uint256).max) {\n            allowance[from][msg.sender] = allowed - amount;\n        }\n        _transfer(from, to, amount);\n        return true;\n    }\n\n    function _transfer(address from, address to, uint256 amount) internal {\n        require(balanceOf[from] >= amount, \"insufficient balance\");\n        balanceOf[from] -= amount;\n        balanceOf[to] += amount;\n        emit Transfer(from, to, amount);\n    }\n}\n\n/// @notice Thin constant-product spot-price pool. Anyone can swap; there is\n/// no fee and no external price feed, so the spot price simply reflects\n/// whatever the current on-chain reserves are.\ncontract Pool {\n    Token public col;\n    Token public bor;\n    uint256 public reserveCol;\n    uint256 public reserveBor;\n\n    constructor(Token _col, Token _bor) {\n        col = _col;\n        bor = _bor;\n    }\n\n    function sync() external {\n        reserveCol = col.balanceOf(address(this));\n        reserveBor = bor.balanceOf(address(this));\n    }\n\n    /// @return price of 1 COL expressed in BOR, scaled by 1e18.\n    function spotPrice() external view returns (uint256) {\n        require(reserveCol > 0, \"no liquidity\");\n        return (reserveBor * 1e18) / reserveCol;\n    }\n\n    function swapColForBor(uint256 colIn) external {\n        col.transferFrom(msg.sender, address(this), colIn);\n        uint256 borOut = (reserveBor * colIn) / (reserveCol + colIn);\n        reserveCol += colIn;\n        reserveBor -= borOut;\n        bor.transfer(msg.sender, borOut);\n    }\n\n    function swapBorForCol(uint256 borIn) external {\n        bor.transferFrom(msg.sender, address(this), borIn);\n        uint256 colOut = (reserveCol * borIn) / (reserveBor + borIn);\n        reserveBor += borIn;\n        reserveCol -= colOut;\n        col.transfer(msg.sender, colOut);\n    }\n}\n\n/// @notice Collateralized lending desk that prices collateral off the\n/// `Pool`'s live spot price with no averaging, staleness check, or bound.\ncontract NaiveOracle {\n    Token public collateralToken;\n    Token public borrowToken;\n    Pool public pool;\n\n    uint256 public totalCollateral;\n    uint256 public totalDebt;\n    mapping(address => uint256) public collateralOf;\n    mapping(address => uint256) public debtOf;\n\n    event Deposited(address indexed who, uint256 amount);\n    event Borrowed(address indexed who, uint256 amount);\n\n    constructor() payable {\n        collateralToken = new Token(\"Collateral\", \"COL\");\n        borrowToken = new Token(\"Borrow\", \"BOR\");\n        pool = new Pool(collateralToken, borrowToken);\n\n        // Thin starting liquidity: 1 COL == 1 BOR.\n        collateralToken.mint(address(pool), 100e18);\n        borrowToken.mint(address(pool), 100e18);\n        pool.sync();\n\n        // Fund the lending desk so it can pay out borrows.\n        borrowToken.mint(address(this), 1_000_000e18);\n    }\n\n    /// @notice Test faucet so anyone can try the protocol without an\n    /// external funding source.\n    function faucet() external {\n        borrowToken.mint(msg.sender, 1_000e18);\n    }\n\n    function depositCollateral(uint256 amount) external {\n        collateralToken.transferFrom(msg.sender, address(this), amount);\n        collateralOf[msg.sender] += amount;\n        totalCollateral += amount;\n        emit Deposited(msg.sender, amount);\n    }\n\n    function borrow(uint256 amount) external {\n        uint256 price = pool.spotPrice();\n        uint256 value = (collateralOf[msg.sender] * price) / 1e18;\n        require(debtOf[msg.sender] + amount <= value, \"exceeds collateral value\");\n\n        debtOf[msg.sender] += amount;\n        totalDebt += amount;\n        borrowToken.transfer(msg.sender, amount);\n        emit Borrowed(msg.sender, amount);\n    }\n}\n",
-  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Invariant predicates for NaiveOracle.\n/// true = property holds (healthy), false = property violated.\ninterface INaiveOracleView {\n    function totalCollateral() external view returns (uint256);\n    function totalDebt() external view returns (uint256);\n}\n\ncontract Invariants {\n    /// @dev Ground-truth reference price (1 COL == 1 BOR), independent of\n    /// whatever the target's own pool currently reports.\n    uint256 constant FAIR_PRICE = 1e18;\n\n    /// @notice Outstanding debt must never exceed the fair value of the\n    /// collateral actually deposited.\n    function protocolSolvent(address target) public view returns (bool) {\n        INaiveOracleView t = INaiveOracleView(target);\n        return t.totalDebt() <= (t.totalCollateral() * FAIR_PRICE) / 1e18;\n    }\n\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!protocolSolvent(target)) return (false, \"protocolSolvent\");\n        return (true, \"\");\n    }\n}\n",
-  "manifest": {
-   "schema": "trust404.track04.manifest/0.1",
-   "target": {
-    "name": "NaiveOracle",
-    "src": "src/NaiveOracle.sol",
-    "solc": "0.8.24",
-    "evm_version": "cancun"
-   },
-   "deploy": {
-    "mode": "local",
-    "constructor_args": [],
-    "value_wei": "0"
-   },
-   "determinism": {
-    "block_number": 21000000,
-    "block_timestamp": 1735689600,
-    "seed": 42
-   },
-   "invariants": {
-    "contract": "Invariants.sol",
-    "predicates": [
-     "protocolSolvent"
-    ]
-   },
-   "budget": {
-    "timeout_sec": 600,
-    "max_attempts": 8
-   }
-  }
- },
- "SafeVault": {
-  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice ETH vault with checks-effects-interactions ordering and a\n/// reentrancy guard on withdrawal.\ncontract SafeVault {\n    mapping(address => uint256) public balances;\n    uint256 private locked = 1;\n\n    event Deposited(address indexed who, uint256 amount);\n    event Withdrawn(address indexed who, uint256 amount);\n\n    modifier nonReentrant() {\n        require(locked == 1, \"reentrant call\");\n        locked = 2;\n        _;\n        locked = 1;\n    }\n\n    constructor() payable {}\n\n    function deposit() external payable {\n        require(msg.value > 0, \"zero deposit\");\n        balances[msg.sender] += msg.value;\n        emit Deposited(msg.sender, msg.value);\n    }\n\n    function withdraw() external nonReentrant {\n        uint256 bal = balances[msg.sender];\n        require(bal > 0, \"no balance\");\n\n        balances[msg.sender] = 0;\n\n        (bool sent, ) = msg.sender.call{value: bal}(\"\");\n        require(sent, \"transfer failed\");\n        emit Withdrawn(msg.sender, bal);\n    }\n\n    receive() external payable {}\n}\n",
-  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Invariant predicates for SafeVault.\n/// true = property holds (healthy), false = property violated.\ncontract Invariants {\n    /// @dev Must match manifest.json -> deploy.value_wei for this target.\n    uint256 constant SEED = 10 ether;\n\n    function vaultSolvent(address target) public view returns (bool) {\n        return target.balance >= SEED;\n    }\n\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!vaultSolvent(target)) return (false, \"vaultSolvent\");\n        return (true, \"\");\n    }\n}\n",
-  "manifest": {
-   "schema": "trust404.track04.manifest/0.1",
-   "target": {
-    "name": "SafeVault",
-    "src": "src/SafeVault.sol",
-    "solc": "0.8.24",
-    "evm_version": "cancun"
-   },
-   "deploy": {
-    "mode": "local",
-    "constructor_args": [],
-    "value_wei": "10000000000000000000",
-    "setup": "Setup.s.sol"
-   },
-   "determinism": {
-    "block_number": 21000000,
-    "block_timestamp": 1735689600,
-    "seed": 42
-   },
-   "invariants": {
-    "contract": "Invariants.sol",
-    "predicates": [
-     "vaultSolvent"
-    ]
-   },
-   "budget": {
-    "timeout_sec": 300,
-    "max_attempts": 5
-   }
-  }
- },
- "BoundedOwner": {
-  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Treasury where the owner can move funds only through a capped,\n/// time-locked proposal: at most 10% of the current balance per proposal,\n/// and only after a 2-day delay has passed.\ncontract BoundedOwner {\n    address public owner;\n    uint256 public constant MAX_WITHDRAW_BPS = 1000; // 10%\n    uint256 public constant TIMELOCK_DELAY = 2 days;\n\n    struct Proposal {\n        address to;\n        uint256 amount;\n        uint256 executeAfter;\n        bool executed;\n    }\n\n    mapping(uint256 => Proposal) public proposals;\n    uint256 public proposalCount;\n\n    event Proposed(uint256 indexed id, address to, uint256 amount, uint256 executeAfter);\n    event Executed(uint256 indexed id);\n\n    modifier onlyOwner() {\n        require(msg.sender == owner, \"not owner\");\n        _;\n    }\n\n    constructor(address initialOwner) payable {\n        owner = initialOwner;\n    }\n\n    function propose(address to, uint256 amount) external onlyOwner returns (uint256 id) {\n        require(amount <= (address(this).balance * MAX_WITHDRAW_BPS) / 10000, \"over cap\");\n        id = proposalCount++;\n        uint256 executeAfter = block.timestamp + TIMELOCK_DELAY;\n        proposals[id] = Proposal({to: to, amount: amount, executeAfter: executeAfter, executed: false});\n        emit Proposed(id, to, amount, executeAfter);\n    }\n\n    function execute(uint256 id) external onlyOwner {\n        Proposal storage p = proposals[id];\n        require(!p.executed, \"already executed\");\n        require(block.timestamp >= p.executeAfter, \"timelocked\");\n        p.executed = true;\n\n        (bool ok, ) = p.to.call{value: p.amount}(\"\");\n        require(ok, \"transfer failed\");\n        emit Executed(id);\n    }\n\n    receive() external payable {}\n}\n",
-  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Invariant predicates for BoundedOwner.\n/// true = property holds (healthy), false = property violated.\ninterface IBoundedOwnerView {\n    function owner() external view returns (address);\n}\n\ncontract Invariants {\n    /// @dev Must match manifest.json -> deploy.constructor_args[0].\n    address constant EXPECTED_OWNER = address(0xA11CE);\n    /// @dev Must match manifest.json -> deploy.value_wei for this target.\n    uint256 constant SEED = 10 ether;\n\n    function ownerUnchanged(address target) public view returns (bool) {\n        return IBoundedOwnerView(target).owner() == EXPECTED_OWNER;\n    }\n\n    function vaultSolvent(address target) public view returns (bool) {\n        return target.balance >= SEED;\n    }\n\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!ownerUnchanged(target)) return (false, \"ownerUnchanged\");\n        if (!vaultSolvent(target)) return (false, \"vaultSolvent\");\n        return (true, \"\");\n    }\n}\n",
-  "manifest": {
-   "schema": "trust404.track04.manifest/0.1",
-   "target": {
-    "name": "BoundedOwner",
-    "src": "src/BoundedOwner.sol",
-    "solc": "0.8.24",
-    "evm_version": "cancun"
-   },
-   "deploy": {
-    "mode": "local",
-    "constructor_args": [
-     "0x00000000000000000000000000000000000a11ce"
-    ],
-    "value_wei": "10000000000000000000",
-    "setup": "Setup.s.sol"
-   },
-   "determinism": {
-    "block_number": 21000000,
-    "block_timestamp": 1735689600,
-    "seed": 42
-   },
-   "invariants": {
-    "contract": "Invariants.sol",
-    "predicates": [
-     "ownerUnchanged",
-     "vaultSolvent"
-    ]
-   },
-   "budget": {
-    "timeout_sec": 300,
-    "max_attempts": 5
-   }
-  }
- },
- "DelegateVault": {
-  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice A \"modular\" vault that lets callers plug in behaviour by\n/// delegatecalling an arbitrary module address they supply. Because the\n/// module runs in THIS contract's storage context, a malicious module can\n/// overwrite `owner` (storage slot 0). Modelled on Ethernaut Delegation /\n/// Preservation and the Parity multisig delegatecall class.\ncontract DelegateVault {\n    address public owner;      // slot 0\n    uint256 public deposits;   // slot 1\n\n    constructor() payable {\n        owner = address(0xA11CE);\n    }\n\n    /// @dev VULNERABLE: module address is fully attacker-controlled and is\n    /// invoked with delegatecall, so its code mutates DelegateVault storage.\n    function execute(address module, bytes calldata data) external {\n        (bool ok, ) = module.delegatecall(data);\n        require(ok, \"module call failed\");\n    }\n\n    function deposit() external payable {\n        deposits += msg.value;\n    }\n\n    receive() external payable {}\n}\n",
-  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice true = property holds (healthy), false = violated.\ninterface IOwned { function owner() external view returns (address); }\n\ncontract Invariants {\n    address constant INITIAL_OWNER = address(0xA11CE);\n\n    /// @notice Ownership must remain with the address set at construction.\n    function ownerUnchanged(address target) public view returns (bool) {\n        return IOwned(target).owner() == INITIAL_OWNER;\n    }\n\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!ownerUnchanged(target)) return (false, \"ownerUnchanged\");\n        return (true, \"\");\n    }\n}\n",
-  "manifest": {
-   "schema": "trust404.track04.manifest/0.1",
-   "target": {
-    "name": "DelegateVault",
-    "src": "src/DelegateVault.sol",
-    "solc": "0.8.24",
-    "evm_version": "cancun"
-   },
-   "deploy": {
-    "mode": "local",
-    "constructor_args": [],
-    "value_wei": "1000000000000000000"
-   },
-   "determinism": {
-    "block_number": 21000000,
-    "block_timestamp": 1735689600,
-    "seed": 42
-   },
-   "invariants": {
-    "contract": "Invariants.sol",
-    "predicates": [
-     "ownerUnchanged"
-    ]
-   },
-   "budget": {
-    "timeout_sec": 300,
-    "max_attempts": 6
-   }
-  }
- },
- "PredictableLottery": {
-  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice A lottery whose \"random\" winning number is derived entirely from\n/// on-chain block fields readable by any caller in the SAME transaction.\n/// An attacker computes the identical value and always wins. Modelled on\n/// Ethernaut CoinFlip and Capture-the-Ether \"Predict the Future\".\ncontract PredictableLottery {\n    constructor() payable {}\n\n    /// @dev VULNERABLE: entropy source is block.timestamp/prevrandao/number,\n    /// all known to the caller before they pick `guess`.\n    function play(uint256 guess) external payable {\n        require(msg.value == 1 ether, \"ante is 1 ether\");\n        uint256 lucky = uint256(\n            keccak256(abi.encodePacked(block.timestamp, block.prevrandao, block.number))\n        ) % 100;\n        if (guess == lucky) {\n            (bool ok, ) = msg.sender.call{value: 5 ether}(\"\");\n            require(ok, \"payout failed\");\n        }\n    }\n\n    receive() external payable {}\n}\n",
-  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\ncontract Invariants {\n    uint256 constant SEED = 20 ether;\n    /// @notice The house must always retain at least its seeded float. A\n    /// fair game nets to zero for the house; only a predictable-RNG drain\n    /// can push it below the seed.\n    function houseSolvent(address target) public view returns (bool) {\n        return target.balance >= SEED;\n    }\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!houseSolvent(target)) return (false, \"houseSolvent\");\n        return (true, \"\");\n    }\n}\n",
-  "manifest": {
-   "schema": "trust404.track04.manifest/0.1",
-   "target": {
-    "name": "PredictableLottery",
-    "src": "src/PredictableLottery.sol",
-    "solc": "0.8.24",
-    "evm_version": "cancun"
-   },
-   "deploy": {
-    "mode": "local",
-    "constructor_args": [],
-    "value_wei": "20000000000000000000"
-   },
-   "determinism": {
-    "block_number": 21000000,
-    "block_timestamp": 1735689600,
-    "seed": 42
-   },
-   "invariants": {
-    "contract": "Invariants.sol",
-    "predicates": [
-     "houseSolvent"
-    ]
-   },
-   "budget": {
-    "timeout_sec": 300,
-    "max_attempts": 6
-   }
-  }
- },
- "OpenInitializer": {
-  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice A logic contract whose admin slot is left uninitialized at\n/// construction and can be claimed by ANYONE via an unguarded initializer.\n/// Modelled on Ethernaut Motorbike (uninitialized UUPS) and the broad class\n/// of proxy contracts deployed without initialize() being locked.\ncontract OpenInitializer {\n    address public admin;   // slot 0 \u2014 starts as address(0)\n\n    constructor() payable {}\n\n    /// @dev VULNERABLE: no `initialized` guard, no access control. The first\n    /// caller becomes admin.\n    function initialize() external {\n        admin = msg.sender;\n    }\n\n    /// @dev Once admin, sweep the whole balance.\n    function sweep(address payable to) external {\n        require(msg.sender == admin, \"not admin\");\n        (bool ok, ) = to.call{value: address(this).balance}(\"\");\n        require(ok, \"sweep failed\");\n    }\n\n    receive() external payable {}\n}\n",
-  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\ninterface IAdmin { function admin() external view returns (address); }\n\ncontract Invariants {\n    /// @notice The admin slot must remain uninitialized until the legitimate\n    /// deployer claims it. Any other address seizing it is a takeover.\n    function adminUninitialized(address target) public view returns (bool) {\n        return IAdmin(target).admin() == address(0);\n    }\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!adminUninitialized(target)) return (false, \"adminUninitialized\");\n        return (true, \"\");\n    }\n}\n",
-  "manifest": {
-   "schema": "trust404.track04.manifest/0.1",
-   "target": {
-    "name": "OpenInitializer",
-    "src": "src/OpenInitializer.sol",
-    "solc": "0.8.24",
-    "evm_version": "cancun"
-   },
-   "deploy": {
-    "mode": "local",
-    "constructor_args": [],
-    "value_wei": "1000000000000000000"
-   },
-   "determinism": {
-    "block_number": 21000000,
-    "block_timestamp": 1735689600,
-    "seed": 42
-   },
-   "invariants": {
-    "contract": "Invariants.sol",
-    "predicates": [
-     "adminUninitialized"
-    ]
-   },
-   "budget": {
-    "timeout_sec": 300,
-    "max_attempts": 6
-   }
-  }
- },
- "LibraryVault": {
-  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice Fixed logic module. Its storage layout is deliberately aligned with\n/// LibraryVault: slot 0 mirrors `owner` and is never written here, while the\n/// counter lives at slot 1. A delegatecall into ping() therefore can only ever\n/// touch slot 1, never the vault's owner slot.\ncontract Logic {\n    address private _ownerSlot; // slot 0 \u2014 mirrors LibraryVault.owner; never written\n    uint256 public pings;       // slot 1\n    function ping() external { pings += 1; }\n}\n\n/// @notice SAFE counterpart to DelegateVault. It also uses delegatecall, but\n/// only ever to an IMMUTABLE module fixed at construction whose storage layout\n/// is aligned with this contract. Callers cannot point it at attacker code, and\n/// the module never writes the owner slot, so ownership cannot be hijacked.\ncontract LibraryVault {\n    address public owner;             // slot 0\n    uint256 public pings;             // slot 1 \u2014 bumped by the module\n    address public immutable module;  // immutable \u2192 not attacker-controlled, no slot\n\n    constructor() payable {\n        owner = address(0xA11CE);\n        module = address(new Logic());\n    }\n\n    /// @dev delegatecall target is the fixed `module`, never a parameter, and\n    /// the module only ever writes slot 1 (pings), never slot 0 (owner).\n    function run(bytes calldata data) external {\n        (bool ok, ) = module.delegatecall(data);\n        require(ok, \"module call failed\");\n    }\n\n    receive() external payable {}\n}\n",
-  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\ninterface IOwned { function owner() external view returns (address); }\n\ncontract Invariants {\n    address constant INITIAL_OWNER = address(0xA11CE);\n    function ownerUnchanged(address target) public view returns (bool) {\n        return IOwned(target).owner() == INITIAL_OWNER;\n    }\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!ownerUnchanged(target)) return (false, \"ownerUnchanged\");\n        return (true, \"\");\n    }\n}\n",
-  "manifest": {
-   "schema": "trust404.track04.manifest/0.1",
-   "target": {
-    "name": "LibraryVault",
-    "src": "src/LibraryVault.sol",
-    "solc": "0.8.24",
-    "evm_version": "cancun"
-   },
-   "deploy": {
-    "mode": "local",
-    "constructor_args": [],
-    "value_wei": "1000000000000000000"
-   },
-   "determinism": {
-    "block_number": 21000000,
-    "block_timestamp": 1735689600,
-    "seed": 42
-   },
-   "invariants": {
-    "contract": "Invariants.sol",
-    "predicates": [
-     "ownerUnchanged"
-    ]
-   },
-   "budget": {
-    "timeout_sec": 300,
-    "max_attempts": 6
-   }
-  }
- },
- "CommitLottery": {
-  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice SAFE counterpart to PredictableLottery. The winning condition is a\n/// pre-committed secret hash, NOT any block field. A caller cannot derive the\n/// secret from on-chain state within the transaction, so there is no\n/// predictable-RNG edge to exploit (commit-reveal pattern).\ncontract CommitLottery {\n    // Hash of the house's secret, fixed at deploy. Preimage is off-chain.\n    bytes32 public constant COMMITMENT =\n        0x9d3e2b1f4c7a86d05e21bb90f7c4c0a3d8e6f1b2c9a4d7e0f3b6c1a2d5e8f0b7;\n\n    constructor() payable {}\n\n    /// @dev No block.timestamp / prevrandao / blockhash anywhere: the payout\n    /// gate is a hash preimage check, unpredictable on-chain.\n    function claim(uint256 secret) external {\n        require(keccak256(abi.encodePacked(secret)) == COMMITMENT, \"wrong secret\");\n        (bool ok, ) = msg.sender.call{value: 5 ether}(\"\");\n        require(ok, \"payout failed\");\n    }\n\n    receive() external payable {}\n}\n",
-  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\ncontract Invariants {\n    uint256 constant SEED = 20 ether;\n    function houseSolvent(address target) public view returns (bool) {\n        return target.balance >= SEED;\n    }\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!houseSolvent(target)) return (false, \"houseSolvent\");\n        return (true, \"\");\n    }\n}\n",
-  "manifest": {
-   "schema": "trust404.track04.manifest/0.1",
-   "target": {
-    "name": "CommitLottery",
-    "src": "src/CommitLottery.sol",
-    "solc": "0.8.24",
-    "evm_version": "cancun"
-   },
-   "deploy": {
-    "mode": "local",
-    "constructor_args": [],
-    "value_wei": "20000000000000000000"
-   },
-   "determinism": {
-    "block_number": 21000000,
-    "block_timestamp": 1735689600,
-    "seed": 42
-   },
-   "invariants": {
-    "contract": "Invariants.sol",
-    "predicates": [
-     "houseSolvent"
-    ]
-   },
-   "budget": {
-    "timeout_sec": 300,
-    "max_attempts": 6
-   }
-  }
- },
- "GuardedInitializer": {
-  "src": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\n/// @notice SAFE counterpart to OpenInitializer. The initializer is locked with\n/// an `initialized` flag and is invoked in the constructor by the deployer, so\n/// no later caller can re-run it to seize admin.\ncontract GuardedInitializer {\n    address public admin;      // slot 0\n    bool private initialized;  // slot 1\n\n    constructor() payable {\n        _init(address(0xA11CE));\n    }\n\n    function initialize(address who) external {\n        _init(who);\n    }\n\n    function _init(address who) internal {\n        require(!initialized, \"already initialized\");\n        initialized = true;\n        admin = who;\n    }\n\n    function sweep(address payable to) external {\n        require(msg.sender == admin, \"not admin\");\n        (bool ok, ) = to.call{value: address(this).balance}(\"\");\n        require(ok, \"sweep failed\");\n    }\n\n    receive() external payable {}\n}\n",
-  "inv": "// SPDX-License-Identifier: MIT\npragma solidity 0.8.24;\n\ninterface IAdmin { function admin() external view returns (address); }\n\ncontract Invariants {\n    address constant INITIAL_ADMIN = address(0xA11CE);\n    function ownerUnchanged(address target) public view returns (bool) {\n        return IAdmin(target).admin() == INITIAL_ADMIN;\n    }\n    function checkAll(address target) external view returns (bool allHold, string memory firstViolated) {\n        if (!ownerUnchanged(target)) return (false, \"ownerUnchanged\");\n        return (true, \"\");\n    }\n}\n",
-  "manifest": {
-   "schema": "trust404.track04.manifest/0.1",
-   "target": {
-    "name": "GuardedInitializer",
-    "src": "src/GuardedInitializer.sol",
-    "solc": "0.8.24",
-    "evm_version": "cancun"
-   },
-   "deploy": {
-    "mode": "local",
-    "constructor_args": [],
-    "value_wei": "1000000000000000000"
-   },
-   "determinism": {
-    "block_number": 21000000,
-    "block_timestamp": 1735689600,
-    "seed": 42
-   },
-   "invariants": {
-    "contract": "Invariants.sol",
-    "predicates": [
-     "ownerUnchanged"
-    ]
-   },
-   "budget": {
-    "timeout_sec": 300,
-    "max_attempts": 6
-   }
-  }
- }
-}
+# Demo targets are fixtures, not engine constants.  Keeping them under targets/
+# makes the submitted search path visibly depend only on the supplied input and
+# avoids carrying public answers inside the proving engine.
+TARGETS = {}
 
-# Disk is the source of truth when targets/ is shipped (CLI/Docker/CI).
-# Embedded copies above remain the Vercel serverless fallback.
-try:
-    from trust404.targets import load_all as _load_targets_disk
-    _disk = _load_targets_disk()
-    if _disk:
-        TARGETS.update(_disk)
-except Exception:
-    pass
+def _demo_targets():
+    """Load web demo fixtures lazily; the Track CLI never touches this path."""
+    if not TARGETS:
+        try:
+            from trust404.targets import load_all as load_targets_disk
+            TARGETS.update(load_targets_disk())
+        except Exception:
+            pass
+    return TARGETS
 
 # TRUST404 Track04 — static scanner.
 # 타깃 소스를 정규식/패턴으로 훑어 (a) 취약 유형별 점수와 (b) 템플릿 파라미터화에
@@ -1580,48 +1175,233 @@ def _fuzz_value_movers(target_src):
             movers.add(fn["name"])
     return movers
 
+def _canonical_abi_type(spec):
+    """Return the selector spelling for an ABI input, including tuples."""
+    t = spec.get("type", "") if isinstance(spec, dict) else str(spec)
+    if t.startswith("tuple"):
+        components = spec.get("components", []) if isinstance(spec, dict) else []
+        inner = ",".join(_canonical_abi_type(item) for item in components)
+        return f"({inner})" + t[len("tuple"):]
+    return t
+
+
+def _fuzz_type_supported(spec, nesting=0):
+    """Bound recursive ABI shapes so hidden-target fuzzing stays predictable."""
+    if nesting > 2:
+        return False
+    t = spec.get("type", "") if isinstance(spec, dict) else str(spec)
+    array = re.fullmatch(r"(.+)\[([0-9]*)\]", t)
+    if array:
+        if array.group(2) and int(array.group(2)) > 4:
+            return False
+        child = dict(spec) if isinstance(spec, dict) else {"type": array.group(1)}
+        child["type"] = array.group(1)
+        return _fuzz_type_supported(child, nesting + 1)
+    if t == "tuple":
+        components = spec.get("components", []) if isinstance(spec, dict) else []
+        return bool(components) and len(components) <= 5 and all(
+            _fuzz_type_supported(item, nesting + 1) for item in components)
+    return bool(re.fullmatch(
+        r"address|bool|string|bytes|bytes(?:[1-9]|[12][0-9]|3[0-2])|"
+        r"uint(?:8|16|24|32|40|48|56|64|72|80|88|96|104|112|120|128|136|144|152|160|168|176|184|192|200|208|216|224|232|240|248|256)?|"
+        r"int(?:8|16|24|32|40|48|56|64|72|80|88|96|104|112|120|128|136|144|152|160|168|176|184|192|200|208|216|224|232|240|248|256)?",
+        t,
+    ))
+
+
+def _fuzz_jsonable(value):
+    if isinstance(value, (bytes, bytearray)):
+        return "0x" + bytes(value).hex()
+    if isinstance(value, tuple):
+        return [_fuzz_jsonable(item) for item in value]
+    if isinstance(value, list):
+        return [_fuzz_jsonable(item) for item in value]
+    return value
+
+
+def _dedupe_fuzz_values(values):
+    out, seen = [], set()
+    for value in values:
+        key = json.dumps(_fuzz_jsonable(value), sort_keys=True, separators=(",", ":"))
+        if key not in seen:
+            seen.add(key)
+            out.append(value)
+    return out
+
+
 def _fuzz_fns(abi):
     out=[]
     for e in abi:
         if e.get("type")!="function": continue
         if e.get("stateMutability") in ("view","pure"): continue
-        types=[i["type"] for i in e.get("inputs",[])]
-        if any(not (t=="address" or t=="bool" or t.startswith("uint")) for t in types): continue
+        inputs=e.get("inputs",[])
+        if any(not _fuzz_type_supported(item) for item in inputs): continue
+        types=[_canonical_abi_type(item) for item in inputs]
         signature=f"{e['name']}({','.join(types)})"
         out.append({"name":e["name"],"signature":signature,"types":types,
+                    "inputs":inputs,
                     "payable":e.get("stateMutability")=="payable"})
     return out
 
-def _fuzz_pool(t, ctx):
+
+def _fuzz_pool(spec, ctx):
+    """Small deterministic value pool for scalar and bounded composite ABI inputs."""
     lvl = ctx.get("pool_level", 0)
-    if t.startswith("uint") or t.startswith("int"):
-        base=[(1<<256)-1, ctx["seed"] or 10**19, 10**18, 1, 0]
-        if lvl >= 1: base += [(1<<255), (1<<64), 2, 255, 256, 10**6]
-        return base
+    spec = spec if isinstance(spec, dict) else {"type": str(spec)}
+    t = spec.get("type", "")
+    array = re.fullmatch(r"(.+)\[([0-9]*)\]", t)
+    if array:
+        child = dict(spec)
+        child["type"] = array.group(1)
+        values = _fuzz_pool(child, ctx)
+        if not values:
+            return []
+        default, hot = values[-1], values[0]
+        if array.group(2):
+            size = int(array.group(2))
+            variants = [[default for _ in range(size)]]
+            if size and hot != default:
+                variants.append([hot] + [default for _ in range(size - 1)])
+            if lvl >= 1 and size:
+                variants.append([hot for _ in range(size)])
+            return _dedupe_fuzz_values(variants)
+        variants = [[], [default], [hot]]
+        if lvl >= 1:
+            variants.append([hot, default])
+        return _dedupe_fuzz_values(variants)
+    if t == "tuple":
+        pools = [_fuzz_pool(item, ctx) for item in spec.get("components", [])]
+        if not pools or any(not pool for pool in pools):
+            return []
+        default = tuple(pool[-1] for pool in pools)
+        hot = tuple(pool[0] for pool in pools)
+        variants = [hot, default]
+        if lvl >= 1:
+            for index, pool in enumerate(pools):
+                mixed = list(default)
+                mixed[index] = pool[0]
+                variants.append(tuple(mixed))
+        return _dedupe_fuzz_values(variants)
+    unsigned = re.fullmatch(r"uint(\d*)", t)
+    if unsigned:
+        bits = int(unsigned.group(1) or "256")
+        maximum = (1 << bits) - 1
+        seed = min(maximum, int(ctx.get("seed") or 10**19))
+        base=[maximum, seed, min(maximum, 10**18), 1, 0]
+        if lvl >= 1:
+            base += [min(maximum, 1 << max(0, bits - 1)),
+                     min(maximum, 1 << min(64, max(0, bits - 1))),
+                     min(maximum, 255), min(maximum, 256), min(maximum, 10**6), 2]
+        return _dedupe_fuzz_values(base)
+    signed = re.fullmatch(r"int(\d*)", t)
+    if signed:
+        bits = int(signed.group(1) or "256")
+        maximum, minimum = (1 << (bits - 1)) - 1, -(1 << (bits - 1))
+        base=[maximum, minimum, -1, 1, 0]
+        if lvl >= 1:
+            base += [min(maximum, 10**6), max(minimum, -10**6), 2, -2]
+        return _dedupe_fuzz_values(base)
     if t=="address":
         base=[_ATTACKER, ZERO_ADDR, _TARGET]
         if ctx.get("owner0"): base.append(ctx["owner0"])
-        return base
+        return _dedupe_fuzz_values(base)
     if t=="bool": return [True, False]
-    if re.fullmatch(r"bytes\d+", t):
-        n=int(t[5:]); v=("0x"+"ff"*n, "0x"+"00"*n)
-        return list(v) if lvl >= 1 else [v[0]]
+    fixed_bytes = re.fullmatch(r"bytes(\d+)", t)
+    if fixed_bytes:
+        size=int(fixed_bytes.group(1))
+        base=[b"\xff" * size, b"\x00" * size]
+        return base if lvl >= 1 else base[:1]
+    if t=="bytes":
+        return [b"\xff" * 4, b"\x00", b""] if lvl >= 1 else [b"\xff" * 4, b""]
+    if t=="string":
+        constants = list(ctx.get("string_constants") or [])
+        return _dedupe_fuzz_values(constants + ["admin", "a", ""])
     return []
 
+
 def _fuzz_calls(fn, ctx, cap=12):
-    pools=[_fuzz_pool(t,ctx) for t in fn["types"]]
+    pools=[_fuzz_pool(spec,ctx) for spec in fn.get("inputs", fn["types"])]
     if any(len(p)==0 for p in pools): return []
     cap = cap if ctx.get("pool_level",0) == 0 else cap*3
-    combos=[()] if not fn["types"] else list(_it.product(*pools))[:cap]
+    if not fn["types"]:
+        combos = [()]
+    else:
+        # A raw cartesian prefix starves later values of the first argument.
+        # Start with hot/default vectors, then vary every input around both
+        # vectors before filling remaining slots from the cartesian product.
+        hot = tuple(pool[0] for pool in pools)
+        default = tuple(pool[-1] for pool in pools)
+        proposed = [hot, default]
+        for base in (hot, default):
+            for value_index in range(max(len(pool) for pool in pools)):
+                for index, pool in enumerate(pools):
+                    if value_index >= len(pool):
+                        continue
+                    value = pool[value_index]
+                    combo = list(base)
+                    combo[index] = value
+                    proposed.append(tuple(combo))
+        combos, seen = [], set()
+        for combo in _it.chain(proposed, _it.product(*pools)):
+            key = json.dumps(_fuzz_jsonable(combo), separators=(",", ":"))
+            if key in seen:
+                continue
+            seen.add(key)
+            combos.append(combo)
+            if len(combos) >= cap:
+                break
     # payable 은 0 / 1 wei(임계 미만 게이트 통과용) / 1 ether 를 시도한다.
     vals=[0]+([1, 10**18] if fn["payable"] else [])
-    return [{"name":fn["name"],"types":fn["types"],"args":list(c),"value":v} for c in combos for v in vals]
+    return [{"name":fn["name"],"signature":fn["signature"],
+             "types":fn["types"],"args":list(c),"value":v}
+            for c in combos for v in vals]
 
 def _fuzz_resolve(a, acct, taddr, Web3):
     if a==_ATTACKER: return acct
     if a==_TARGET: return taddr
-    if isinstance(a,str) and a.startswith("0x"): return Web3.to_checksum_address(a)
+    if isinstance(a, tuple):
+        return tuple(_fuzz_resolve(item, acct, taddr, Web3) for item in a)
+    if isinstance(a, list):
+        return [_fuzz_resolve(item, acct, taddr, Web3) for item in a]
+    if isinstance(a,str) and re.fullmatch(r"0x[0-9a-fA-F]{40}", a):
+        return Web3.to_checksum_address(a)
     return a
+
+
+def _fuzz_contains(value, marker):
+    if value == marker:
+        return True
+    if isinstance(value, (tuple, list)):
+        return any(_fuzz_contains(item, marker) for item in value)
+    return False
+
+
+def _fuzz_address_patches(call, payload, dispatcher_addr, target_addr):
+    """Locate symbolic address ABI words that must be rebound in final PoC."""
+    raw = bytes.fromhex(str(payload).removeprefix("0x"))
+    patches = []
+    for marker, address, symbol in (
+        (_ATTACKER, dispatcher_addr, "attacker"),
+        (_TARGET, target_addr, "target"),
+    ):
+        if not _fuzz_contains(call.get("args") or [], marker):
+            continue
+        needle = b"\x00" * 12 + bytes.fromhex(address.removeprefix("0x"))
+        offsets = []
+        start = 0
+        while True:
+            offset = raw.find(needle, start)
+            if offset < 0:
+                break
+            if offset >= 4 and (offset - 4) % 32 == 0:
+                offsets.append(offset)
+            start = offset + 1
+        if not offsets:
+            raise RuntimeError(
+                f"symbolic {symbol} address missing from encoded calldata")
+        patches.extend({"offset": offset, "symbol": symbol}
+                       for offset in offsets)
+    return patches
 
 def _fuzz_lit(t, a):
     if t=="address":
@@ -1630,7 +1410,18 @@ def _fuzz_lit(t, a):
         if a==ZERO_ADDR: return "address(0)"
         return f"address({a})"
     if t=="bool": return "true" if a else "false"
-    if a==(1<<256)-1: return "type(uint256).max"
+    if t=="string": return json.dumps(str(a))
+    if t=="bytes" or re.fullmatch(r"bytes\d+", t):
+        raw = bytes(a) if isinstance(a, (bytes, bytearray)) else bytes.fromhex(str(a).removeprefix("0x"))
+        return f'hex"{raw.hex()}"'
+    uint = re.fullmatch(r"uint(\d*)", t)
+    if uint and a == (1 << int(uint.group(1) or "256")) - 1:
+        return f"type({t}).max"
+    signed = re.fullmatch(r"int(\d*)", t)
+    if signed:
+        bits = int(signed.group(1) or "256")
+        if a == (1 << (bits - 1)) - 1: return f"type({t}).max"
+        if a == -(1 << (bits - 1)): return f"type({t}).min"
     return str(a)
 
 def _fuzz_codegen(seq, payable_map):
@@ -1641,7 +1432,20 @@ def _fuzz_codegen(seq, payable_map):
     # aligned between search and final Forge verification.
     calls=[]
     for i,c in enumerate(seq):
-        if c.get("raw"):  # receive/fallback 트리거
+        if "encoded_data" in c:
+            encoded = str(c.get("encoded_data") or "0x").removeprefix("0x")
+            data_var = f"_data{i}"
+            calls.append(f'        bytes memory {data_var} = hex"{encoded}";')
+            for patch in c.get("address_patches") or []:
+                replacement = "address()" if patch.get("symbol") == "attacker" else "t"
+                calls.append(
+                    "        assembly { mstore(add(add(" + data_var
+                    + ", 0x20), " + str(int(patch["offset"])) + "), "
+                    + replacement + ") }")
+            payload=data_var
+            signature=c.get("signature") or c.get("sel_of") or c.get("name", "raw")
+            comment=f"  // {signature}"
+        elif c.get("raw"):  # receive/fallback 트리거
             if c.get("data"):  # 셀렉터 calldata → fallback→delegatecall
                 payload=f"hex\"{c['data'][2:] if c['data'].startswith('0x') else c['data']}\""
             else:
@@ -1708,7 +1512,7 @@ def _fuzz_sequence_key(seq):
     for call in seq:
         normalized.append({
             "signature": call.get("signature") or call.get("name"),
-            "args": call.get("args") or [],
+            "args": _fuzz_jsonable(call.get("args") or []),
             "value": int(call.get("value") or 0),
             "raw": bool(call.get("raw")),
             "data": call.get("data") or "",
@@ -1917,6 +1721,10 @@ def _iter_fuzz_candidates(name, target_src, invariants_src, manifest, do_verify,
         "target": target_addr,
         "owner0": owner0,
         "pool_level": pool_level,
+        "string_constants": sorted({
+            value for value in re.findall(r'"([^"\\\n]{1,64})"', target_src)
+            if value and not value.isspace()
+        })[:6],
     }
     functions = _fuzz_fns(abi)
     payable_map = {fn["signature"]: fn["payable"] for fn in functions}
@@ -1969,12 +1777,18 @@ def _iter_fuzz_candidates(name, target_src, invariants_src, manifest, do_verify,
         payloads = []
         values = []
         selectors = []
+        reproducer = []
         for call in sequence:
             payload = _fuzz_call_data(
                 call, target, dispatcher_addr, target_addr, Web3)
             payloads.append(payload)
             values.append(int(call.get("value") or 0))
             selectors.append(payload[:10] if len(payload) >= 10 else "0x00000000")
+            encoded_call = dict(call)
+            encoded_call["encoded_data"] = payload
+            encoded_call["address_patches"] = _fuzz_address_patches(
+                call, payload, dispatcher_addr, target_addr)
+            reproducer.append(encoded_call)
         feedback = {
             "sequence": _fuzz_sequence_key(sequence),
             "caller": dispatcher_addr,
@@ -2000,6 +1814,11 @@ def _iter_fuzz_candidates(name, target_src, invariants_src, manifest, do_verify,
                 returned = bytes(event["returnData"]) if event else b""
                 feedback["calls"].append({
                     "index": index,
+                    "function": (sequence[index].get("signature")
+                                 or sequence[index].get("sel_of")
+                                 or sequence[index].get("name", "raw")),
+                    "arguments": _fuzz_jsonable(sequence[index].get("args") or []),
+                    "value_wei": str(values[index]),
                     "selector": selector,
                     "success": success,
                     "revert_data": "0x" + returned.hex() if not success else "",
@@ -2009,10 +1828,69 @@ def _iter_fuzz_candidates(name, target_src, invariants_src, manifest, do_verify,
         broken, reason, after = predicate_state()
         feedback["predicate_after"] = after
         feedback["reason"] = reason
-        return broken, reason, feedback
+        feedback["reproducer"] = [{
+            "function": (call.get("signature") or call.get("sel_of")
+                         or call.get("name", "raw")),
+            "arguments": _fuzz_jsonable(call.get("args") or []),
+            "value_wei": str(call.get("value") or 0),
+            "calldata": call.get("encoded_data") or "0x",
+            "address_patches": call.get("address_patches") or [],
+        } for call in reproducer]
+        return broken, reason, feedback, reproducer
 
     probes = 0
     emitted = 0
+
+    def has_effective_call(feedback):
+        calls = feedback.get("calls") or []
+        return bool(calls) and any(call.get("success") for call in calls)
+
+    def minimize_sequence(sequence, reason, feedback, reproducer):
+        """Delete calls while the same invariant violation still reproduces.
+
+        Every reduction is replayed from the authoritative pre-attack snapshot.
+        The final candidate is therefore 1-minimal with respect to deleting one
+        call, subject to the remaining deterministic fuzz budget.
+        """
+        nonlocal probes
+        original = list(sequence)
+        current = list(sequence)
+        current_reason = reason
+        current_feedback = feedback
+        current_reproducer = reproducer
+        removed = []
+        index = 0
+        reduction_probes = 0
+        while (len(current) > 1 and index < len(current)
+               and probes < budget and time_left()):
+            trial = current[:index] + current[index + 1:]
+            probes += 1
+            reduction_probes += 1
+            tester.revert_to_snapshot(snapshot_id)
+            broken, trial_reason, trial_feedback, trial_reproducer = execute_sequence(trial)
+            if len(feedback_sink) < 128:
+                feedback_sink.append(trial_feedback)
+            if broken and has_effective_call(trial_feedback):
+                removed.append(
+                    current[index].get("signature")
+                    or current[index].get("sel_of")
+                    or current[index].get("name", "raw"))
+                current = trial
+                current_reason = trial_reason
+                current_feedback = trial_feedback
+                current_reproducer = trial_reproducer
+                index = 0
+                continue
+            index += 1
+        current_feedback["minimization"] = {
+            "algorithm": "deterministic-call-deletion",
+            "original_calls": len(original),
+            "final_calls": len(current),
+            "removed": removed,
+            "replay_probes": reduction_probes,
+            "one_minimal": len(current) <= 1 or index >= len(current),
+        }
+        return current, current_reason, current_feedback, current_reproducer
 
     def probe(sequence):
         nonlocal probes, emitted
@@ -2023,17 +1901,21 @@ def _iter_fuzz_candidates(name, target_src, invariants_src, manifest, do_verify,
         key = _fuzz_sequence_key(sequence)
         if key in banned:
             return None
-        broken, reason, feedback = execute_sequence(sequence)
+        broken, reason, feedback, reproducer = execute_sequence(sequence)
         if len(feedback_sink) < 128:
             feedback_sink.append(feedback)
         if not broken:
             return None
-        if feedback.get("calls") and not any(
-                call["success"] for call in feedback["calls"]):
+        if not has_effective_call(feedback):
+            return None
+        sequence, reason, feedback, reproducer = minimize_sequence(
+            sequence, reason, feedback, reproducer)
+        key = _fuzz_sequence_key(sequence)
+        if key in banned:
             return None
         banned.add(key)
         emitted += 1
-        return list(sequence), payable_map, feedback
+        return reproducer, payable_map, feedback
 
     for call in all_calls:
         if probes >= budget or not time_left() or emitted >= max_candidates:
@@ -2044,10 +1926,10 @@ def _iter_fuzz_candidates(name, target_src, invariants_src, manifest, do_verify,
     if depth < 2 or probes >= budget or not time_left() or emitted >= max_candidates:
         return
 
-    second_calls = [
+    second_calls = ([
         call for call in all_calls
         if call.get("raw") or call["name"] in movers
-    ] or all_calls
+    ] if movers else list(all_calls))
     for first in all_calls:
         if probes >= budget or not time_left() or emitted >= max_candidates:
             break
@@ -5511,7 +5393,7 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
 
     단계 순서(점점 강한 일반화):
       template  → 계열별 결정론 템플릿(정적 스코어 순)
-      synth     → 재진입/AMM/플래시론/스토리지/프록시/다중블록/스토리지충돌/그리핑DoS/콜백 합성
+      synth     → 재진입/AMM/플래시론/스토리지/프록시/스토리지충돌/그리핑DoS/콜백 합성
       fuzz      → 범용 호출 시퀀스 탐색(SliSE 류 슬라이싱 우선순위) → codegen
     """
     search_src = analysis_src or target_src
@@ -5623,24 +5505,51 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
             r = None
         if isinstance(r, dict) and r.get("exploit_src"):
             yield ("synth", r.get("strategy") or fn.__name__, r["exploit_src"])
-    # 3) 범용 퍼저 단계
-    metric("fuzz_executions")
+    # 3) 범용 퍼저 단계.  The first bounded pass favors cheap one/two-call
+    # paths.  The wider ABI pool and depth 3 are reached only after the shallow
+    # iterator is exhausted (including candidates rejected by final validation),
+    # preserving normal-target cost while giving hidden targets a deeper path.
     fuzz_feedback = []
     fuzz_banned = set()
     try:
-        for seq, payable_map, feedback in _iter_fuzz_candidates(
-                name, target_src, inv, manifest, bool(do_verify),
-                deadline=deadline, extra_sources=extra_sources,
-                banned=fuzz_banned, feedback_sink=fuzz_feedback):
-            metric("fuzz_candidates")
-            label = "fuzz(" + " → ".join(
-                c.get("name", "raw") for c in seq) + ")"
-            try:
-                yield ("fuzz", label, _fuzz_codegen(seq, payable_map))
-            except Exception as exc:
-                search_error("fuzz", "codegen", exc)
-    except Exception as exc:
-        search_error("fuzz", "sequence-search", exc)
+        shallow_budget = max(1, int(os.environ.get("TRUST404_FUZZ_BUDGET", "500")))
+        deep_budget = max(shallow_budget, int(os.environ.get(
+            "TRUST404_FUZZ_DEEP_BUDGET", "1500")))
+    except Exception:
+        shallow_budget, deep_budget = 500, 1500
+    fuzz_rounds = ((shallow_budget, 2, 0), (deep_budget, 3, 1))
+    for round_index, (round_budget, round_depth, pool_level) in enumerate(
+            fuzz_rounds, 1):
+        if deadline is not None and time.time() >= deadline:
+            return
+        metric("fuzz_executions")
+        try:
+            for seq, payable_map, feedback in _iter_fuzz_candidates(
+                    name, target_src, inv, manifest, bool(do_verify),
+                    budget=round_budget, depth=round_depth,
+                    pool_level=pool_level, deadline=deadline,
+                    extra_sources=extra_sources, banned=fuzz_banned,
+                    feedback_sink=fuzz_feedback):
+                metric("fuzz_candidates")
+                label = "fuzz(" + " → ".join(
+                    c.get("name", "raw") for c in seq) + ")"
+                try:
+                    metadata = {
+                        "discovery": {
+                            "kind": "abi-sequence-fuzz",
+                            "round": round_index,
+                            "budget": round_budget,
+                            "depth": round_depth,
+                            "pool_level": pool_level,
+                            "trace": feedback,
+                        }
+                    }
+                    yield ("fuzz", label, _fuzz_codegen(seq, payable_map), metadata)
+                except Exception as exc:
+                    search_error("fuzz", "codegen", exc)
+        except Exception as exc:
+            search_error("fuzz", f"sequence-search-round-{round_index}", exc)
+            return
 
 
 def prove_sources(name, target_src, invariants_src, manifest, do_verify=True, extra_candidates=None):
@@ -5723,13 +5632,14 @@ def _attach_inputs(res, target_src, invariants_src, manifest):
 
 
 def prove(name):
-    d = TARGETS[name]
+    d = _demo_targets()[name]
     res = prove_sources(name, d["src"], d["inv"], d["manifest"], do_verify=True)
     return _attach_inputs(res, d["src"], d["inv"], d["manifest"])
 
 def _run(name):
-    if name not in TARGETS:
-        return {"error":f"unknown target: {name}","targets":list(TARGETS.keys())}
+    targets = _demo_targets()
+    if name not in targets:
+        return {"error":f"unknown target: {name}","targets":list(targets.keys())}
     try:
         return prove(name)
     except Exception as e:
@@ -5968,7 +5878,7 @@ class handler(BaseHTTPRequestHandler):
         q = parse_qs(urlparse(self.path).query)
         name = (q.get("target") or [""])[0]
         if not name:
-            return self._send(200, {"targets":list(TARGETS.keys()),
+            return self._send(200, {"targets":list(_demo_targets().keys()),
                                     "usage":"GET ?target=<Name> | POST {contract,invariants?,manifest?,targetName?}"})
         self._send(200, _run(name))
     def do_POST(self):

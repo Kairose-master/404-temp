@@ -1,7 +1,7 @@
 # TRUST404 Track04 — strategy selection + Exploit.sol templates.
 # 각 취약 유형에 대해, scanner 가 뽑은 함수 시그니처를 채워 Exploit.sol 을
-# 결정론적으로 생성한다. 함수 이름을 하드코딩하지 않고 스캔 결과에서 가져오되,
-# 못 찾으면 이 트랙 공개셋의 관례적 이름으로 폴백한다.
+# 결정론적으로 생성한다. 함수 시그니처는 현재 입력의 스캔 결과에서만 가져오며,
+# 필요한 capability가 불완전하면 후보를 만들지 않고 다음 탐색 단계로 넘긴다.
 import random
 import re
 
@@ -31,11 +31,6 @@ def seeded_order(order, scores, seed):
         rng.shuffle(group)
         result.extend(group)
     return result
-
-
-def _fn_name(findings, key, default):
-    fn = findings.get(key)
-    return fn["name"] if fn else default
 
 
 def build_exploit(fam, findings):

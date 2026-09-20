@@ -181,7 +181,12 @@ def schedule_candidates(candidates: Iterable[tuple], max_attempts: int,
             return "synth"
         return "fuzz" if stage == "fuzz" else "synth"
 
-    for candidate in candidates:
+    iterator = iter(candidates)
+    while yielded < max_attempts:
+        try:
+            candidate = next(iterator)
+        except StopIteration:
+            break
         group = bucket(candidate[0])
         if used[group] < caps[group] and yielded < max_attempts:
             used[group] += 1

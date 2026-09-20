@@ -12,7 +12,8 @@
 깨면 exit 0 + `Exploit.sol` + `result.json` + `attempts.log`.
 예산 소진 시 exit 1. 멀쩡한 타깃은 전 단계를 돌아도 안 깨지므로 오탐 0.
 
-방법: [`METHOD.md`](./METHOD.md). 이름 하드코딩 없음 — 소스 capability로 계열 발화.
+방법: [`METHOD.md`](./METHOD.md). 공개 타깃은 `targets/` 회귀 fixture에만 두고,
+표준 엔진은 입력 소스의 capability·ABI·불변식 의존성으로 후보를 도출한다.
 
 ## 제출물 3종
 
@@ -29,8 +30,8 @@
 | PoC가 실행되어 불변식을 깨는가 | 취약 7/7 PROVEN. 제출 Docker의 기본 검증기는 `forge test --offline` |
 | 결정론 | LLM을 끈 고정 이미지에서 같은 `--seed` → 바이트 동일 `Exploit.sol` |
 | 취약만 깨고 정상은 유지 | 안전 5/5 NOT PROVEN. 오탐 0 |
-| 스스로 찾은 경로인가 | 입력 소스의 capability와 함수 시그니처로 전략을 선택하며 타깃 이름으로 분기하지 않음 |
-| 비공개 일반화·최소 PoC | template→synth→fuzz 단계 격상, 첫 번째 ordered invariant를 깨는 최소 호출 우선 |
+| 스스로 찾은 경로인가 | 입력 source/ABI 근거와 실제 호출 trace를 `result.json`에 기록하며 타깃 이름으로 분기하지 않음 |
+| 비공개 일반화·최소 PoC | 복합 ABI·깊이 3까지 점진 탐색하고, 발견 경로를 호출 삭제 재실행으로 축약한 뒤 Forge 재검증 |
 
 ## 타깃 12개 (공개 6 + 워게임 유도 6)
 
@@ -49,7 +50,8 @@
 | CommitLottery | (커밋-리빌 난수) | NOT PROVEN | — | 1 |
 | GuardedInitializer | (initialized 가드) | NOT PROVEN | — | 1 |
 
-취약 7 정탐 · 안전 5 미발견 — **12/12**. 워게임 3계열은 각각 안전 대응 타깃이 있다.
+취약 7 정탐 · 정상 회귀 타깃 5 미발견 — **12/12**. `NOT_PROVEN`은 안전성 증명이
+아니라 주어진 탐색 예산에서 재현 가능한 위반을 찾지 못했다는 뜻이다.
 
 ## 빠른 시작
 

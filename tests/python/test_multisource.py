@@ -146,6 +146,54 @@ class MultiSourceForge(unittest.TestCase):
 
 
 class VerificationAccounting(unittest.TestCase):
+    def test_fuzz_discovery_evidence_is_preserved_in_result(self):
+        spec = importlib.util.spec_from_file_location(
+            "fuzz_evidence_agent", ROOT / "agent/agent.py")
+        cli = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cli)
+
+        source = """pragma solidity 0.8.24;
+        contract Exploit { function run(address) external payable {} }
+        """
+        metadata = {"discovery": {
+            "kind": "abi-sequence-fuzz", "round": 1, "depth": 1,
+            "trace": {
+                "predicate_before": {"allHold": True, "firstViolated": ""},
+                "predicate_after": {"allHold": False,
+                                    "firstViolated": "ownerUnchanged"},
+                "calls": [{"index": 0, "function": "seize()",
+                           "success": True}],
+                "reproducer": [{"function": "seize()", "arguments": [],
+                                "value_wei": "0", "calldata": "0x12345678"}],
+                "minimization": {"original_calls": 1, "final_calls": 1,
+                                 "one_minimal": True},
+            },
+        }}
+
+        def stream(*args, **kwargs):
+            yield "fuzz", "fuzz(seize)", source, metadata
+
+        engine = SimpleNamespace(iter_engine_candidates=stream)
+        proven = SimpleNamespace(
+            tuple=lambda: (True, "ownerUnchanged", "forge"), profit=None)
+        target = ROOT / "targets/BoundedOwner"
+        with tempfile.TemporaryDirectory() as td, \
+                patch.object(cli, "_load_engine", return_value=engine), \
+                patch.object(cli, "verify_full", return_value=proven), \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = cli.main([
+                "--contract", str(target / "src/BoundedOwner.sol"),
+                "--invariants", str(target / "Invariants.sol"),
+                "--manifest", str(target / "manifest.json"),
+                "--out", td, "--max-attempts", "2", "--timeout", "30",
+            ])
+            payload = json.loads((Path(td) / "result.json").read_text())
+        self.assertEqual(cli.EXIT_FOUND, rc)
+        self.assertEqual(["seize()"], payload["derivation"]["call_path"])
+        self.assertIn("seize()", payload["how"])
+        self.assertTrue(payload["exploit_trace"]["trace"]
+                        ["predicate_after"]["allHold"] is False)
+
     def test_rejected_fuzz_candidate_continues_to_next_sequence(self):
         spec = importlib.util.spec_from_file_location("fuzz_retry_agent", ROOT / "agent/agent.py")
         cli = importlib.util.module_from_spec(spec)

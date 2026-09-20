@@ -15,7 +15,9 @@ python3 agent/agent.py --contract <path> --invariants <path> --manifest <path> \
 | 1 | 예산 내 미발견 (`--out/Exploit.sol` 에 마지막 후보, 증명 아님) |
 | 2 | 입력/검증기/내부 오류 (검증기 부재 포함 — 미발견과 합치지 않음) |
 
-산출물: `--out/Exploit.sol`(최선 후보), `--out/attempts.log`(시도별 로그).
+산출물: `--out/Exploit.sol`(증명된 후보 또는 마지막 후보),
+`--out/attempts.log`(시도별 로그), `--out/result.json`(판정·위반 불변식·도출 근거·
+호출 trace·퍼저 최소화 결과). `NOT_PROVEN`은 예산 내 미발견이며 안전성 증명을 뜻하지 않는다.
 
 ## 구성
 | 파일 | 역할 |

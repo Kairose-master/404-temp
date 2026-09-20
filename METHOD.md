@@ -9,7 +9,7 @@
 ```
   0) llm      — (개발 모드에서 명시적으로 켠 경우만) 로컬/원격 LLM 초안 1개
   1) template — 정적 스코어 상위 계열부터 결정론 템플릿 PoC
-  2) synth    — 재진입/AMM/플래시론/스토리지/프록시/다중블록/스토리지충돌/그리핑DoS/콜백
+  2) synth    — 재진입/AMM/플래시론/스토리지/프록시/스토리지충돌/그리핑DoS/콜백
                 + **계열 게이트**(capability IR). Ethernaut/DVD 솔버는 타깃 이름이
                 아니라 `gasleft_modulo`·`unpermissioned_callback` 같은 태그로 발화.
   3) fuzz     — 범용 호출 시퀀스 탐색 — 미공개 타깃 일반화 축
@@ -40,9 +40,9 @@
   keccak/모듈로 혼합 + 값 이전이 한 함수에 공존 — 데드라인 체크만으로는 미발화),
   **미보호 initializer**(`owner`/`admin`을 설정하되 `initialized`/`initializer`/
   owner 가드가 없는 initializer). 특정 타깃 이름을 하드코딩하지 않는다.
-- `strategies.py` — 유형별 `Exploit.sol` 템플릿. 스캐너가 뽑은 실제 함수 이름을
-  채워 넣고, 못 찾으면 공개셋 관례명으로 폴백한다. `--seed` 기반 PRNG로 동점 유형의
-  순서를 결정론적으로 tie-break 한다.
+- `strategies.py` — 유형별 `Exploit.sol` 템플릿. 현재 입력에서 스캐너가 뽑은 실제
+  함수 이름과 capability가 모두 있을 때만 후보를 만든다. 공개 타깃 이름이나 관례명으로
+  폴백하지 않는다. `--seed` 기반 PRNG로 동점 유형의 순서를 결정론적으로 tie-break 한다.
 - `verify.py` — 후보 검증기. **제출 Docker의 기본은 Foundry**(forge 1.7.1 + solc 0.8.24):
   참가 번들 `harness/src/Harness.sol` 의 `_prove()` 를 임시 Foundry 프로젝트로 엮어
   `forge test --offline`으로 검증한다. 로컬 개발용 내장 EVM 경로도 있으며,
@@ -54,7 +54,8 @@
   후보를 `verify.py` 로 검증한다. 검증 실패 시 다음 후보/단계로 격상하며 반복한다.
   산출물: `--out/Exploit.sol`(증명된, 또는 최선 후보), `--out/attempts.log`(단계 격상 ·
   시도별 번호·전략·검증 결과·유지된 불변식), `--out/result.json`(증명 여부 · 위반한
-  불변식 · **어떻게** 위반했는지 설명 · 시도 수 · 거친 단계).
+  불변식 · **어떻게** 위반했는지 설명 · 입력에서 도출한 근거 · 퍼저 호출별 성공 여부와
+  calldata · 최소화 결과 · 시도 수 · 거친 단계).
   타깃과 함께 제공된 Solidity source unit 전체를 결정론적으로 읽어 상속된 함수도
   탐색하며, 모든 후보가 컴파일/검증 오류로 끝나면 NOT_PROVEN 대신 exit 2를 낸다.
 - `audit.py` — 실무 감사 CLI. 임의 `.sol`/디렉터리를 받아 불변식 없이도(자동 효과검사)
@@ -67,10 +68,23 @@
 스캐너 점수 내림차순으로 **템플릿 단계**를 먼저 시도한다(동점은 `--seed` PRNG로 결정론
 tie-break). 한 후보가 검증에 실패하면 같은 단계의 다음 후보로, 그 단계가 소진되면 다음
 단계로 격상한다: template → **synth**(합성: 재진입 예치→인출, 다중 컨트랙트 AMM 조작·
-플래시론, private 슬롯 읽기, 프록시 calldata 배선, 다중 블록 러너, delegatecall 스토리지
-충돌, 그리핑 DoS, 콜백 불일치) → **fuzz**(호출 시퀀스 탐색: 단일 호출 → setup→drain
-2단계, raw 송금·셀렉터 calldata 포함, SliSE 류 데이터 의존 우선순위). 어느 단계에서든
-실패하면 다음 단계로 격상하고, **퍼저 단계는 라운드마다 예산·시퀀스 깊이(단일→쌍→3단계)·입력 풀을 키워 점진 심화(progressive deepening)로 시간 예산(`TRUST404_MAX_SECONDS`)까지 끈질기게 재탐색**한다. 불변식을 깨는 후보가 나오면 즉시 종료(0)하고, `--max-attempts`/`--timeout` 을 소진하면
+플래시론, private 슬롯 읽기, 프록시 calldata 배선, delegatecall 스토리지 충돌, 그리핑
+DoS, 콜백 불일치) → **fuzz**(호출 시퀀스 탐색: 단일 호출 → 2단계, raw 송금·셀렉터
+calldata 포함, SliSE 류 데이터 의존 우선순위). 표준 하네스가 한 번의 `run(address)`만
+허용하므로 외부 트랜잭션을 여러 번 요구하는 multi-block provider는 제출 후보에서 제외한다.
+
+퍼저의 1차 라운드는 예산 500·깊이 2·작은 입력 풀로 짧은 경로를 찾는다. 1차 후보가
+없거나 생성된 후보들이 공식 검증을 통과하지 못해 iterator가 소진될 때만 2차 라운드
+(예산 1500·깊이 3·확장 입력 풀)를 실행한다. 인자는
+`address`/`bool`/unsigned integer뿐 아니라 signed integer, fixed/dynamic bytes, string,
+bounded array와 tuple을 ABI에서 직접 만들고, 최종 PoC에는 탐색 당시의 raw calldata를
+고정해 복합 타입도 동일하게 재현한다. 탐색 dispatcher와 최종 Exploit 주소가 달라지는
+`address(this)`·target 인자는 ABI word 위치를 기록해 실행 시 실제 주소로 다시 묶는다.
+발견된 다단계 경로는 각 호출을 하나씩 제거하고
+초기 snapshot부터 다시 실행해 같은 불변식 위반이 유지되는 동안 축약한다. 축약된 경로를
+공식 Foundry 검증기가 다시 통과해야만 PROVEN으로 출력하며, 최초 증명 뒤에도 동일한 호출
+삭제를 Foundry로 반복해 최종 PoC의 1-call deletion 최소성을 확인한다. 불변식을 깨는 후보가 나오면
+즉시 종료(0)하고, `--max-attempts`/`--timeout` 을 소진하면
 마지막 후보를 남기고 1로 종료한다. 각 실패는 `attempts.log` 에 `[단계/전략] NOT PROVEN
 — invariants held (…)` 로 남아 루프가 왜·어떻게 재탐색했는지 보인다. 멀쩡 타깃은 모든
 단계를 다 돌아도 어떤 후보도 불변식을 깨지 못하므로 자연히 1(오탐 0).
@@ -118,8 +132,8 @@ PROVEN 됨을 확인했다.
   (forge-std 와 동일). 파생식 없는 랜덤 EOA 는 밖.
 - 소스 없는 외부 프로토콜: 하드코딩 0x + ERC-20/2612/4626/3156/UniV2
   공식 셀렉터 (ethereum/ERCs). 바이트코드 PUSH4 로 계열만 고른다. 디컴파일 없음.
-- 여러 블록 커밋-리빌: `prepare` 에서 commit, HEVM `roll` / py-evm `mine_block`
-  후 `reveal`. 같은 트랜잭션의 두 번의 호출은 같은 블록이라 안 된다.
+- 여러 블록 커밋-리빌처럼 서로 다른 외부 트랜잭션이 필요한 공격은 공식 단일
+  `run(address)` 실행 모델 밖이므로 표준 제출 후보에서 제외한다.
 - Vyper/순수 Yul 은 `opaque_ir` — 계열 synth 를 건너뛰고 퍼저만 돌린다.
 - 숨은 셋 심화(한 `run()`): read-only reentrancy, ERC4626 첫 입금 인플레,
   ERC777/721 훅 재진입, nonce 없는 서명 재사용, CREATE2 변태.
@@ -127,8 +141,10 @@ PROVEN 됨을 확인했다.
   공격은 단일 `run()` 템플릿으로는 얕게만 시도한다.
 - 검증기는 하네스 `_prove` 의 단일 호출 의미를 재현한다. 하네스가 향후 다중 호출·
   다중 액터로 확장되면 검증기도 맞춰 갱신해야 한다.
-- 하드코딩한 정답은 없다. 스캐너 점수가 0 이하인 유형은 생성 자체를 건너뛰므로,
-  공개셋에 없는 완전히 새로운 유형(비공개 타깃)은 가장 가까운 템플릿으로만 접근한다.
+- 하드코딩한 정답은 없다. 공개·확장 타깃 소스는 `targets/`의 회귀 fixture로만 존재하며
+  증명 엔진에는 내장하지 않는다. 표준 CLI는 전달받은 source unit·불변식·매니페스트만
+  분석한다. 스캐너 점수가 0 이하인 유형은 해당 템플릿을 건너뛰고 ABI sequence fuzz로
+  접근한다.
 - 워게임 유도 3종(delegatecall/난수/initializer)도 단일 `run()` 안에서 성립하는
   형태만 다룬다. delegatecall 하이재킹은 슬롯 0 = owner/admin 레이아웃을 가정하며
   (owner/admin 슬롯은 선행 상태변수 개수로 계산해 Pwn 을 패딩한다),

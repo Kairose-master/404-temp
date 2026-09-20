@@ -198,7 +198,7 @@ def main(argv=None):
     # 소비되므로, PoC 가 불변식을 위반하지 못하면 더 강한 방법으로 탐색·생성을 반복한다.
     #   0) llm      — (선택) 로컬/원격 LLM 초안
     #   1) template — 계열별 결정론 템플릿(정적 스코어 순)
-    #   2) synth    — 재진입/AMM/플래시론/스토리지/프록시/다중블록/스토리지충돌/DoS/콜백 합성
+    #   2) synth    — 재진입/AMM/플래시론/스토리지/프록시/스토리지충돌/DoS/콜백 합성
     #   3) fuzz     — 범용 호출 시퀀스 탐색(미공개 타깃 일반화 축)
     metrics = {
         "generated": 0,
@@ -211,6 +211,7 @@ def main(argv=None):
         "provider_errored": 0,
         "fuzz_executions": 0,
         "fuzz_candidates": 0,
+        "minimization_verifications": 0,
     }
     search_errors = []
 
@@ -224,7 +225,7 @@ def main(argv=None):
     def candidate_stream():
         seen_candidates = set()
 
-        def register(stage, label, source):
+        def register(stage, label, source, metadata=None):
             metrics["generated"] += 1
             fp = candidate_fingerprint(source)
             if fp in seen_candidates:
@@ -234,6 +235,8 @@ def main(argv=None):
             seen_candidates.add(fp)
             profile = candidate_profile(
                 stage, label, findings, invariant_deps, feats)
+            if metadata:
+                profile["discovery"] = metadata.get("discovery", metadata)
             note(
                 f"# candidate [{stage}/{label}] confidence={profile['confidence']:.3f} "
                 f"cost={profile['cost']} overlap={','.join(profile['invariant_overlap']) or '-'} "
@@ -282,14 +285,19 @@ def main(argv=None):
         if engine is not None and hasattr(engine, "iter_engine_candidates"):
             note("# engine loaded: template → synth → fuzz stages")
             try:
-                for stage, label, src in engine.iter_engine_candidates(
+                for generated in engine.iter_engine_candidates(
                         target_name, contract_src, invariants_src, manifest,
                         do_verify=True, analysis_src=analysis_src,
                         seed=args.seed, deadline=started + args.timeout,
                         include_templates=False, world_src=world_src,
                         metrics=metrics, search_errors=search_errors,
                         extra_sources=extra_sources or None):
-                    item = register(stage, label, src)
+                    if len(generated) == 4:
+                        stage, label, src, metadata = generated
+                    else:
+                        stage, label, src = generated
+                        metadata = None
+                    item = register(stage, label, src, metadata)
                     if item:
                         yield item
             except Exception as e:
@@ -373,21 +381,138 @@ def main(argv=None):
         except Exception:
             intent_cls = None
 
+        # A fuzz path is first reduced cheaply in the search EVM.  Recheck
+        # deletion variants with the selected final verifier as well, so the
+        # submitted source is 1-minimal under the actual scoring semantics.
+        if proven and stage == "fuzz":
+            discovery = profile.get("discovery") or {}
+            trace = discovery.get("trace") or {}
+            reproducer = trace.get("reproducer") or []
+            engine = _load_engine()
+            if reproducer and engine is not None and hasattr(engine, "_fuzz_codegen"):
+                current_calls = [(index, dict(call))
+                                 for index, call in enumerate(reproducer)]
+                original_count = len(current_calls)
+                removed = []
+                minimization_errors = []
+                index = 0
+                while len(current_calls) > 1 and index < len(current_calls):
+                    if time.time() - started >= args.timeout:
+                        minimization_errors.append("timeout before deletion replay completed")
+                        break
+                    trial_calls = current_calls[:index] + current_calls[index + 1:]
+                    codegen_calls = [{
+                        "name": call.get("function", "raw"),
+                        "signature": call.get("function", "raw"),
+                        "args": call.get("arguments") or [],
+                        "value": int(call.get("value_wei") or 0),
+                        "encoded_data": call.get("calldata") or "0x",
+                        "address_patches": call.get("address_patches") or [],
+                    } for _, call in trial_calls]
+                    trial_source = engine._fuzz_codegen(codegen_calls, {})
+                    try:
+                        remaining_timeout = max(
+                            1, args.timeout - int(time.time() - started))
+                        trial_result = verify_full(
+                            target_name=target_name,
+                            target_src=contract_src,
+                            invariants_src=invariants_src,
+                            exploit_src=trial_source,
+                            manifest=manifest,
+                            seed=args.seed,
+                            extra_sources=extra_sources or None,
+                            timeout_sec=remaining_timeout,
+                        )
+                        metrics["minimization_verifications"] += 1
+                    except Exception as exc:
+                        minimization_errors.append(str(exc)[:240])
+                        break
+                    if (trial_result.proven
+                            and trial_result.violated == first_violated):
+                        removed.append(current_calls[index][1].get(
+                            "function", "raw"))
+                        current_calls = trial_calls
+                        source = trial_source
+                        result = trial_result
+                        detail = trial_result.detail
+                        index = 0
+                        continue
+                    index += 1
+
+                final_reproducer = [call for _, call in current_calls]
+                kept_indices = {original for original, _ in current_calls}
+                final_events = []
+                for event in trace.get("calls") or []:
+                    if event.get("index") in kept_indices:
+                        event = dict(event)
+                        event["index"] = len(final_events)
+                        final_events.append(event)
+                official_minimization = {
+                    "algorithm": "final-verifier-call-deletion",
+                    "original_calls": original_count,
+                    "final_calls": len(current_calls),
+                    "removed": removed,
+                    "replay_verifications": metrics["minimization_verifications"],
+                    "one_minimal": (
+                        len(current_calls) <= 1
+                        or (not minimization_errors and index >= len(current_calls))
+                    ),
+                }
+                if minimization_errors:
+                    official_minimization["errors"] = minimization_errors
+                trace["official_minimization"] = official_minimization
+                trace["reproducer"] = final_reproducer
+                trace["calls"] = final_events
+                trace["sequence"] = json.dumps(
+                    [{
+                        "function": call.get("function", "raw"),
+                        "arguments": call.get("arguments") or [],
+                        "value_wei": call.get("value_wei", "0"),
+                    } for call in final_reproducer],
+                    ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+                )
+                label = "fuzz(" + " → ".join(
+                    call.get("function", "raw").split("(", 1)[0]
+                    for call in final_reproducer) + ")"
+
         if proven:
             note(f"attempt {attempts} [{stage}/{label}]: PROVEN — invariant violated: {first_violated}")
+            discovery = profile.get("discovery") or {}
+            trace = discovery.get("trace") or {}
+            if trace:
+                route = " → ".join(
+                    call.get("function", "raw")
+                    for call in trace.get("reproducer", []))
+                if route:
+                    note(f"# proven call trace: {route}")
+                minimized = (trace.get("official_minimization")
+                             or trace.get("minimization") or {})
+                if minimized:
+                    note(
+                        "# minimization "
+                        f"calls={minimized.get('original_calls')}→{minimized.get('final_calls')} "
+                        f"one_minimal={minimized.get('one_minimal')}"
+                    )
             if getattr(result, "profit", None) is not None:
                 note(f"# profit {result.profit.classification} extractable_wei={result.profit.extractable_wei}")
             write_exploit(out_dir, source)
+            candidate_summary = {
+                key: value for key, value in profile.items()
+                if key != "discovery"
+            }
             payload = {
                 "proven": True, "target": target_name, "stage": stage, "strategy": label,
                 "invariant_violated": first_violated,
-                "how": _explain(label, first_violated),
+                "how": _explain(label, first_violated, profile),
+                "derivation": _describe_derivation(stage, label, profile),
                 "verification_detail": detail,
                 "attempts": attempts, "stages": stages_seen,
                 "seed": args.seed, "elapsed_s": round(time.time() - started, 2),
-                "candidate": profile,
+                "candidate": candidate_summary,
                 "metrics": metrics_snapshot(),
             }
+            if discovery:
+                payload["exploit_trace"] = discovery
             if getattr(result, "profit", None) is not None:
                 payload["profit"] = result.profit.as_dict()
             if intent_cls:
@@ -556,8 +681,33 @@ def _write_result(out_dir, obj):
         json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _explain(label, first_violated):
+def _explain(label, first_violated, profile=None):
     """어느 불변식을 '어떻게' 위반했는지에 대한 사람용 설명(출력 규약)."""
+    discovery = (profile or {}).get("discovery") or {}
+    trace = discovery.get("trace") or {}
+    reproducer = trace.get("reproducer") or []
+    if reproducer:
+        route = " → ".join(call.get("function", "raw") for call in reproducer)
+        outcomes = trace.get("calls") or []
+        succeeded = sum(1 for call in outcomes if call.get("success"))
+        minimization = (trace.get("official_minimization")
+                        or trace.get("minimization") or {})
+        minimal = ""
+        if minimization:
+            original = minimization.get("original_calls", len(reproducer))
+            final = minimization.get("final_calls", len(reproducer))
+            if final < original:
+                minimal = f" 호출 삭제 재검증으로 {original}개에서 {final}개로 축약한 뒤"
+            elif final == 1:
+                minimal = " 단일 호출 경로로 더 줄일 수 없음을 확인한 뒤"
+            elif minimization.get("one_minimal"):
+                minimal = f" 각 호출의 삭제를 재검증해 {final}개 호출이 모두 필요함을 확인한 뒤"
+        return (
+            f"현재 타깃 ABI에서 탐색한 호출 경로 '{route}'를 실행했고,"
+            f" {len(outcomes)}개 호출 중 {succeeded}개가 성공했다.{minimal} "
+            f"실행 전 checkAll=true에서 실행 후 checkAll=false로 바뀌어 "
+            f"불변식 '{first_violated}' 위반을 재현함."
+        )
     base = (label or "").split(":")[0].split(" ")[0]
     how = {
         "reentrancy": "외부 호출 뒤 상태 갱신(CEI 위반)을 재진입으로 악용해",
@@ -577,7 +727,40 @@ def _explain(label, first_violated):
         "king-dos": "revert 하는 receive 로 특권 역할을 영구 락(그리핑 DoS)해",
         "callback-inconsistency": "외부 콜백을 false→true 로 조작해",
     }.get(base, f"전략 '{label or 'generated'}'의 PoC 호출 경로를 실행해")
-    return f"{how} 불변식 '{first_violated}' 을(를) 위반함."
+    return f"{how} 불변식 '{first_violated}' 위반을 재현함."
+
+
+def _describe_derivation(stage, label, profile=None):
+    """Explain why this candidate came from the current input, not a target id."""
+    profile = profile or {}
+    discovery = profile.get("discovery") or {}
+    trace = discovery.get("trace") or {}
+    if trace.get("reproducer"):
+        functions = [call.get("function", "raw")
+                     for call in trace["reproducer"]]
+        return {
+            "method": "input-derived ABI sequence search",
+            "target_name_dispatch": False,
+            "source_evidence": [
+                item for item in (profile.get("evidence") or [])
+                if not str(item).startswith("no_")
+            ],
+            "invariant_overlap": profile.get("invariant_overlap") or [],
+            "call_path": functions,
+            "round": discovery.get("round"),
+            "depth": discovery.get("depth"),
+            "minimization": (trace.get("official_minimization")
+                             or trace.get("minimization") or {}),
+        }
+    return {
+        "method": "source capability hypothesis",
+        "target_name_dispatch": False,
+        "stage": stage,
+        "strategy": label,
+        "source_evidence": profile.get("evidence") or [],
+        "estimated_effect": profile.get("estimated_effect") or [],
+        "invariant_overlap": profile.get("invariant_overlap") or [],
+    }
 
 
 def _fallback_stub():
