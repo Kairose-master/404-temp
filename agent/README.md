@@ -21,18 +21,21 @@ python3 agent/agent.py --contract <path> --invariants <path> --manifest <path> \
 | 파일 | 역할 |
 |---|---|
 | `agent.py` | CLI·오케스트레이션·생성-검증 루프·종료코드 |
-| `scanner.py` | 정적 분석: 함수 시그니처 추출 + 4대 유형 스코어링 |
+| `scanner.py` | 정적 분석: 함수 시그니처 추출 + 7개 취약 유형 스코어링 |
 | `strategies.py` | 유형별 `Exploit.sol` 템플릿 + seed 기반 결정론 순서 |
-| `verify.py` | 후보 검증기(내장 EVM 기본 / forge 선택) — `_prove` 재현 |
-| `llm.py` | 선택적 LLM 초안 제안기(`temperature=0`, 없어도 degrade) |
+| `verify.py` | 후보 검증기(제출 Docker는 Foundry 기본 / 로컬 EVM 보조) — `_prove` 재현 |
+| `llm.py` | 명시적 개발 모드용 LLM 초안 제안기(제출 Docker에서는 비활성) |
 
 ## 검증기 두 경로
-- **내장 EVM (기본)**: `solc 0.8.24` + `eth-tester`/`py-evm`. forge·네트워크 불필요.
+- **Foundry (제출 Docker 기본)**: 고정된 Foundry 1.7.1과 참가 번들
+  `harness/src/Harness.sol`로 `forge test --offline`을 실행한다. 주최 측 표준 채점
+  의미와 같은 경로이며 별도 환경변수가 필요 없다.
+- **내장 EVM (로컬 개발 보조)**: `TRUST404_VERIFIER=evm`으로 선택한다.
+  `solc 0.8.24` + `eth-tester`/`py-evm`을 사용하며,
   타깃을 `value_wei` 시드 + `constructor_args` 로 배포 → `checkAll` 건강 확인 →
   Exploit 에 10 ETH 지급 후 `run{value:10 ether}` → 재검사.
-- **forge (선택)**: `TRUST404_VERIFIER=forge` + `TRUST404_HARNESS_DIR=<harness>` 로
-  참가 번들 `harness/src/Harness.sol` 의 `_prove()` 를 `forge test` 로 실행. 후보
-  자체의 revert는 다음 후보로 진행하고, Setup·배포·초기 불변식 실패는 exit 2로 종료한다.
+  두 경로 모두 후보 자체의 revert는 다음 후보로 진행하고, Setup·배포·초기 불변식
+  실패는 exit 2로 종료한다.
 
 ## Docker
 
@@ -137,13 +140,14 @@ docker run --rm -v "$PWD:/w" track04 audit /w/MyProject.zip --out /w/audit
 ### 옵션·환경변수
 - `--seed <int>` 결정론 시드(같은 시드 → 바이트 동일 산출). `--max-attempts <int>`
   후보 예산. `--timeout <sec>` 시간 예산.
-- `-e ANTHROPIC_API_KEY=$ANTHROPIC_API_KEY` 를 주면 0단계 LLM 초안을 먼저 시도하고,
-  없으면 오프라인 휴리스틱/합성/퍼저만으로 동작한다(네트워크 불필요).
-- `-e TRUST404_VERIFIER=forge` 로 검증기를 py-evm 대신 Foundry `forge test` 경로로
-  바꾼다(이미지에 Foundry 1.7.1·vendored `forge-std` 포함).
+- 표준 Docker 실행은 API 키가 주변 환경에 있어도 LLM을 사용하지 않는다. 개발용
+  LLM 실험은 `-e TRUST404_ENABLE_LLM=1`과 `-e ANTHROPIC_API_KEY=...`(또는
+  `LLM_BASE_URL`/`LLM_API_KEY`)를 함께 줘야 활성화된다.
+- `-e TRUST404_VERIFIER=evm`으로만 내장 EVM을 선택한다. 지정하지 않으면 공식 표준인
+  Foundry `forge test` 경로다.
 
 이미지는 빌드 시 `solc 0.8.24`, Foundry **1.7.1**, vendored `forge-std` 를 넣으므로
-실행 시 네트워크가 없어도 된다. 기본 검증기는 py-evm.
+실행 시 네트워크가 없어도 된다. 제출 Docker의 기본 검증기는 Foundry다.
 
 ## 로컬 실행 (Docker 없이)
 ```bash

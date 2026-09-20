@@ -5,7 +5,7 @@
 **탐색 → 생성 → 검증 → (미위반 시) 단계 격상** 의 자기검증 루프를 돈다.
 
 ```
-0) LLM(선택)  →  1) 계열 템플릿  →  2) 합성(synth)  →  3) 퍼저(fuzz)
+0) LLM(명시적 개발 모드)  →  1) 계열 템플릿  →  2) 합성(synth)  →  3) 퍼저(fuzz)
 ```
 
 각 후보는 하네스 `_prove()` 를 재현한 검증기로 불변식 위반을 확인한다.
@@ -20,16 +20,17 @@
 |---|---|---|
 | A | 에이전트 + Dockerfile + 표준 CLI | [`agent/`](./agent) |
 | B | METHOD.md | [`METHOD.md`](./METHOD.md) |
-| C | Exploit.sol (에이전트 산출) | [`exploits/`](./exploits) |
+| C | Exploit.sol (에이전트 산출 원본) | [`Exploit.sol`](./Exploit.sol) |
 
-## 채점 4칸
+## 트랙 심사 기준 대응
 
 | 칸 | 이 제출물 |
 |---|---|
-| PoC가 불변식을 깨는가 | 취약 7/7 PROVEN. 내장 EVM `_prove` 재현 + `forge test` |
-| 결정론 | 같은 `--seed` → 바이트 동일 `Exploit.sol` |
+| PoC가 실행되어 불변식을 깨는가 | 취약 7/7 PROVEN. 제출 Docker의 기본 검증기는 `forge test --offline` |
+| 결정론 | LLM을 끈 고정 이미지에서 같은 `--seed` → 바이트 동일 `Exploit.sol` |
 | 취약만 깨고 정상은 유지 | 안전 5/5 NOT PROVEN. 오탐 0 |
-| 스스로 찾은 경로 · 일반화 | 타깃 이름 없음. 워게임 유도 3계열 + 안전 페어 |
+| 스스로 찾은 경로인가 | 입력 소스의 capability와 함수 시그니처로 전략을 선택하며 타깃 이름으로 분기하지 않음 |
+| 비공개 일반화·최소 PoC | template→synth→fuzz 단계 격상, 첫 번째 ordered invariant를 깨는 최소 호출 우선 |
 
 ## 타깃 12개 (공개 6 + 워게임 유도 6)
 
@@ -82,7 +83,8 @@ forge test -vv
 ```
 agent/        A — agent.py (트랙 CLI), Dockerfile, scanner, strategies, verify
 METHOD.md     B
-exploits/     C — 타깃별 Exploit.sol + attempts.log + result.json
+Exploit.sol   C — 에이전트가 OpenVault에서 생성한 제출용 PoC 원본
+exploits/     공개·확장 타깃별 실행 결과 보관
 targets/      공개 12 (취약 7 / 안전 5)
 harness/      참가 번들 _prove() 사본
 test/         forge (Prove.t.sol)
