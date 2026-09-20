@@ -5221,7 +5221,8 @@ def _fuzz_fallback_impl(name, target_src, invariants_src, manifest, do_verify, s
 
 def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify=True,
                            analysis_src=None, seed=42, deadline=None,
-                           include_templates=True, world_src=None):
+                           include_templates=True, world_src=None, metrics=None,
+                           search_errors=None):
     """트랙 자기검증 루프(agent.py)용 후보 생성기.
 
     탐색·생성 단계를 지연(lazy) 산출해 (stage, label, exploit_src) 로 내보낸다. 각 단계는
@@ -5236,6 +5237,22 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     """
     search_src = analysis_src or target_src
     context_src = world_src or search_src
+    if metrics is None:
+        metrics = {}
+    if search_errors is None:
+        search_errors = []
+
+    def metric(key, amount=1):
+        metrics[key] = int(metrics.get(key, 0)) + amount
+
+    def search_error(stage, provider, exc):
+        metric("provider_errored")
+        search_errors.append({
+            "stage": stage,
+            "provider": provider,
+            "error": str(exc)[:300],
+        })
+
     findings = scan_target(search_src, invariants_src or "", manifest)
     order = seeded_order(sorted(STRATEGY_ORDER, key=lambda f: (-findings["scores"].get(f,0), f)),
                          findings["scores"], seed)
@@ -5261,16 +5278,19 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
     # 2) 합성 단계 — 소스를 여러 개 낼 수 있는 생성기
     t0 = time.time(); scan_step = {"step":"scan","scores":findings["scores"],
                                   "features":sorted(feats) if feats else []}
-    for gen in (lambda: _synth_reentrancy(search_src),
-                lambda: _synth_amm(context_src, name),
-                lambda: _synth_flashloan(context_src, name)):
+    generators = (
+        ("reentrancy", lambda: _synth_reentrancy(search_src)),
+        ("amm", lambda: _synth_amm(context_src, name)),
+        ("flashloan", lambda: _synth_flashloan(context_src, name)),
+    )
+    for provider_name, gen in generators:
         if deadline is not None and time.time() >= deadline:
             return
         try:
             for label, ex in gen():
                 yield ("synth", label, ex)
-        except Exception:
-            pass
+        except Exception as exc:
+            search_error("synth", provider_name, exc)
     # 2c) 일반화 DeFi/CTF 계열 (DVD Unstoppable/Truster/Selfie/Climber — 레벨명 없음)
     try:
         from trust404.synth_defi import iter_defi_families
@@ -5280,10 +5300,11 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
                 return
             fam = label.split(":")[0].replace("-", "_")
             if not _sr_defi(fam, feats):
+                metric("provider_skipped")
                 continue
             yield ("synth", label, ex)
-    except Exception:
-        pass
+    except Exception as exc:
+        search_error("synth", "defi-families", exc)
     # 2d) 교차 컨트랙트 월드 모델 — 시퀀스를 run(address) 로 접음 (ReX 약점)
     try:
         from trust404.world import iter_world_candidates
@@ -5291,8 +5312,8 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
             if deadline is not None and time.time() >= deadline:
                 return
             yield ("world", label, ex)
-    except Exception:
-        pass
+    except Exception as exc:
+        search_error("world", "world-model", exc)
     # 2b) 합성 단계 — 실행으로 소스를 확정하는 단일 결과형 생성기
     # 레벨 솔버는 계열 capability 로 게이트된다 (trust404.registry).
     # 피처가 없으면 전부 실행(폴백). 태그가 안 겹치면 컴파일/배포를 건너뛴다.
@@ -5319,26 +5340,30 @@ def iter_engine_candidates(name, target_src, invariants_src, manifest, do_verify
             return
         fn = _by[fn_name]
         if not _should_run(fn.__name__, feats):
+            metric("provider_skipped")
             continue
         try:
             r = fn(name, target_src, inv, manifest, scan_step, t0)
-        except Exception:
+        except Exception as exc:
+            search_error("synth", fn_name, exc)
             r = None
         if isinstance(r, dict) and r.get("exploit_src"):
             yield ("synth", r.get("strategy") or fn.__name__, r["exploit_src"])
     # 3) 범용 퍼저 단계
+    metric("fuzz_executions")
     try:
         found = _fuzz_search(name, target_src, inv, manifest, bool(do_verify),
                              deadline=deadline)
-    except Exception:
+    except Exception as exc:
+        search_error("fuzz", "sequence-search", exc)
         found = None
     if found:
         seq, payable_map, reason = found
         label = "fuzz(" + " → ".join(c.get("name", "raw") for c in seq) + ")"
         try:
             yield ("fuzz", label, _fuzz_codegen(seq, payable_map))
-        except Exception:
-            pass
+        except Exception as exc:
+            search_error("fuzz", "codegen", exc)
 
 
 def prove_sources(name, target_src, invariants_src, manifest, do_verify=True, extra_candidates=None):
