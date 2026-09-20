@@ -4,7 +4,10 @@
 # 실제 in-memory EVM 에서 배포->Exploit.sol 생성->실행->checkAll 재검사.
 import os, json, time, re, random, warnings, traceback
 warnings.filterwarnings("ignore")
-os.environ.setdefault("SOLCX_BINARY_PATH", "/tmp/solcx-bin")
+# Only the serverless runtime needs a writable temporary compiler cache.
+# Local CLI imports must retain py-solc-x's default ~/.solcx installation.
+if os.environ.get("VERCEL") == "1":
+    os.environ.setdefault("SOLCX_BINARY_PATH", "/tmp/solcx-bin")
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 from pathlib import Path as _Path
@@ -1142,7 +1145,7 @@ def _init(findings):
 
 def _ensure_solc():
     import solcx
-    os.makedirs(os.environ["SOLCX_BINARY_PATH"], exist_ok=True)
+    solcx.get_solcx_install_folder().mkdir(parents=True, exist_ok=True)
     try:
         solcx.install_solc(SOLC)  # idempotent; downloads to SOLCX_BINARY_PATH if missing
     except Exception:
@@ -1169,7 +1172,7 @@ def _resolve_solc(spec):
 def _solc_for(target_src):
     """타깃 pragma 로 solc 버전을 정해 설치·설정하고 (버전문자열, evmVersion) 반환."""
     import solcx
-    os.makedirs(os.environ["SOLCX_BINARY_PATH"], exist_ok=True)
+    solcx.get_solcx_install_folder().mkdir(parents=True, exist_ok=True)
     m = re.search(r"pragma\s+solidity\s+([^;]+);", target_src or "")
     ver = _resolve_solc(m.group(1) if m else SOLC)
     vs = ".".join(str(x) for x in ver)
