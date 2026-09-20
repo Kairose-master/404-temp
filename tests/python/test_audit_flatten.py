@@ -21,6 +21,18 @@ audit = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(audit)
 
 
+class _CtorEngine:
+    @staticmethod
+    def _strip_comments(src):
+        return src
+
+    @staticmethod
+    def _contract_bodies(_src):
+        return {
+            "Pool": "constructor(Token _col, IToken _bor, Token[2] memory peers) {}",
+        }
+
+
 def _make_project(base: Path):
     (base / "src" / "base").mkdir(parents=True, exist_ok=True)
     (base / "lib" / "oz" / "contracts" / "utils").mkdir(parents=True, exist_ok=True)
@@ -128,6 +140,21 @@ class Flatten(unittest.TestCase):
         self.assertEqual(rc, audit.EXIT_ERROR)
         report = json.loads((out / "report.json").read_text())
         self.assertEqual(report["summary"]["analysis_errors"], 1)
+
+    def test_constructor_contract_types_are_synthesized_as_addresses(self):
+        src = """
+        interface IToken {}
+        library Types { }
+        contract Token {}
+        contract Pool {
+            constructor(Token _col, IToken _bor, Token[2] memory peers) {}
+        }
+        """
+        dummy = "0x000000000000000000000000000000000000dEaD"
+        self.assertEqual(
+            audit.synth_ctor_args(_CtorEngine(), src, "Pool"),
+            [dummy, dummy, [dummy, dummy]],
+        )
 
     def test_prepare_input_extracts_zip(self):
         zp = self.tmp.parent / (self.tmp.name + ".zip")

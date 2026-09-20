@@ -72,14 +72,26 @@ def concrete_contracts(src, eng):
 
 
 def synth_ctor_args(eng, src, contract):
-    """타깃 생성자 시그니처를 읽어 배포용 기본 인자를 합성한다. 문자열/바이트/배열/
-    구조체가 필요하면 None(분석 불가)을 돌려준다."""
-    body = eng._contract_bodies(eng._strip_comments(src)).get(contract, "")
+    """타깃 생성자 시그니처를 읽어 배포용 기본 인자를 합성한다.
+
+    Solidity contract/interface/library parameters are encoded as ``address``
+    in the ABI. Keep the cheap source-level parser, but recognize those
+    user-defined reference types so helper contracts such as ``Pool(Token,
+    Token)`` do not turn a complete directory audit into an infrastructure
+    error. Unsupported structs and other composite types still fail closed.
+    """
+    stripped = eng._strip_comments(src)
+    body = eng._contract_bodies(stripped).get(contract, "")
+    address_like = set(re.findall(
+        r"\b(?:contract|interface|library)\s+(\w+)", stripped))
+    dummy_address = "0x000000000000000000000000000000000000dEaD"
     m = re.search(r"constructor\s*\(([^)]*)\)", body)
     if not m or not m.group(1).strip():
         return []
     def default_for(t):
-        if t == "address": return "0x000000000000000000000000000000000000dEaD"
+        base = t.rsplit(".", 1)[-1]
+        if t == "address" or base in address_like:
+            return dummy_address
         if t.startswith("uint") or t.startswith("int"): return 10**18
         if t == "bool": return False
         if t == "bytes32": return "0x" + "11" * 32
@@ -93,27 +105,17 @@ def synth_ctor_args(eng, src, contract):
         if not toks:
             continue
         t = toks[0]
-        arr = re.fullmatch(r"([a-z0-9]+)\[(\d+)\]", t)
+        arr = re.fullmatch(r"(.+)\[(\d+)\]", t)
         if arr:
             elem = default_for(arr.group(1))
             if elem is None:
                 return None
             args.append([elem] * int(arr.group(2)))
             continue
-        if t == "address":
-            args.append("0x000000000000000000000000000000000000dEaD")  # 유효한 20-byte 테스트 주소
-        elif t.startswith("uint") or t.startswith("int"):
-            args.append(10**18)
-        elif t == "bool":
-            args.append(False)
-        elif t == "bytes32":
-            args.append("0x" + "11" * 32)   # 알려진 값(자체 배포이므로 우리가 안다)
-        elif t == "string":
-            args.append("trust404")
-        elif t == "bytes":
-            args.append("0x")
-        else:
+        value = default_for(t)
+        if value is None:
             return None  # 배열/구조체 등 → 안전하게 분석 스킵
+        args.append(value)
     return args
 
 
@@ -379,7 +381,7 @@ def analyze_source(eng, src, contract, invariants, seed_eth, seed):
     cargs = synth_ctor_args(eng, src, contract)
     if cargs is None:
         return {"name": contract, "proven": False,
-                "error": "constructor needs string/bytes/array args (auto-deploy unsupported)",
+                "error": "constructor contains unsupported parameter types for auto-deploy",
                 "steps": [{"step": "scan", "scores": {}}]}
     manifest["deploy"]["constructor_args"] = cargs
     do_verify = bool(invariants)
