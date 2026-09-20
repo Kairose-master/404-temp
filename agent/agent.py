@@ -134,17 +134,20 @@ def main(argv=None):
     target_name = manifest["target"]["name"]
     extra_sources = {}
     try:
-        from trust404.abi import load_extra_sources
+        from trust404.abi import load_extra_sources, combine_analysis_sources
         extra_sources = load_extra_sources(args.manifest, args.contract, manifest)
         if extra_sources:
             note("# extra sources: " + ",".join(sorted(extra_sources)))
     except Exception as e:
         note(f"# extra sources skipped: {str(e)[:80]}")
+        combine_analysis_sources = None
+    analysis_src = (combine_analysis_sources(contract_src, extra_sources)
+                    if combine_analysis_sources else contract_src)
     note(f"# TRUST404 Track04 agent | target={target_name} seed={args.seed} "
          f"max_attempts={args.max_attempts} timeout={args.timeout}s")
 
     # ── 정적 분석 → 후보 유형 스코어링 ────────────────────────────────────────
-    findings = scan_target(contract_src, invariants_src, manifest)
+    findings = scan_target(analysis_src, invariants_src, manifest)
     scored = sorted(
         STRATEGY_ORDER,
         key=lambda fam: (-findings["scores"].get(fam, 0), fam),
@@ -155,10 +158,7 @@ def main(argv=None):
     feats = set()
     if extract_features is not None:
         try:
-            blob = contract_src
-            if extra_sources:
-                blob = contract_src + "\n" + "\n".join(extra_sources.values())
-            feats = extract_features(blob, target_name)
+            feats = extract_features(analysis_src, target_name)
             note("# features: " + ",".join(sorted(feats)[:40]))
             if hkg_lift is not None:
                 hkg = hkg_lift(feats)
@@ -166,7 +166,7 @@ def main(argv=None):
                 note("# hkg causes: " + ",".join(hkg.causes[:8]))
                 note("# hkg ranked: " + ",".join(hkg.ranked_primitives[:8]))
             if plan_world is not None:
-                wp = plan_world(contract_src, target_name, feats)
+                wp = plan_world(analysis_src, target_name, feats)
                 note(f"# world cross={wp.cross_contract} reason={wp.reason[:160]}")
         except Exception as e:
             note(f"# feature extract failed: {str(e)[:80]}")
@@ -179,42 +179,57 @@ def main(argv=None):
     #   2) synth    — 재진입/AMM/플래시론/스토리지/프록시/다중블록/스토리지충돌/DoS/콜백 합성
     #   3) fuzz     — 범용 호출 시퀀스 탐색(미공개 타깃 일반화 축)
     def candidate_stream():
+        seen_sources = set()
         # 0) LLM (로컬 LLM_BASE_URL 또는 API 키가 있을 때만)
         llm_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("LLM_API_KEY")
         llm_base = os.environ.get("LLM_BASE_URL")
         if llm_key or llm_base:
             try:
                 from llm import propose_exploit  # optional
-                draft = propose_exploit(contract_src, invariants_src, findings, llm_key)
+                draft = propose_exploit(analysis_src, invariants_src, findings, llm_key)
                 if draft:
                     note(f"# LLM draft obtained ({'local:'+llm_base if llm_base else 'anthropic'})")
+                    seen_sources.add(draft)
                     yield ("llm", "llm", draft)
             except Exception as e:  # network blocked / parse fail → degrade
                 note(f"# LLM unavailable, degrading to heuristics: {str(e)[:120]}")
         else:
             note("# no LLM configured; offline heuristic/synthesis/fuzz mode")
-        # 1~3) 엔진(api/prove.py)의 단계별 생성기 — 없으면 로컬 템플릿으로 degrade
+        # Always generate the deterministic templates from the complete source
+        # view first.  This catches inherited attack surfaces even when deeper
+        # engine stages cannot execute a multi-source target internally.
+        for fam in scored:
+            src = build_exploit(fam, findings)
+            if src and src not in seen_sources:
+                seen_sources.add(src)
+                yield ("template", fam, src)
+
+        # 1~3) 엔진(api/prove.py)의 단계별 생성기
         engine = _load_engine()
         if engine is not None and hasattr(engine, "iter_engine_candidates"):
             note("# engine loaded: template → synth → fuzz stages")
             try:
                 for stage, label, src in engine.iter_engine_candidates(
-                        target_name, contract_src, invariants_src, manifest, do_verify=True):
+                        target_name, contract_src, invariants_src, manifest,
+                        do_verify=True, analysis_src=analysis_src,
+                        seed=args.seed, deadline=started + args.timeout):
+                    if src in seen_sources:
+                        continue
+                    seen_sources.add(src)
                     yield (stage, label, src)
             except Exception as e:
                 note(f"# engine candidate stream error: {str(e)[:140]}")
         else:
             note("# engine unavailable; local template stage only")
-            for fam in scored:
-                src = build_exploit(fam, findings)
-                if src:
-                    yield ("template", fam, src)
+            return
 
     # ── 자기검증 루프 (Self-validation Loop) ──────────────────────────────────
     # 생성 → 검증 → (불변식 미위반 시) 다음 후보로 탐색·생성 반복. 이 루프가 트랙의 핵심.
     last_source = _fallback_stub()
     attempts = 0
     verifier_ok = True
+    verified_attempts = 0
+    verification_errors = []
     stages_seen = []
     held_invariants = {}  # 실패한 시도에서 '유지된' 불변식 관찰(피드백)
     critiques = []
@@ -233,6 +248,7 @@ def main(argv=None):
         last_source = source
         # ① 검증(불변식 위반 여부) — 참가 하네스 _prove() 재현
         try:
+            remaining_timeout = max(1, args.timeout - int(time.time() - started))
             result = verify_full(
                 target_name=target_name,
                 target_src=contract_src,
@@ -241,14 +257,19 @@ def main(argv=None):
                 manifest=manifest,
                 seed=args.seed,
                 extra_sources=extra_sources or None,
+                timeout_sec=remaining_timeout,
             )
             proven, first_violated, detail = result.tuple()
+            verified_attempts += 1
         except VerifyUnavailable as e:
             verifier_ok = False
             note(f"attempt {attempts} [{stage}/{label}]: verifier unavailable ({e}); emitting best candidate")
             break
         except Exception as e:
-            note(f"attempt {attempts} [{stage}/{label}]: verify error → refine ({str(e)[:140]})")
+            err = str(e)[:400]
+            verification_errors.append({"attempt": attempts, "stage": stage,
+                                        "strategy": label, "error": err})
+            note(f"attempt {attempts} [{stage}/{label}]: verify error → refine ({err[:140]})")
             continue
 
         intent_cls = None
@@ -273,6 +294,7 @@ def main(argv=None):
                 "proven": True, "target": target_name, "stage": stage, "strategy": label,
                 "invariant_violated": first_violated,
                 "how": _explain(label, first_violated),
+                "verification_detail": detail,
                 "attempts": attempts, "stages": stages_seen,
                 "seed": args.seed, "elapsed_s": round(time.time() - started, 2),
             }
@@ -313,11 +335,14 @@ def main(argv=None):
                     if attempts < args.max_attempts:
                         attempts += 1
                         last_source = draft
+                        remaining_timeout = max(
+                            1, args.timeout - int(time.time() - started))
                         proven2, fv2, d2 = verify_candidate(
                             target_name=target_name, target_src=contract_src,
                             invariants_src=invariants_src, exploit_src=draft,
                             manifest=manifest, seed=args.seed,
-                            extra_sources=extra_sources or None)
+                            extra_sources=extra_sources or None,
+                            timeout_sec=remaining_timeout)
                         if proven2:
                             note(f"attempt {attempts} [llm/critique]: PROVEN — {fv2}")
                             write_exploit(out_dir, draft)
@@ -325,6 +350,7 @@ def main(argv=None):
                                 "proven": True, "target": target_name, "stage": "llm",
                                 "strategy": "llm-critique", "invariant_violated": fv2,
                                 "how": _explain("llm-critique", fv2),
+                                "verification_detail": d2,
                                 "attempts": attempts, "stages": stages_seen + ["llm"],
                                 "seed": args.seed,
                                 "elapsed_s": round(time.time() - started, 2),
@@ -340,10 +366,15 @@ def main(argv=None):
 
     # ── 예산 내 미발견 ────────────────────────────────────────────────────────
     write_exploit(out_dir, last_source)
+    if verified_attempts == 0:
+        verifier_ok = False
+        note("# no candidate completed verification; refusing to report NOT_PROVEN")
     _write_result(out_dir, {
         "proven": False, "target": target_name,
         "attempts": attempts, "stages": stages_seen,
         "verifier_available": verifier_ok,
+        "verified_attempts": verified_attempts,
+        "verification_errors": verification_errors,
         "feedback": held_invariants,
         "critiques": [c.as_dict() for c in critiques] if critiques else [],
         "features": sorted(feats),
@@ -383,7 +414,7 @@ def _explain(label, first_violated):
         "storage": "private 슬롯 값을 스토리지에서 읽어",
         "king-dos": "revert 하는 receive 로 특권 역할을 영구 락(그리핑 DoS)해",
         "callback-inconsistency": "외부 콜백을 false→true 로 조작해",
-    }.get(base, "생성된 PoC 실행으로")
+    }.get(base, f"전략 '{label or 'generated'}'의 PoC 호출 경로를 실행해")
     return f"{how} 불변식 '{first_violated}' 을(를) 위반함."
 
 

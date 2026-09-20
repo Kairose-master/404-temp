@@ -118,10 +118,8 @@ abstract contract Harness is Test {
     /// 반환값의 targetValueWei 는 "Exploit 자금"이 아니라 타깃 **생성자**에 함께
     /// 보낼 초기 자금이다(manifest.deploy.value_wei). Exploit 쪽 자금은 별개로
     /// DEFAULT_EXPLOIT_FUNDING_WEI(하네스 규약)를 쓴다 — 이 둘을 섞으면 안 된다.
-    /// 무인자 배포 경로(vm.deployCode, value 없음)에서는 targetValueWei
-    /// 를 아직 실제로 전달하지 않는다(값이 있는 타깃은 Setup.s.sol 로 위임하는게
-    /// constructor_args 와 같은 이유로 더 안전). 값을 반환은 하되 호출자가 필요시
-    /// Setup 경로에서 쓰도록 남겨 둔 예약 필드.
+    /// 무인자 직접 배포 경로에서는 targetValueWei 를 생성자 호출에 실제로 전달한다.
+    /// constructor_args 가 필요한 타깃은 기존대로 Setup.s.sol 에 위임한다.
     function _deployFromManifest(string memory manifestJson, string memory targetDir)
         internal
         returns (
@@ -140,23 +138,32 @@ abstract contract Harness is Test {
         blockNumber = vm.parseJsonUint(manifestJson, ".determinism.block_number");
         blockTimestamp = vm.parseJsonUint(manifestJson, ".determinism.block_timestamp");
 
+        // Constructors and Setup.run() may read block.number/block.timestamp.
+        // Freeze both values before any target-side deployment so the initial
+        // state is deterministic as required by the manifest.
+        vm.roll(blockNumber);
+        vm.warp(blockTimestamp);
+
         string memory prefix = bytes(targetDir).length == 0 ? "" : string.concat(targetDir, "/");
-
-        if (vm.keyExistsJson(manifestJson, ".deploy.setup")) {
-            string memory setupFile = vm.parseJsonString(manifestJson, ".deploy.setup");
-            address setup = vm.deployCode(string.concat(prefix, setupFile, ":Setup"));
-            target = ISetup(setup).run();
-        } else {
-            target = vm.deployCode(string.concat(prefix, targetSrc, ":", targetName));
-        }
-
-        invariants = vm.deployCode(string.concat(prefix, invariantsFile, ":Invariants"));
 
         targetValueWei = 0;
         if (vm.keyExistsJson(manifestJson, ".deploy.value_wei")) {
             // 스펙 예시가 문자열("0")로 표기하므로 문자열로 읽어 10진수로 변환한다.
             targetValueWei = _parseDecimal(vm.parseJsonString(manifestJson, ".deploy.value_wei"));
         }
+
+        if (vm.keyExistsJson(manifestJson, ".deploy.setup")) {
+            string memory setupFile = vm.parseJsonString(manifestJson, ".deploy.setup");
+            address setup = vm.deployCode(string.concat(prefix, setupFile, ":Setup"));
+            target = ISetup(setup).run();
+        } else {
+            target = vm.deployCode(
+                string.concat(prefix, targetSrc, ":", targetName), targetValueWei
+            );
+        }
+
+        invariants = vm.deployCode(string.concat(prefix, invariantsFile, ":Invariants"));
+
     }
 
     function _parseDecimal(string memory s) private pure returns (uint256 result) {

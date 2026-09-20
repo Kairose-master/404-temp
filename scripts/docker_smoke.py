@@ -58,7 +58,9 @@ def main() -> int:
         try:
             verify_full(**inputs)
         except SetupDeploymentError as exc:
-            if "Setup.run reverted" not in str(exc):
+            expected = ("Setup.run reverted" if args.backend == "evm"
+                        else "declared Setup/initial state")
+            if expected not in str(exc):
                 raise AssertionError(f"{name}: wrong deployment failure: {exc}") from exc
         else:
             raise AssertionError(f"{name}: failed Setup unexpectedly produced a proof result")
@@ -113,8 +115,7 @@ contract Exploit {
         check(name, result, expected, "unbroken" if expected else "")
 
     inputs = case_inputs("SetupRevertsZeroArg")
-    if args.backend == "evm":
-        check_setup_error("SetupRevertsZeroArg", inputs)
+    check_setup_error("SetupRevertsZeroArg", inputs)
     # Same target and exploit: only change Setup's revert to a successful return.
     setup_src = inputs["extra_sources"]["Setup.s.sol"]
     inputs["extra_sources"]["Setup.s.sol"] = setup_src.replace(

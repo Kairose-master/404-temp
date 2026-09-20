@@ -55,6 +55,8 @@
   산출물: `--out/Exploit.sol`(증명된, 또는 최선 후보), `--out/attempts.log`(단계 격상 ·
   시도별 번호·전략·검증 결과·유지된 불변식), `--out/result.json`(증명 여부 · 위반한
   불변식 · **어떻게** 위반했는지 설명 · 시도 수 · 거친 단계).
+  타깃과 함께 제공된 Solidity source unit 전체를 결정론적으로 읽어 상속된 함수도
+  탐색하며, 모든 후보가 컴파일/검증 오류로 끝나면 NOT_PROVEN 대신 exit 2를 낸다.
 - `audit.py` — 실무 감사 CLI. 임의 `.sol`/디렉터리를 받아 불변식 없이도(자동 효과검사)
   엔진 전량을 돌려 심각도별 리포트(JSON/Markdown)와 PoC를 산출한다. 생성자 인자는
   시그니처에서 자동 합성하고, 스크립트/인터페이스/라이브러리는 건너뛴다.
@@ -90,6 +92,7 @@ LLM 은 **선택적 가속**이다. 키가 있으면 `claude-sonnet-5`, `tempera
 - 검증기는 `manifest.determinism`(block_number/timestamp/seed)과 고정 solc
   0.8.24/evm cancun 을 사용한다. 내장 EVM 은 배포 시점 상태가 시드/인자만의
   함수라 실행마다 동일하다.
+- Python 검증 스택도 `requirements.txt` 에 exact version으로 고정한다.
 
 ## 6. 한계
 - 오라클: 스팟 조작과 **같은 블록에서 스팟으로 붕괴하는 TWAP**은 합성한다.
