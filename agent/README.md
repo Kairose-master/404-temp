@@ -31,7 +31,8 @@ python3 agent/agent.py --contract <path> --invariants <path> --manifest <path> \
   타깃을 `value_wei` 시드 + `constructor_args` 로 배포 → `checkAll` 건강 확인 →
   Exploit 에 10 ETH 지급 후 `run{value:10 ether}` → 재검사.
 - **forge (선택)**: `TRUST404_VERIFIER=forge` + `TRUST404_HARNESS_DIR=<harness>` 로
-  참가 번들 `harness/src/Harness.sol` 의 `_prove()` 를 `forge test` 로 실행.
+  참가 번들 `harness/src/Harness.sol` 의 `_prove()` 를 `forge test` 로 실행. 후보
+  자체의 revert는 다음 후보로 진행하고, Setup·배포·초기 불변식 실패는 exit 2로 종료한다.
 
 ## Docker
 
@@ -123,10 +124,12 @@ docker run --rm -v "$PWD:/w" track04 audit /w/MyProject.zip --out /w/audit
 - `import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";` — 별칭은
   **경로 접미사 최장 일치**로 트리에서 실제 파일을 찾는다(그 라이브러리가 zip/폴더
   안 `lib/`·`node_modules/` 어디에 있든 무방). 그러니 의존 라이브러리도 함께 넣어라.
+- `import {Base as Parent} from "./Base.sol";`, `import * as Types from "./Types.sol";`
+  같은 symbol/namespace alias도 flatten 결과에 반영한다.
 - 감사 **대상**은 각 파일에 직접 선언된 구체 컨트랙트뿐이다. import 로 끌려온 베이스·
   인터페이스·라이브러리와 `lib/`·`node_modules/`·`test/`·`script/` 폴더는 대상에서
   제외하되, import 해석용으로는 계속 참조한다.
-- 해석 못 한 import 는 건너뛰고 로그로 남긴 뒤 가능한 만큼 컴파일을 시도한다.
+- 해석 못 하거나 같은 접미사의 후보가 여러 개인 import는 분석 오류(exit 2)로 남긴다.
 
 불변식을 함께 증명하려면 `--invariants Inv.sol` 를 준다. `audit` 매니페스트 스키마와
 불변식 작성법은 `targets/*/manifest.json` 과 `targets/*/Invariants.sol` 을 본떠 쓰면 된다.

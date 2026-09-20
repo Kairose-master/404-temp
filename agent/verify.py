@@ -52,20 +52,20 @@ class SetupDeploymentError(VerifyUnavailable):
 
 
 def verify_candidate(target_name, target_src, invariants_src, exploit_src, manifest, seed,
-                     extra_sources=None):
+                     extra_sources=None, timeout_sec=None):
     return verify_full(
         target_name, target_src, invariants_src, exploit_src, manifest, seed,
-        extra_sources=extra_sources,
+        extra_sources=extra_sources, timeout_sec=timeout_sec,
     ).tuple()
 
 
 def verify_full(target_name, target_src, invariants_src, exploit_src, manifest, seed=0,
-                extra_sources=None):
+                extra_sources=None, timeout_sec=None):
     mode = os.environ.get("TRUST404_VERIFIER", "evm").lower()
     if mode == "forge":
         proven, violated, detail = _verify_forge(
             target_name, target_src, invariants_src, exploit_src, manifest,
-            extra_sources=extra_sources)
+            extra_sources=extra_sources, timeout_sec=timeout_sec)
         return VerifyResult(proven, violated, detail, profit=None)
     return _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
                        extra_sources=extra_sources)
@@ -94,16 +94,18 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
 
     src_key = (manifest.get("target") or {}).get("src") or f"{target_name}.sol"
     inv_key = (manifest.get("invariants") or {}).get("contract") or "Invariants.sol"
-    files = {
-        src_key: target_src,
-        f"{target_name}.sol": target_src,
-        inv_key: invariants_src,
-        "Invariants.sol": invariants_src,
-        "Exploit.sol": exploit_src,
-    }
+    # Keep exactly one canonical source-unit name for each input.  Adding a
+    # second basename alias makes solc compile the same target twice; relative
+    # imports from that alias then resolve against the wrong directory (for
+    # example ImportedOwner.sol -> OwnerBase.sol instead of
+    # src/ImportedOwner.sol -> src/OwnerBase.sol).
+    files = {}
     for k, v in (extra_sources or {}).items():
         if v:
             files[k] = v
+    files[src_key] = target_src
+    files[inv_key] = invariants_src
+    files["Exploit.sol"] = exploit_src
     std_in = {
         "language": "Solidity",
         "sources": {fn: {"content": s} for fn, s in files.items()},
@@ -118,9 +120,23 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
         for cname, c in contracts.items():
             arts[cname] = {"abi": c["abi"], "bin": c["evm"]["bytecode"]["object"]}
 
-    for need in (target_name, "Invariants", "Exploit"):
-        if need not in arts:
-            raise RuntimeError(f"missing compiled artifact: {need}")
+    # Imported bundles may legally contain the same contract name in multiple
+    # source units.  Pin the three authoritative artifacts to their canonical
+    # source paths instead of accepting whichever name was iterated last.
+    for alias, source_key, contract_name in (
+        (target_name, src_key, target_name),
+        ("Invariants", inv_key, "Invariants"),
+        ("Exploit", "Exploit.sol", "Exploit"),
+    ):
+        artifact = (compiled.get("contracts", {}).get(source_key, {})
+                    .get(contract_name))
+        if artifact is None:
+            raise RuntimeError(
+                f"missing compiled artifact: {source_key}:{contract_name}")
+        arts[alias] = {
+            "abi": artifact["abi"],
+            "bin": artifact["evm"]["bytecode"]["object"],
+        }
 
     det = manifest.get("determinism") or {}
     from trust404.hevm import make_backend
@@ -141,6 +157,13 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
     dep = manifest.get("deploy", {})
     target, taddr = _deploy_target(w3, compiled, arts, target_name, dep, acct, deploy, _box)
     inv, iaddr = deploy(arts["Invariants"])
+
+    # Setup may use vm.roll/vm.warp while constructing the initial world.  The
+    # official Harness._prove resets both values before its first invariant
+    # check, so restore the manifest baseline after all deployment is complete.
+    _box["block_number"] = int(det.get("block_number") or 0)
+    _box["timestamp"] = int(det.get("block_timestamp") or 0) or 1
+    _box["prank"] = None
 
     before = inv.functions.checkAll(taddr).call()
     if before[0] is not True:
@@ -170,6 +193,7 @@ def _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
                 w3, eaddr, taddr, tokens,
                 before_attacker=before_att, before_target=before_tgt,
                 invariant_broken=proven,
+                external_funding_wei=DEFAULT_EXPLOIT_FUNDING_WEI,
             )
         except Exception:
             profit = None
@@ -400,7 +424,7 @@ def _forge_solc_arg(version: str) -> str:
 
 
 def _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest,
-                  extra_sources=None):
+                  extra_sources=None, timeout_sec=None):
     import json
     import shutil
     import subprocess
@@ -427,13 +451,15 @@ def _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest
         (work / "test").mkdir(parents=True, exist_ok=True)
         shutil.copytree(Path(harness_dir) / "src", work / "harness_src")
         shutil.copytree(forge_std, work / "lib" / "forge-std")
+        for rel, content in (extra_sources or {}).items():
+            if content:
+                _safe_write(work, rel, content)
+        # Authoritative inputs are written last so a sibling source can never
+        # replace the candidate Exploit or the requested target/invariants.
         _safe_write(work, target_src_rel, target_src)
         _safe_write(work, inv_rel, invariants_src)
         _safe_write(work, "src/Exploit.sol", exploit_src)
         (work / "manifest.json").write_text(man_json, encoding="utf-8")
-        for rel, content in (extra_sources or {}).items():
-            if content:
-                _safe_write(work, rel, content)
         (work / "foundry.toml").write_text(
             "[profile.default]\n"
             f"solc_version = \"{solc}\"\n"
@@ -451,35 +477,70 @@ def _verify_forge(target_name, target_src, invariants_src, exploit_src, manifest
         deal_wei = seed_wei + funding + 10**18
         test_src = f"""// SPDX-License-Identifier: MIT
 pragma solidity {solc};
-import {{Harness}} from "../harness_src/Harness.sol";
+import {{Harness, IInvariants}} from "../harness_src/Harness.sol";
 import {{Exploit}} from "../src/Exploit.sol";
 contract Run is Harness {{
+    function executeCandidate(
+        address target, address inv, uint256 bn, uint256 ts
+    ) external returns (bool proven, string memory violated) {{
+        require(msg.sender == address(this), "self only");
+        Exploit exp = new Exploit();
+        return _prove(target, inv, address(exp), bn, ts, {funding});
+    }}
+
     function test_prove() public {{
         vm.deal(address(this), {deal_wei});
         string memory man = vm.readFile("manifest.json");
         (address target, address inv, uint256 bn, uint256 ts,) = _deployFromManifest(man, "");
-        Exploit exp = new Exploit();
-        (bool proven, string memory v) = _prove(target, inv, address(exp), bn, ts, {funding});
-        proven; v;
+        vm.roll(bn);
+        vm.warp(ts);
+        (bool healthy, string memory broken) = IInvariants(inv).checkAll(target);
+        require(healthy, string.concat(
+            "BAD TARGET DESIGN: invariant already broken before exploit: ", broken
+        ));
+
+        // Candidate construction/run/post-check failures reject this candidate
+        // without turning a healthy target into an infrastructure failure.  All
+        // setup, deployment and pre-invariant failures happen above this try and
+        // therefore remain INCONCLUSIVE.
+        try this.executeCandidate(target, inv, bn, ts)
+            returns (bool proven, string memory v)
+        {{
+            proven; v;
+        }} catch {{
+            emit ProofResult(false, "");
+        }}
     }}
 }}
 """
         (work / "test" / "Run.t.sol").write_text(test_src)
+        forge_timeout = 180
+        if timeout_sec is not None:
+            forge_timeout = max(1, min(180, int(timeout_sec)))
         try:
             proc = subprocess.run(
                 ["forge", "test", "--match-contract", "Run", "-vvvv", "--offline",
                  "--use", _forge_solc_arg(solc), "--color", "never"],
-                cwd=work, capture_output=True, text=True, timeout=180)
+                cwd=work, capture_output=True, text=True, timeout=forge_timeout)
         except subprocess.TimeoutExpired as e:
-            raise RuntimeError(f"forge timed out: {e}")
+            raise VerifyUnavailable(f"forge timed out after {forge_timeout}s: {e}")
         out = (proc.stdout or "") + (proc.stderr or "")
-        # Failed execution traces may contain events from reverted calls.
-        # Never accept those events as a successful official proof.
+        # Candidate-local failures are caught by Run.executeCandidate and yield
+        # a successful Forge process with ProofResult(false).  Any remaining
+        # non-zero process result happened while compiling, deploying, running
+        # Setup, or checking the initial state, so it is inconclusive rather
+        # than a negative proof.
         if proc.returncode != 0:
-            if ("Compiler run failed" in out or "not found" in out
-                    or "failing tests" not in out.lower()):
-                raise RuntimeError(f"forge verifier infrastructure failed:\n{out[-1200:]}")
-            return False, "", "forge NOT_PROVEN (test reverted/failed)"
+            tail = out[-1200:]
+            # Invalid generated Solidity is a rejected candidate, so the
+            # self-validation loop may refine and try the next one. If every
+            # candidate fails this way, agent.py still reports INCONCLUSIVE.
+            if "src/Exploit.sol" in out or "Exploit.sol:" in out:
+                raise RuntimeError("candidate Exploit compilation failed:\n" + tail)
+            if dep.get("setup"):
+                raise SetupDeploymentError(
+                    "forge could not establish the declared Setup/initial state:\n" + tail)
+            raise VerifyUnavailable("forge verifier infrastructure failed:\n" + tail)
         proven, violated = _parse_proof_result(out)
         if proven is None:
             raise RuntimeError(f"forge succeeded without ProofResult:\n{out[-1200:]}")
