@@ -7,7 +7,7 @@
 탐색·생성한다:
 
 ```
-  0) llm      — (선택) 로컬/원격 LLM 초안 1개
+  0) llm      — (개발 모드에서 명시적으로 켠 경우만) 로컬/원격 LLM 초안 1개
   1) template — 정적 스코어 상위 계열부터 결정론 템플릿 PoC
   2) synth    — 재진입/AMM/플래시론/스토리지/프록시/다중블록/스토리지충돌/그리핑DoS/콜백
                 + **계열 게이트**(capability IR). Ethernaut/DVD 솔버는 타깃 이름이
@@ -20,9 +20,9 @@
 `result.json`(어느 불변식을 **어떻게** 위반했는지 설명), 예산(`--max-attempts`/
 `--timeout`)을 소진할 때까지 못 찾으면 1. 실패한 시도마다 `attempts.log` 에 단계·전략·
 검증 결과·유지된 불변식을 남겨 루프 진행을 추적한다. 멀쩡 타깃은 모든 단계를 다 돌아도
-어떤 후보도 불변식을 깨지 못하므로 자연히 1로 종료(오탐 0). `ANTHROPIC_API_KEY`(또는
-`LLM_API_KEY`·`LLM_BASE_URL`)가 있으면 0단계 LLM 초안을 먼저 시도하고, 없으면 1~3단계
-휴리스틱/합성/퍼저만으로 오프라인 동작한다.
+어떤 후보도 불변식을 깨지 못하므로 자연히 1로 종료(오탐 0). 표준 제출 Docker는
+`TRUST404_ENABLE_LLM=0`으로 고정되어 1~3단계 휴리스틱/합성/퍼저만으로 오프라인
+동작한다. 개발 시에만 `TRUST404_ENABLE_LLM=1`과 API 설정을 함께 줘 0단계를 켠다.
 
 이 단계 격상 구조 덕에 트랙 CLI(`agent.py`)가 실무 감사 엔진(`api/prove.py`)의 합성·
 퍼저 후보를 그대로 검증에 태운다 — 템플릿이 못 잡는 다단계·다중 컨트랙트·미공개 패턴을
@@ -43,12 +43,12 @@
 - `strategies.py` — 유형별 `Exploit.sol` 템플릿. 스캐너가 뽑은 실제 함수 이름을
   채워 넣고, 못 찾으면 공개셋 관례명으로 폴백한다. `--seed` 기반 PRNG로 동점 유형의
   순서를 결정론적으로 tie-break 한다.
-- `verify.py` — 후보 검증기. **기본은 내장 EVM**(solc 0.8.24 + eth-tester/py-evm):
+- `verify.py` — 후보 검증기. **제출 Docker의 기본은 Foundry**(forge 1.7.1 + solc 0.8.24):
+  참가 번들 `harness/src/Harness.sol` 의 `_prove()` 를 임시 Foundry 프로젝트로 엮어
+  `forge test --offline`으로 검증한다. 로컬 개발용 내장 EVM 경로도 있으며,
   타깃을 `manifest.deploy.value_wei`(시드) + `constructor_args` 로 배포 →
   `checkAll` 로 배포 직후 건강 확인 → Exploit 에 10 ETH 지급 후
-  `run{value: 10 ether}(target)` → 재검사. `TRUST404_VERIFIER=forge` 면 참가 번들
-  `harness/src/Harness.sol` 의 `_prove()` 를 임시 Foundry 프로젝트로 엮어
-  `forge test` 로 검증한다.
+  `run{value: 10 ether}(target)` → 재검사하는 같은 의미를 재현한다.
 - `agent.py` — 트랙 표준 CLI/오케스트레이션. **자기검증 루프의 본체.** `api/prove.py`
   의 `iter_engine_candidates` 로 template→synth→fuzz 후보를 단계별·지연 생성하고, 각
   후보를 `verify.py` 로 검증한다. 검증 실패 시 다음 후보/단계로 격상하며 반복한다.
@@ -60,8 +60,8 @@
 - `audit.py` — 실무 감사 CLI. 임의 `.sol`/디렉터리를 받아 불변식 없이도(자동 효과검사)
   엔진 전량을 돌려 심각도별 리포트(JSON/Markdown)와 PoC를 산출한다. 생성자 인자는
   시그니처에서 자동 합성하고, 스크립트/인터페이스/라이브러리는 건너뛴다.
-- `llm.py` — 선택적 LLM 제안기. urllib 만 사용, `temperature=0`. 실패 시 예외를
-  던져 휴리스틱으로 degrade.
+- `llm.py` — 명시적 개발 모드용 LLM 제안기. urllib 만 사용, `temperature=0`.
+  제출 Docker에서는 비활성이고, 실패 시 휴리스틱으로 degrade.
 
 ## 3. 탐색 전략 — 단계 격상형 루프
 스캐너 점수 내림차순으로 **템플릿 단계**를 먼저 시도한다(동점은 `--seed` PRNG로 결정론
@@ -76,22 +76,25 @@ tie-break). 한 후보가 검증에 실패하면 같은 단계의 다음 후보�
 단계를 다 돌아도 어떤 후보도 불변식을 깨지 못하므로 자연히 1(오탐 0).
 
 ## 4. LLM 사용 여부와 프롬프트 개요
-LLM 은 **선택적 가속**이다. 키가 있으면 `claude-sonnet-5`, `temperature=0` 으로
+LLM 은 **개발 모드의 선택적 가속**이다. 키만 존재해서는 호출하지 않으며,
+`TRUST404_ENABLE_LLM=1`까지 명시한 경우에만 `claude-sonnet-5`, `temperature=0`으로
 1차 후보 초안을 요청한다. 프롬프트에는 타깃 소스 전문, `Invariants.sol` 전문,
 스캐너 유형 점수 힌트, 불변식 술어 이름을 넣고 "외부 라이브러리 import 없이
 `contract Exploit { function run(address) external payable }` 만 출력" 하도록
-제약한다. 키가 없거나 네트워크가 막혀 있거나 파싱에 실패하면 곧바로 휴리스틱
-템플릿 경로로 degrade 한다 — 공개셋 4개 취약 타깃은 **오프라인(키 없이)** 만으로
-모두 PROVEN 됨을 확인했다.
+제약한다. 표준 제출 Docker는 이 모드를 끄므로 원격 모델 응답이 후보 순서나 최종
+PoC를 바꾸지 않는다. 개발 모드에서 키가 없거나 호출·파싱에 실패하면 휴리스틱
+경로로 degrade 한다. 공개셋 4개 취약 타깃은 **오프라인(LLM 미사용)** 만으로 모두
+PROVEN 됨을 확인했다.
 
 ## 5. 결정론 보장 방법
 - 무작위성이 필요한 유일한 지점(동점 유형 tie-break)에 `--seed` PRNG를 쓴다.
   같은 seed → 같은 전략 순서 → 같은 `Exploit.sol`(재실행 diff 동일 확인).
-- 최종 코드 생성은 항상 결정론적 템플릿 엔진이 담당한다. LLM 은 초안 제안만 하고,
-  `temperature=0` 이라도 남는 비결정성 때문에 "보조 후보"로만 취급한다.
+- 제출 Docker에서는 LLM을 비활성화한다. `temperature=0`만으로 원격 응답의 바이트
+  결정론을 보장할 수 없기 때문에, 주변 환경에 API 키가 있어도 채점 후보 순서와
+  최종 `Exploit.sol`은 오프라인 생성기만 결정한다.
 - 검증기는 `manifest.determinism`(block_number/timestamp/seed)과 고정 solc
-  0.8.24/evm cancun 을 사용한다. 내장 EVM 은 배포 시점 상태가 시드/인자만의
-  함수라 실행마다 동일하다.
+  0.8.24/forge 1.7.1/evm cancun 을 사용한다. 제출 경로는 `forge test --offline`이며,
+  배포 전에 block number와 timestamp를 고정한다.
 - Python 검증 스택도 `requirements.txt` 에 exact version으로 고정한다.
 
 ## 6. 한계
@@ -139,11 +142,11 @@ LLM 은 **선택적 가속**이다. 키가 있으면 `claude-sonnet-5`, `tempera
 
 ## 재현 (타깃 12개: 공개셋 6 + 워게임 유도 6)
 ```bash
-# 내장 EVM 검증기(기본, forge 불필요)
+# 공식 채점과 같은 Foundry 검증기
 for t in ReentrantVault OpenVault BadAccounting NaiveOracle DelegateVault \
          PredictableLottery OpenInitializer SafeVault BoundedOwner LibraryVault \
          CommitLottery GuardedInitializer; do
-  python3 agent/agent.py \
+  TRUST404_VERIFIER=forge TRUST404_ENABLE_LLM=0 python3 agent/agent.py \
     --contract targets/$t/src/$t.sol \
     --invariants targets/$t/Invariants.sol \
     --manifest  targets/$t/manifest.json \
@@ -152,6 +155,14 @@ for t in ReentrantVault OpenVault BadAccounting NaiveOracle DelegateVault \
 done
 # 기대: 취약 7개 exit 0(PROVEN), 멀쩡 5개 exit 1
 ```
+
+루트 [`Exploit.sol`](./Exploit.sol)은 위 표준 CLI에 공개 `OpenVault`, seed 42,
+max-attempts 5를 입력해 나온 파일을 수정 없이 복사한 제출물 C다. 고정 Docker 이미지와
+`--network=none`에서 같은 입력을 10회 실행한 결과, 10회 모두 exit 0,
+`ownerUnchanged`, `access_control`로 일치했다. 생성된 PoC와 `attempts.log`도 각각
+10개 중 고유 결과가 1개였고, PoC SHA-256은
+`af8c53f067cce923015ae6764c118509a4b3c94cf19da5490c1f2099dbcadf5d`였다.
+
 검증 결과 요약:
 
 | 타깃 | 계열 | 판정 | 깨진 술어 | exit |
