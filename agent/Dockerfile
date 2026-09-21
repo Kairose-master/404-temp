@@ -1,5 +1,6 @@
 # TRUST404 Track04 — Autonomous Exploit Prover
-# Pins: Python 3.11.13 bookworm, solc 0.8.24, Foundry v1.7.1 binaries, vendored forge-std.
+# Pins: Python 3.11.13 bookworm, representative solc releases, Foundry v1.7.1,
+# and vendored forge-std.
 # Build has network; the scoring sandbox does not.
 FROM python:3.11.13-slim-bookworm
 
@@ -14,7 +15,12 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /work
 
-# solcx's pinned Linux solc 0.8.24 binary is x86-64. Do not claim ARM support
+# These are the patch releases selected by api/prove.py for each Solidity minor,
+# plus the public fixture compiler. Private targets can add an exact release at
+# build time with --build-arg EXTRA_SOLC_VERSIONS="0.8.20 ...".
+ARG EXTRA_SOLC_VERSIONS=""
+
+# solcx's pinned Linux solc binaries are x86-64. Do not claim ARM support
 # just because a Foundry ARM tarball exists. ARM hosts can build/run amd64.
 RUN test "$(dpkg --print-architecture)" = amd64 \
     || (echo 'Use docker build --platform linux/amd64 for this image.' >&2; exit 1)
@@ -34,12 +40,24 @@ RUN mkdir -p /opt/foundry/bin \
     && chmod +x /opt/foundry/bin/forge /opt/foundry/bin/cast \
     && forge --version
 
-COPY agent/requirements.txt /work/agent/requirements.txt
+COPY agent/requirements.txt agent/install_solc_versions.py /work/agent/
 # solcx does not create a custom SOLCX_BINARY_PATH directory.
 RUN mkdir -p "$SOLCX_BINARY_PATH" \
-    && pip install -r /work/agent/requirements.txt \
-    && python -c "import solcx; solcx.install_solc('0.8.24')" \
-    && /opt/solc/solc-v0.8.24 --version
+    && pip install -r /work/agent/requirements.txt
+
+# Keep compiler releases in separate layers: a transient failure for one
+# download does not invalidate the releases that already succeeded.
+RUN python /work/agent/install_solc_versions.py 0.4.26
+RUN python /work/agent/install_solc_versions.py 0.5.17
+RUN python /work/agent/install_solc_versions.py 0.6.12
+RUN python /work/agent/install_solc_versions.py 0.7.6
+RUN python /work/agent/install_solc_versions.py 0.8.24
+RUN python /work/agent/install_solc_versions.py 0.8.28
+RUN python /work/agent/install_solc_versions.py $EXTRA_SOLC_VERSIONS
+
+RUN for version in 0.4.26 0.5.17 0.6.12 0.7.6 0.8.24 0.8.28 $EXTRA_SOLC_VERSIONS; do \
+         "/opt/solc/solc-v${version}" --version >/dev/null || exit 1; \
+       done
 
 COPY agent /work/agent
 COPY harness /work/harness

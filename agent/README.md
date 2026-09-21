@@ -25,11 +25,11 @@ python3 agent/agent.py --contract <path> --invariants <path> --manifest <path> \
 | `agent.py` | CLI·오케스트레이션·생성-검증 루프·종료코드 |
 | `scanner.py` | 정적 분석: 함수 시그니처 추출 + 7개 취약 유형 스코어링 |
 | `strategies.py` | 유형별 `Exploit.sol` 템플릿 + seed 기반 결정론 순서 |
-| `verify.py` | 후보 검증기(제출 Docker는 Foundry 기본 / 로컬 EVM 보조) — `_prove` 재현 |
+| `verify.py` | 후보 검증기(로컬·Docker 모두 Foundry 기본 / EVM 보조) — `_prove` 재현 |
 | `llm.py` | 명시적 개발 모드용 LLM 초안 제안기(제출 Docker에서는 비활성) |
 
 ## 검증기 두 경로
-- **Foundry (제출 Docker 기본)**: 고정된 Foundry 1.7.1과 참가 번들
+- **Foundry (로컬·제출 Docker 기본)**: 고정된 Foundry 1.7.1과 참가 번들
   `harness/src/Harness.sol`로 `forge test --offline`을 실행한다. 주최 측 표준 채점
   의미와 같은 경로이며 별도 환경변수가 필요 없다.
 - **내장 EVM (로컬 개발 보조)**: `TRUST404_VERIFIER=evm`으로 선택한다.
@@ -52,7 +52,9 @@ docker build --platform linux/amd64 -t track04 -f agent/Dockerfile .
   폴더를 못 봐서 `COPY harness ...` 단계에서 실패한다.
 - **`-f agent/Dockerfile`** 로 Dockerfile 위치만 따로 알려준다(context 와 별개).
 - **`--platform linux/amd64`** 는 Apple Silicon(ARM) Mac 에서 필수다. 이미지는
-  x86-64 `solc 0.8.24` 를 넣으므로 Dockerfile 이 amd64 를 명시적으로 요구한다.
+  x86-64 `solc` 바이너리를 넣으므로 Dockerfile 이 amd64 를 명시적으로 요구한다.
+- 기본 solc는 `0.4.26`, `0.5.17`, `0.6.12`, `0.7.6`, `0.8.24`, `0.8.28`이다.
+  다른 정확한 버전은 `--build-arg EXTRA_SOLC_VERSIONS="0.8.20"`처럼 추가한다.
 
 ### 2. 내장 타깃 실행 — 이름만 바꿔서
 ```bash
@@ -125,14 +127,18 @@ docker run --rm -v "$PWD:/w" track04 audit /w/MyProject.zip --out /w/audit
 
 **여러 .sol + import 자동 해석.** 디렉터리나 zip 을 주면, 감사 대상 파일마다
 `import` 문을 파싱해 의존 파일을 트리에서 찾아 하나로 인라인(flatten)한 뒤 컴파일한다.
-`remappings.txt` 없이도 별칭 import 를 처리한다:
+해석 순서는 상대경로, 프로젝트 루트의 정확한 경로, `node_modules/`,
+`remappings.txt`/`foundry.toml`의 remapping, 경로 접미사 호환 탐색 순이다:
 
 - `import "./IVault.sol";` · `import "../base/VaultBase.sol";` — 상대경로 해석.
-- `import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";` — 별칭은
-  **경로 접미사 최장 일치**로 트리에서 실제 파일을 찾는다(그 라이브러리가 zip/폴더
-  안 `lib/`·`node_modules/` 어디에 있든 무방). 그러니 의존 라이브러리도 함께 넣어라.
+- `import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";` — 같은 경로가
+  `node_modules/@openzeppelin/...`에 있거나 `@openzeppelin/=lib/openzeppelin-contracts/`
+  remapping으로 지정되어 있으면 그 정확한 파일을 사용한다. 설정이 없을 때만 경로
+  접미사를 사용하며, 후보가 둘이면 임의 선택하지 않고 분석 오류로 끝낸다.
 - `import {Base as Parent} from "./Base.sol";`, `import * as Types from "./Types.sol";`
   같은 symbol/namespace alias도 flatten 결과에 반영한다.
+- 엔트리 파일의 pragma를 결과 맨 앞에 유지하고, 의존 파일의 서로 다른 Solidity 및
+  `abicoder` pragma도 함께 보존한다. 서로 양립할 수 없는 제약은 실제 빌드처럼 실패한다.
 - 감사 **대상**은 각 파일에 직접 선언된 구체 컨트랙트뿐이다. import 로 끌려온 베이스·
   인터페이스·라이브러리와 `lib/`·`node_modules/`·`test/`·`script/` 폴더는 대상에서
   제외하되, import 해석용으로는 계속 참조한다.
@@ -150,14 +156,15 @@ docker run --rm -v "$PWD:/w" track04 audit /w/MyProject.zip --out /w/audit
 - `-e TRUST404_VERIFIER=evm`으로만 내장 EVM을 선택한다. 지정하지 않으면 공식 표준인
   Foundry `forge test` 경로다.
 
-이미지는 빌드 시 `solc 0.8.24`, Foundry **1.7.1**, vendored `forge-std` 를 넣으므로
-실행 시 네트워크가 없어도 된다. 제출 Docker의 기본 검증기는 Foundry다.
+이미지는 빌드 시 위 solc 세트, Foundry **1.7.1**, vendored `forge-std` 를 넣으므로
+지원 버전은 실행 시 네트워크가 없어도 된다. 로컬과 Docker의 기본 검증기는 Foundry다.
 
 ## 로컬 실행 (Docker 없이)
 ```bash
 pip install -r agent/requirements.txt
 python3 -c "import solcx; solcx.install_solc('0.8.24')"
-python3 agent/agent.py --contract targets/ReentrantVault/src/ReentrantVault.sol \
+forge --version
+TRUST404_VERIFIER=forge python3 agent/agent.py --contract targets/ReentrantVault/src/ReentrantVault.sol \
   --invariants targets/ReentrantVault/Invariants.sol \
   --manifest targets/ReentrantVault/manifest.json \
   --out demo-results/ReentrantVault --timeout 300 --seed 42 --max-attempts 5

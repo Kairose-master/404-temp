@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Official run-only results for the remaining-hole fixtures. Needs solc 0.8.24."""
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -46,13 +48,14 @@ def _run(name):
     extras = load_extra_sources(base / "manifest.json", base / man["target"]["src"], man)
     from verify import verify_full
     try:
-        r = verify_full(
-            man["target"]["name"],
-            (base / man["target"]["src"]).read_text(),
-            (base / man["invariants"]["contract"]).read_text(),
-            (base / "Exploit.sol").read_text(),
-            man, 42, extras or None,
-        )
+        with patch.dict(os.environ, {"TRUST404_VERIFIER": "evm"}):
+            r = verify_full(
+                man["target"]["name"],
+                (base / man["target"]["src"]).read_text(),
+                (base / man["invariants"]["contract"]).read_text(),
+                (base / "Exploit.sol").read_text(),
+                man, 42, extras or None,
+            )
         return "PROVEN" if r.proven else "NOT_PROVEN", r
     except Exception as e:
         return "ERROR", e

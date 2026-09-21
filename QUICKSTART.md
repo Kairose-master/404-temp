@@ -17,9 +17,12 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r agent/requirements.txt
 python -c "import solcx; solcx.install_solc('0.8.24'); solcx.set_solc_version('0.8.24'); print(solcx.get_solc_version())"
+forge --version
 ```
 
-마지막 명령이 `0.8.24`를 출력해야 한다. `exit 2` 또는
+solc 확인 명령은 `0.8.24`를 출력하고 `forge --version`도 성공해야 한다. manifest가
+다른 `target.solc`를 지정하면 그 정확한 버전도 `solcx.install_solc(...)`로 설치한다.
+`exit 2` 또는
 `INCONCLUSIVE (verifier unavailable)`은 취약점 미발견이 아니라 검증기 준비
 실패이므로 결과로 채점하면 안 된다.
 
@@ -81,11 +84,11 @@ function checkAll(address target)
     returns (bool allHold, string memory firstViolated);
 ```
 
-로컬 내장 EVM으로 실행:
+Docker와 같은 공식 Forge 검증기로 로컬 실행:
 
 ```bash
 TARGET_DIR=/absolute/path/MyVault
-TRUST404_VERIFIER=evm python agent/agent.py \
+TRUST404_VERIFIER=forge python agent/agent.py \
   --contract "$TARGET_DIR/src/MyVault.sol" \
   --invariants "$TARGET_DIR/Invariants.sol" \
   --manifest "$TARGET_DIR/manifest.json" \
@@ -118,6 +121,10 @@ private-results/MyVault/
 ```bash
 docker build --platform linux/amd64 -t track04 -f agent/Dockerfile .
 ```
+
+이미지에는 `0.4.26`, `0.5.17`, `0.6.12`, `0.7.6`, `0.8.24`, `0.8.28`이
+들어 있다. manifest의 `target.solc`가 다른 정확한 버전(예: `0.8.20`)이면 빌드 시
+`--build-arg EXTRA_SOLC_VERSIONS="0.8.20"`을 추가한다.
 
 비공개 입력은 읽기 전용으로, 결과 폴더는 쓰기 가능하게 각각 마운트한다.
 

@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Official run-only counterexamples. Needs solc 0.8.24."""
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -33,15 +35,16 @@ def _case(name):
     from trust404.abi import load_extra_sources
     extras = load_extra_sources(base / "manifest.json", base / man["target"]["src"], man)
     from verify import verify_full
-    return verify_full(
-        target_name=man["target"]["name"],
-        target_src=(base / man["target"]["src"]).read_text(),
-        invariants_src=(base / man["invariants"]["contract"]).read_text(),
-        exploit_src=(base / "Exploit.sol").read_text(),
-        manifest=man,
-        seed=42,
-        extra_sources=extras or None,
-    )
+    with patch.dict(os.environ, {"TRUST404_VERIFIER": "evm"}):
+        return verify_full(
+            target_name=man["target"]["name"],
+            target_src=(base / man["target"]["src"]).read_text(),
+            invariants_src=(base / man["invariants"]["contract"]).read_text(),
+            exploit_src=(base / "Exploit.sol").read_text(),
+            manifest=man,
+            seed=42,
+            extra_sources=extras or None,
+        )
 
 
 @unittest.skipUnless(_solc(), "solc 0.8.24 not installed")

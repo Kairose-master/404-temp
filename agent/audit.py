@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import time
+import tomllib
 from pathlib import Path
 
 EXIT_OK, EXIT_ERROR, EXIT_FINDINGS = 0, 2, 3
@@ -407,7 +408,7 @@ def build_report(findings, args, total_analyzed=None):
         "version": "0.2",
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "seed": args.seed,
-        "engine": "solc 0.8.24 · in-memory EVM (py-evm) · templates+fuzzer",
+        "engine": "pragma-selected solc · in-memory EVM (py-evm) · templates+fuzzer",
         "summary": {
             "contracts_analyzed": total_analyzed if total_analyzed is not None else len(findings),
             "reported": len(findings),
@@ -644,38 +645,139 @@ _IMPORT_RE = re.compile(
     r'^\s*import\s+(?:[^"\';]*\bfrom\b\s*)?["\']([^"\']+)["\'][^;]*;',
     re.MULTILINE)
 _SPDX_RE = re.compile(r'^\s*//\s*SPDX-License-Identifier:.*$', re.MULTILINE)
-_PRAGMA_RE = re.compile(r'^\s*pragma\s+[^;]+;\s*$', re.MULTILINE)
+_PRAGMA_RE = re.compile(r'^\s*(pragma\s+[^;]+;)\s*(?://[^\n]*)?$', re.MULTILINE)
+
+
+class SourceIndex(list):
+    """Solidity files plus the project metadata needed for import resolution."""
+
+    def __init__(self, files, root, remappings):
+        super().__init__(files)
+        self.root = Path(root).resolve()
+        self.remappings = tuple(remappings)
+
+
+def _parse_remapping(value):
+    """Return a normalized ``(context, prefix, target)`` Foundry remapping."""
+    value = str(value).strip()
+    if not value or value.startswith("#") or "=" not in value:
+        return None
+    left, target = value.split("=", 1)
+    context, separator, prefix = left.rpartition(":")
+    if not separator:
+        context, prefix = "", left
+    context = context.strip().replace("\\", "/")
+    prefix = prefix.strip().replace("\\", "/")
+    target = target.strip().replace("\\", "/")
+    if not prefix or not target:
+        return None
+    return context, prefix, target
+
+
+def _project_remappings(root):
+    """Read remappings.txt and Foundry's configured remappings, if present."""
+    values = []
+    remappings_file = root / "remappings.txt"
+    if remappings_file.is_file():
+        try:
+            values.extend(remappings_file.read_text(encoding="utf-8").splitlines())
+        except OSError:
+            pass
+
+    foundry_file = root / "foundry.toml"
+    if foundry_file.is_file():
+        try:
+            config = tomllib.loads(foundry_file.read_text(encoding="utf-8"))
+            configured = config.get("remappings", [])
+            profile = config.get("profile", {})
+            if isinstance(profile, dict):
+                default = profile.get("default", {})
+                if isinstance(default, dict):
+                    configured = default.get("remappings", configured)
+            if isinstance(configured, str):
+                configured = [configured]
+            if isinstance(configured, list):
+                values.extend(configured)
+        except (OSError, tomllib.TOMLDecodeError):
+            pass
+
+    parsed = {_parse_remapping(value) for value in values}
+    parsed.discard(None)
+    # Foundry chooses the longest matching prefix. Keep the order deterministic.
+    return sorted(parsed,
+                  key=lambda item: (-len(item[1]), -len(item[0]), item[0], item[1], item[2]))
 
 
 def build_source_index(root):
-    """루트 아래 모든 .sol 을 posix 절대경로로 색인한다(라이브러리 포함)."""
-    root = Path(root)
+    """Index Solidity files and project import metadata (including libraries)."""
+    root = Path(root).resolve()
     idx = []
     if root.is_file():
-        idx.append(root.resolve())
+        idx.append(root)
         root = root.parent
     for f in root.rglob("*.sol"):
         idx.append(f.resolve())
-    # 중복 제거, 결정론 정렬.
-    return sorted(set(idx), key=lambda x: str(x))
+    files = sorted(set(idx), key=lambda x: str(x))
+    return SourceIndex(files, root, _project_remappings(root))
 
 
 def resolve_import(imp, importing_abs, index):
     """import 경로 문자열을 실제 파일로 해석한다.
 
     1) `./`·`../` 상대경로는 import 한 파일 기준으로 해석.
-    2) 아니면 색인에서 **가장 긴 경로 접미사**가 일치하는 파일을 고른다.
-       (`@openzeppelin/contracts/access/Ownable.sol` 같은 remapping 별칭도
-        `.../access/Ownable.sol` 접미사로 자동 매칭 — remappings.txt 불필요.)
-    최장 접미사가 같은 후보가 여러 개면 잘못된 라이브러리를 고르지 않고 실패한다.
+    2) 프로젝트 루트와 `node_modules/`의 정확한 경로를 확인.
+    3) `remappings.txt`/`foundry.toml`의 가장 긴 명시적 remapping을 적용.
+    4) 이전 입력과의 호환을 위해 가장 긴 경로 접미사를 마지막으로 시도.
+    같은 우선순위에 후보가 여러 개면 잘못된 라이브러리를 고르지 않고 실패한다.
     """
     imp = imp.strip().replace("\\", "/")
     importing_abs = Path(importing_abs).resolve()
+    known = set(index)
     if imp.startswith("./") or imp.startswith("../"):
         cand = (importing_abs.parent / imp).resolve()
-        if cand in index:
+        if cand in known:
             return cand
         return None
+
+    root = getattr(index, "root", None)
+    if root is not None:
+        for base in (root, root / "node_modules"):
+            cand = (base / imp).resolve()
+            if cand in known:
+                return cand
+
+        try:
+            importing_unit = importing_abs.relative_to(root).as_posix()
+        except ValueError:
+            importing_unit = importing_abs.as_posix()
+        prefix_configured = any(
+            imp.startswith(prefix) for _context, prefix, _target in index.remappings)
+        matching = [(context, prefix, target)
+                    for context, prefix, target in index.remappings
+                    if imp.startswith(prefix)
+                    and (not context or importing_unit.startswith(context))]
+        if matching:
+            best_specificity = (len(matching[0][1]), len(matching[0][0]))
+            candidates = set()
+            for context, prefix, target in matching:
+                if (len(prefix), len(context)) != best_specificity:
+                    break
+                cand = (root / target / imp[len(prefix):]).resolve()
+                if cand in known:
+                    candidates.add(cand)
+            if len(candidates) == 1:
+                return candidates.pop()
+            if len(candidates) > 1:
+                names = ", ".join(str(p) for p in sorted(candidates, key=str)[:4])
+                raise ValueError(f"ambiguous import {imp!r}: {names}")
+            # A matching explicit remapping is authoritative. Do not guess a
+            # similarly named file elsewhere when its configured target is absent.
+            return None
+        if prefix_configured:
+            # The import prefix is configured, but only for another source-unit
+            # context. Standard resolution leaves this importer unremapped.
+            return None
+
     # 접미사 매칭: import 경로의 뒤쪽 세그먼트가 많이 겹칠수록 우선.
     imp_parts = [s for s in imp.split("/") if s not in ("", ".", "..")]
     matches = []
@@ -721,24 +823,26 @@ def _import_rewrites(statement):
 def flatten_sol(entry_abs, index, log=None):
     """entry 파일과 그 import 를 후위 순회로 인라인해 자체완결 소스 1개를 만든다.
 
-    - SPDX/ pragma/ import 줄은 인라인 시 제거하고, 최종 결과 맨 위에 한 번만 둔다.
+    - SPDX/import 줄은 인라인 시 제거한다. 엔트리의 pragma를 먼저 두고 의존성의
+      서로 다른 pragma도 보존해 원래 프로젝트의 컴파일 제약을 유지한다.
     - 순환 import 와 중복 파일은 방문 집합으로 건너뛴다.
-    - 해석 실패한 import 는 주석으로 남기고 계속(부분 컴파일이라도 시도).
+    - 해석 실패한 import는 분석 오류로 중단한다.
     """
     entry_abs = Path(entry_abs).resolve()
     seen = set()
     chunks = []
-    pragma_line = None
+    pragma_lines = []
     spdx_id = None
 
     def strip_header(text):
-        nonlocal pragma_line, spdx_id
+        nonlocal spdx_id
         m = _SPDX_RE.search(text)
         if m and spdx_id is None:
             spdx_id = m.group(0).strip()
-        m = _PRAGMA_RE.search(text)
-        if m and pragma_line is None:
-            pragma_line = m.group(0).strip()
+        for m in _PRAGMA_RE.finditer(text):
+            pragma = m.group(1).strip()
+            if pragma not in pragma_lines:
+                pragma_lines.append(pragma)
         text = _SPDX_RE.sub("", text)
         text = _PRAGMA_RE.sub("", text)
         text = _IMPORT_RE.sub("", text)
@@ -776,9 +880,24 @@ def flatten_sol(entry_abs, index, log=None):
             body = re.sub(rf"\b{re.escape(alias)}\b", original, body)
         chunks.append((f"// ── from {path.name} " + "─" * 20, body))
 
+    # Capture the entry header before dependency-first traversal so its compiler
+    # constraint remains the first Solidity pragma in the flattened source.
+    try:
+        entry_text = entry_abs.read_text(encoding="utf-8")
+    except Exception as e:
+        raise RuntimeError(f"import read failed: {entry_abs}: {e}") from e
+    entry_spdx = _SPDX_RE.search(entry_text)
+    if entry_spdx:
+        spdx_id = entry_spdx.group(0).strip()
+    for m in _PRAGMA_RE.finditer(entry_text):
+        pragma = m.group(1).strip()
+        if pragma not in pragma_lines:
+            pragma_lines.append(pragma)
+
     visit(entry_abs)
+    pragmas = pragma_lines or ["pragma solidity ^0.8.0;"]
     header = (spdx_id or "// SPDX-License-Identifier: MIT") + "\n" + \
-             (pragma_line or "pragma solidity ^0.8.0;") + "\n"
+             "\n".join(pragmas) + "\n"
     parts = [header]
     for banner, body in chunks:
         if body:
