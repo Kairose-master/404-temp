@@ -62,7 +62,12 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r agent/requirements.txt
 python -c "import solcx; solcx.install_solc('0.8.24'); solcx.set_solc_version('0.8.24'); print(solcx.get_solc_version())"
+forge --version
 ```
+
+solc 확인 명령은 `0.8.24`를 출력하고 `forge --version`도 성공해야 한다. 비공개
+manifest가 다른 `target.solc`를 지정하면 그 정확한 버전도 `solcx.install_solc(...)`로
+설치한다.
 
 그다음 공개 타깃 12개를 고정 시드와 공식 Forge 검증기로 실행한다.
 Foundry가 저장소 루트의 `out/`을 빌드 산출물 경로로 사용하므로, 에이전트 결과는
@@ -101,7 +106,7 @@ cat demo-results/OpenVault/Exploit.sol
 ```
 
 `exit 2`와 `INCONCLUSIVE (verifier unavailable)`은 취약점 판정이 아니라 검증기
-준비 실패다. 위의 solc 확인 명령이 `0.8.24`를 출력하는지 먼저 확인한다.
+준비 실패다. 위의 solc와 Forge 확인 명령이 모두 성공하는지 먼저 확인한다.
 
 ## 비공개 타깃 실행
 
@@ -229,7 +234,7 @@ Setup을 받지 않았다면 `deploy.setup` 키를 manifest에 쓰면 안 된다
 ```bash
 TARGET_DIR="$PWD/private-targets/MyVault"
 
-TRUST404_VERIFIER=evm python agent/agent.py \
+TRUST404_VERIFIER=forge python agent/agent.py \
   --contract "$TARGET_DIR/src/MyVault.sol" \
   --invariants "$TARGET_DIR/Invariants.sol" \
   --manifest "$TARGET_DIR/manifest.json" \
@@ -247,8 +252,9 @@ TRUST404_VERIFIER=evm python agent/agent.py \
 
 종료 코드 `0`일 때만 `Exploit.sol`이 실제로 불변식 위반을 증명한 PoC다. 종료 코드
 `1`은 예산 내 미발견, `2` 또는 `INCONCLUSIVE`는 입력·컴파일러·검증기 오류다.
-`Setup.s.sol`이 Foundry cheatcode를 사용하면 로컬 EVM 대신 아래 Docker/Forge 경로를
-사용한다.
+로컬 실행도 Docker와 같은 Forge 검증기를 기본으로 사용하므로 `forge`가 `PATH`에
+있어야 한다. `TRUST404_VERIFIER=evm`은 빠른 개발 진단용 보조 경로이며, 최종 판정은
+Forge 또는 아래 Docker 경로로 재검증한다.
 
 ### 3. Docker로 실행하고 결과를 호스트에 보존
 
@@ -256,6 +262,16 @@ TRUST404_VERIFIER=evm python agent/agent.py \
 
 ```bash
 docker build --platform linux/amd64 -t track04 -f agent/Dockerfile .
+```
+
+기본 이미지는 `0.4.26`, `0.5.17`, `0.6.12`, `0.7.6`, `0.8.24`, `0.8.28`을
+오프라인용으로 포함한다. manifest의 `target.solc`가 이 목록에 없는 정확한 버전이면
+빌드할 때 추가한다. 예를 들어 `0.8.20` 타깃은 다음처럼 만든다.
+
+```bash
+docker build --platform linux/amd64 \
+  --build-arg EXTRA_SOLC_VERSIONS="0.8.20" \
+  -t track04 -f agent/Dockerfile .
 ```
 
 Docker에는 호스트 경로가 자동으로 보이지 않는다. 입력 폴더와 출력 폴더를 각각

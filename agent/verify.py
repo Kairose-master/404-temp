@@ -61,14 +61,17 @@ def verify_candidate(target_name, target_src, invariants_src, exploit_src, manif
 
 def verify_full(target_name, target_src, invariants_src, exploit_src, manifest, seed=0,
                 extra_sources=None, timeout_sec=None):
-    mode = os.environ.get("TRUST404_VERIFIER", "evm").lower()
+    mode = os.environ.get("TRUST404_VERIFIER", "forge").strip().lower()
     if mode == "forge":
         proven, violated, detail = _verify_forge(
             target_name, target_src, invariants_src, exploit_src, manifest,
             extra_sources=extra_sources, timeout_sec=timeout_sec)
         return VerifyResult(proven, violated, detail, profit=None)
-    return _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
-                       extra_sources=extra_sources)
+    if mode == "evm":
+        return _verify_evm(target_name, target_src, invariants_src, exploit_src, manifest,
+                           extra_sources=extra_sources)
+    raise VerifyUnavailable(
+        f"unsupported TRUST404_VERIFIER={mode!r}; expected 'forge' or 'evm'")
 
 
 # ── 내장 EVM 검증기 ──────────────────────────────────────────────────────────

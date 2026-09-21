@@ -64,12 +64,67 @@ class Flatten(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_alias_import_resolves_by_suffix(self):
+    def test_alias_import_resolves_by_suffix_as_compatibility_fallback(self):
         note = self.tmp / "lib" / "oz" / "contracts" / "utils" / "Note.sol"
         got = audit.resolve_import(
             "@oz/contracts/utils/Note.sol",
             self.tmp / "src" / "base" / "VaultBase.sol", self.index)
         self.assertEqual(got, note.resolve())
+
+    def test_remappings_file_wins_over_ambiguous_suffixes(self):
+        other = self.tmp / "vendor" / "oz" / "contracts" / "utils"
+        other.mkdir(parents=True)
+        (other / "Note.sol").write_text(
+            "pragma solidity ^0.8.0; contract OtherNote {}\n", encoding="utf-8")
+        (self.tmp / "remappings.txt").write_text("@oz/=lib/oz/\n", encoding="utf-8")
+        index = audit.build_source_index(self.tmp)
+        got = audit.resolve_import(
+            "@oz/contracts/utils/Note.sol",
+            self.tmp / "src" / "base" / "VaultBase.sol", index)
+        self.assertEqual(
+            got, (self.tmp / "lib" / "oz" / "contracts" / "utils" / "Note.sol").resolve())
+
+    def test_foundry_toml_remapping_is_applied(self):
+        (self.tmp / "foundry.toml").write_text(
+            '[profile.default]\nremappings = ["deps/=lib/oz/contracts/"]\n',
+            encoding="utf-8")
+        got = audit.resolve_import(
+            "deps/utils/Note.sol", self.tmp / "src" / "Vault.sol",
+            audit.build_source_index(self.tmp))
+        self.assertEqual(
+            got, (self.tmp / "lib" / "oz" / "contracts" / "utils" / "Note.sol").resolve())
+
+    def test_context_remapping_only_applies_to_matching_importer(self):
+        (self.tmp / "remappings.txt").write_text(
+            "src/:deps/=lib/oz/contracts/\n", encoding="utf-8")
+        index = audit.build_source_index(self.tmp)
+        inside = audit.resolve_import(
+            "deps/utils/Note.sol", self.tmp / "src" / "Vault.sol", index)
+        outside = audit.resolve_import(
+            "deps/utils/Note.sol", self.tmp / "script" / "Deploy.sol", index)
+        self.assertEqual(
+            inside, (self.tmp / "lib" / "oz" / "contracts" / "utils" / "Note.sol").resolve())
+        self.assertIsNone(outside)
+
+    def test_missing_remapping_target_does_not_fall_back_by_suffix(self):
+        (self.tmp / "remappings.txt").write_text(
+            "@oz/=missing/oz/\n", encoding="utf-8")
+        got = audit.resolve_import(
+            "@oz/contracts/utils/Note.sol", self.tmp / "src" / "Vault.sol",
+            audit.build_source_index(self.tmp))
+        self.assertIsNone(got)
+
+    def test_node_modules_exact_package_path_wins(self):
+        package = self.tmp / "node_modules" / "@scope" / "pkg"
+        package.mkdir(parents=True)
+        (package / "Thing.sol").write_text("contract PackageThing {}\n", encoding="utf-8")
+        duplicate = self.tmp / "vendor" / "@scope" / "pkg"
+        duplicate.mkdir(parents=True)
+        (duplicate / "Thing.sol").write_text("contract OtherThing {}\n", encoding="utf-8")
+        got = audit.resolve_import(
+            "@scope/pkg/Thing.sol", self.tmp / "src" / "Vault.sol",
+            audit.build_source_index(self.tmp))
+        self.assertEqual(got, (package / "Thing.sol").resolve())
 
     def test_relative_import_resolves(self):
         got = audit.resolve_import(
@@ -84,14 +139,34 @@ class Flatten(unittest.TestCase):
             self.assertIn(needle, flat)
         # No import lines survive.
         self.assertNotIn("import ", flat)
-        # Exactly one SPDX and one pragma header.
+        # SPDX is consolidated, while distinct compiler constraints survive.
         self.assertEqual(flat.count("SPDX-License-Identifier"), 1)
-        self.assertEqual(flat.count("pragma solidity"), 1)
+        self.assertEqual(flat.count("pragma solidity"), 2)
+        self.assertLess(flat.index("pragma solidity 0.8.24;"),
+                        flat.index("pragma solidity ^0.8.0;"))
         # Dependencies come before the contract that needs them.
         self.assertLess(flat.index("abstract contract VaultBase"),
                         flat.index("contract Vault is VaultBase"))
         self.assertLess(flat.index("abstract contract Note"),
                         flat.index("contract Vault is VaultBase"))
+
+    def test_flatten_preserves_non_solidity_and_dependency_pragmas(self):
+        dep = self.tmp / "src" / "PragmaDep.sol"
+        dep.write_text(
+            "pragma solidity >=0.8.10; // dependency range\n"
+            "pragma abicoder v2;\ncontract PragmaDep {}\n",
+            encoding="utf-8")
+        entry = self.tmp / "src" / "PragmaEntry.sol"
+        entry.write_text(
+            "pragma solidity 0.8.24;\n"
+            'import "./PragmaDep.sol";\ncontract PragmaEntry is PragmaDep {}\n',
+            encoding="utf-8")
+        flat = audit.flatten_sol(entry, audit.build_source_index(self.tmp))
+        self.assertEqual(flat.count("pragma solidity 0.8.24;"), 1)
+        self.assertEqual(flat.count("pragma solidity >=0.8.10;"), 1)
+        self.assertEqual(flat.count("pragma abicoder v2;"), 1)
+        self.assertLess(flat.index("pragma solidity 0.8.24;"),
+                        flat.index("pragma solidity >=0.8.10;"))
 
     def test_flatten_preserves_symbol_and_namespace_aliases(self):
         alias = self.tmp / "src" / "AliasVault.sol"

@@ -1,4 +1,5 @@
 """Offline compiler selection and Forge result handling; no EVM tools needed."""
+import os
 import sys
 import tempfile
 import types
@@ -11,6 +12,23 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "agent"))
 import verify
+
+
+class VerifierSelection(unittest.TestCase):
+    def test_forge_is_the_default_backend(self):
+        with patch.dict(os.environ, {}, clear=True), \
+                patch.object(verify, "_verify_forge",
+                             return_value=(False, "", "forge")) as forge, \
+                patch.object(verify, "_verify_evm") as evm:
+            result = verify.verify_full("T", "", "", "", {})
+        self.assertEqual(result.detail, "forge")
+        forge.assert_called_once()
+        evm.assert_not_called()
+
+    def test_unknown_backend_fails_closed(self):
+        with patch.dict(os.environ, {"TRUST404_VERIFIER": "typo"}):
+            with self.assertRaisesRegex(verify.VerifyUnavailable, "unsupported"):
+                verify.verify_full("T", "", "", "", {})
 
 
 class CompilerSelection(unittest.TestCase):

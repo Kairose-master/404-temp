@@ -1,6 +1,10 @@
 # Offline Docker verification
 
-The image installs Python 3.11.13, Foundry v1.7.1 and solc 0.8.24 at build time.
+The image installs Python 3.11.13, Foundry v1.7.1 and solc 0.4.26, 0.5.17,
+0.6.12, 0.7.6, 0.8.24 and 0.8.28 at build time. These are the patch releases
+selected by the audit engine for each supported Solidity minor, plus the public
+fixture compiler. Add a private target's exact compiler with
+`--build-arg EXTRA_SOLC_VERSIONS="0.8.20"` when it is not in that set.
 It currently targets `linux/amd64`. On ARM hosts, explicitly build and run with
 `--platform linux/amd64` (requires an amd64 emulation-capable Docker installation).
 Other architectures are rejected instead of silently downloading the wrong solc.
