@@ -89,7 +89,7 @@ TRUST404_VERIFIER=evm python agent/agent.py \
   --contract "$TARGET_DIR/src/MyVault.sol" \
   --invariants "$TARGET_DIR/Invariants.sol" \
   --manifest "$TARGET_DIR/manifest.json" \
-  --out out/private/MyVault \
+  --out private-results/MyVault \
   --timeout 300 --seed 42 --max-attempts 24
 ```
 
@@ -97,7 +97,7 @@ TRUST404_VERIFIER=evm python agent/agent.py \
 생긴다.
 
 ```text
-out/private/MyVault/
+private-results/MyVault/
 ├── Exploit.sol
 ├── result.json
 └── attempts.log
@@ -123,10 +123,10 @@ docker build --platform linux/amd64 -t track04 -f agent/Dockerfile .
 
 ```bash
 TARGET_DIR=/absolute/path/MyVault
-mkdir -p out/private
+mkdir -p private-results
 docker run --rm \
   -v "$TARGET_DIR:/target:ro" \
-  -v "$PWD/out/private:/results" \
+  -v "$PWD/private-results:/results" \
   track04 \
   --contract /target/src/MyVault.sol \
   --invariants /target/Invariants.sol \
@@ -136,7 +136,7 @@ docker run --rm \
 ```
 
 컨테이너의 `/results/MyVault`는 호스트의
-`$PWD/out/private/MyVault`에 대응하므로 컨테이너가 종료되어도 세 결과 파일이
+`$PWD/private-results/MyVault`에 대응하므로 컨테이너가 종료되어도 세 결과 파일이
 남는다. 출력 경로를 마운트하지 않으면 컨테이너 삭제와 함께 결과도 사라진다.
 
 ## 3. 소스만 있는 비공개 타깃

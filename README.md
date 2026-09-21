@@ -55,22 +55,49 @@
 
 ## 빠른 시작
 
+최초 1회 환경을 준비한다.
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r agent/requirements.txt
 python -c "import solcx; solcx.install_solc('0.8.24'); solcx.set_solc_version('0.8.24'); print(solcx.get_solc_version())"
+```
+
+그다음 공개 타깃 12개를 고정 시드와 공식 Forge 검증기로 실행한다.
+Foundry가 저장소 루트의 `out/`을 빌드 산출물 경로로 사용하므로, 에이전트 결과는
+충돌하지 않는 `demo-results/`에 저장한다.
+
+```bash
+source .venv/bin/activate
+export TRUST404_VERIFIER=forge
+export TRUST404_ENABLE_LLM=0
+
 for t in ReentrantVault OpenVault BadAccounting NaiveOracle DelegateVault \
          PredictableLottery OpenInitializer SafeVault BoundedOwner LibraryVault \
-         CommitLottery GuardedInitializer; do
-  TRUST404_VERIFIER=evm python agent/agent.py \
-    --contract   targets/$t/src/$t.sol \
-    --invariants targets/$t/Invariants.sol \
-    --manifest   targets/$t/manifest.json \
-    --out out/$t --timeout 300 --seed 42 --max-attempts 8
+         CommitLottery GuardedInitializer
+do
+  python agent/agent.py \
+    --contract "targets/$t/src/$t.sol" \
+    --invariants "targets/$t/Invariants.sol" \
+    --manifest "targets/$t/manifest.json" \
+    --out "demo-results/$t" \
+    --timeout 300 \
+    --seed 42 \
+    --max-attempts 8
+
   echo "$t -> exit $?"
 done
-# 기대: 취약 7개 exit 0, 멀쩡 5개 exit 1
+```
+
+기대 결과는 취약 타깃 7개가 exit `0`(`PROVEN`), 정상 타깃 5개가 exit
+`1`(`NOT_PROVEN`)이다. exit `2`는 입력·환경·실행 오류다. 생성된 증명 자료는 다음처럼
+확인할 수 있다.
+
+```bash
+cat demo-results/OpenVault/attempts.log
+python3 -m json.tool demo-results/OpenVault/result.json
+cat demo-results/OpenVault/Exploit.sol
 ```
 
 `exit 2`와 `INCONCLUSIVE (verifier unavailable)`은 취약점 판정이 아니라 검증기
@@ -80,31 +107,31 @@ done
 
 비공개 번들에 `Target.sol`·`Invariants.sol`·`manifest.json`이 모두 있으면 표준
 증명 CLI를 사용한다. `--out`이 결과 폴더이며, 아래 명령은 저장소의
-`out/private/MyVault/`에 세 파일을 만든다.
+`private-results/MyVault/`에 세 파일을 만든다.
 
 ```bash
 TRUST404_VERIFIER=evm python agent/agent.py \
   --contract /absolute/path/MyVault/src/MyVault.sol \
   --invariants /absolute/path/MyVault/Invariants.sol \
   --manifest /absolute/path/MyVault/manifest.json \
-  --out out/private/MyVault --timeout 300 --seed 42 --max-attempts 24
+  --out private-results/MyVault --timeout 300 --seed 42 --max-attempts 24
 ```
 
 | 생성 위치 | 내용 |
 |---|---|
-| `out/private/MyVault/Exploit.sol` | 증명된 PoC, 또는 미발견 시 마지막 후보 |
-| `out/private/MyVault/result.json` | 판정, 위반 불변식, 전략, 시도 수와 실행 trace |
-| `out/private/MyVault/attempts.log` | 후보 생성·검증·단계 격상 로그 |
+| `private-results/MyVault/Exploit.sol` | 증명된 PoC, 또는 미발견 시 마지막 후보 |
+| `private-results/MyVault/result.json` | 판정, 위반 불변식, 전략, 시도 수와 실행 trace |
+| `private-results/MyVault/attempts.log` | 후보 생성·검증·단계 격상 로그 |
 
 Docker에서는 입력과 출력 폴더를 각각 마운트한다. `/results/MyVault`에 쓴 파일은
-호스트의 `$PWD/out/private/MyVault/`에 남는다.
+호스트의 `$PWD/private-results/MyVault/`에 남는다.
 
 ```bash
 TARGET_DIR=/absolute/path/MyVault
-mkdir -p out/private
+mkdir -p private-results
 docker run --rm \
   -v "$TARGET_DIR:/target:ro" \
-  -v "$PWD/out/private:/results" \
+  -v "$PWD/private-results:/results" \
   track04 \
   --contract /target/src/MyVault.sol \
   --invariants /target/Invariants.sol \
@@ -113,7 +140,7 @@ docker run --rm \
   --timeout 300 --seed 42 --max-attempts 24
 ```
 
-`-v "$PWD/out/private:/results"`를 빼면 출력이 컨테이너 내부에만 생겨
+`-v "$PWD/private-results:/results"`를 빼면 출력이 컨테이너 내부에만 생겨
 `--rm`으로 컨테이너가 종료될 때 함께 사라진다.
 
 소스만 있고 불변식·매니페스트가 없으면 `audit` 모드를 사용한다. 이 모드는

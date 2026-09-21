@@ -63,10 +63,12 @@ docker run --rm -v "$PWD:/w" track04 \
   --contract   /w/targets/$T/src/$T.sol \
   --invariants /w/targets/$T/Invariants.sol \
   --manifest   /w/targets/$T/manifest.json \
-  --out /w/out/$T --seed 42 --max-attempts 5
+  --out /w/demo-results/$T --seed 42 --max-attempts 5
 ```
-`-v "$PWD:/w"` 로 저장소를 컨테이너의 `/w` 에 마운트하고, `--out /w/out/$T` 로
-결과(`Exploit.sol`·`result.json`·`attempts.log`)를 호스트로 되돌려 받는다.
+`-v "$PWD:/w"` 로 저장소를 컨테이너의 `/w` 에 마운트하고,
+`--out /w/demo-results/$T` 로 결과(`Exploit.sol`·`result.json`·`attempts.log`)를
+호스트로 되돌려 받는다. 저장소의 `out/`은 Foundry 빌드 산출물 경로이므로 에이전트
+결과 경로로 사용하지 않는다.
 사용 가능한 이름: `ReentrantVault OpenVault BadAccounting NaiveOracle DelegateVault
 PredictableLottery OpenInitializer SafeVault BoundedOwner LibraryVault CommitLottery
 GuardedInitializer`.
@@ -80,7 +82,7 @@ for T in ReentrantVault OpenVault BadAccounting NaiveOracle DelegateVault \
     --contract   /w/targets/$T/src/$T.sol \
     --invariants /w/targets/$T/Invariants.sol \
     --manifest   /w/targets/$T/manifest.json \
-    --out /w/out/$T --seed 42 --max-attempts 8
+    --out /w/demo-results/$T --seed 42 --max-attempts 8
   echo "$T -> exit $?"   # 취약 7개 exit 0, 멀쩡 5개 exit 1
 done
 ```
@@ -96,7 +98,7 @@ docker run --rm \
   --contract   /proj/src/MyVault.sol \
   --invariants /proj/Invariants.sol \
   --manifest   /proj/manifest.json \
-  --out /w/out/MyVault --seed 42 --max-attempts 8
+  --out /w/demo-results/MyVault --seed 42 --max-attempts 8
 ```
 불변식·매니페스트가 **없으면** `audit` 서브커맨드로 라우팅한다. 생성자 인자를
 시그니처에서 자동 합성하고 자동 효과검사로 엔진 전량을 돌려 심각도별 리포트
@@ -158,9 +160,9 @@ python3 -c "import solcx; solcx.install_solc('0.8.24')"
 python3 agent/agent.py --contract targets/ReentrantVault/src/ReentrantVault.sol \
   --invariants targets/ReentrantVault/Invariants.sol \
   --manifest targets/ReentrantVault/manifest.json \
-  --out out/ReentrantVault --timeout 300 --seed 42 --max-attempts 5
+  --out demo-results/ReentrantVault --timeout 300 --seed 42 --max-attempts 5
 ```
 
 ## 공개셋 결과
-취약 4개(Reentrant/Open/BadAccounting/NaiveOracle) → exit 0(PROVEN),
-멀쩡 2개(SafeVault/BoundedOwner) → exit 1. 자세한 내용은 `../METHOD.md`.
+취약 7개 → exit 0(`PROVEN`), 정상 5개 → exit 1(`NOT_PROVEN`). 자세한 내용은
+`../METHOD.md`.
