@@ -96,6 +96,26 @@ TRUST404_VERIFIER=evm python agent/agent.py \
 | `out/private/MyVault/result.json` | 판정, 위반 불변식, 전략, 시도 수와 실행 trace |
 | `out/private/MyVault/attempts.log` | 후보 생성·검증·단계 격상 로그 |
 
+Docker에서는 입력과 출력 폴더를 각각 마운트한다. `/results/MyVault`에 쓴 파일은
+호스트의 `$PWD/out/private/MyVault/`에 남는다.
+
+```bash
+TARGET_DIR=/absolute/path/MyVault
+mkdir -p out/private
+docker run --rm \
+  -v "$TARGET_DIR:/target:ro" \
+  -v "$PWD/out/private:/results" \
+  track04 \
+  --contract /target/src/MyVault.sol \
+  --invariants /target/Invariants.sol \
+  --manifest /target/manifest.json \
+  --out /results/MyVault \
+  --timeout 300 --seed 42 --max-attempts 24
+```
+
+`-v "$PWD/out/private:/results"`를 빼면 출력이 컨테이너 내부에만 생겨
+`--rm`으로 컨테이너가 종료될 때 함께 사라진다.
+
 소스만 있고 불변식·매니페스트가 없으면 `audit` 모드를 사용한다. 이 모드는
 `result.json` 대신 `audit/private/report.json`, `report.md`, `report.sarif`와
 증명된 계약별 `exploits/<Contract>.sol`을 만든다.
