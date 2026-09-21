@@ -166,6 +166,45 @@ private-targets/MyVault/
 같은 구조로 넣는다. import 파일을 `node_modules/`에만 두지 말고
 `manifest.json` 아래의 비공개 번들 안에 포함한다.
 
+#### 의존성이 있을 때 어떤 모드를 써야 하나
+
+의존성이 있다는 이유만으로 분석이 불가능한 것은 아니다. 다만 **컴파일 의존성**과
+**실행 환경 의존성**을 구분해야 한다.
+
+| 의존성 종류 | 예 | 실행 방법 |
+|---|---|---|
+| 컴파일 의존성 | import된 interface, 상속 base contract, Solidity library | 의존 소스를 폴더/zip에 함께 넣으면 표준 증명과 audit 모두 처리 가능 |
+| 실행 환경 의존성 | 배포된 ERC20, oracle, AMM pool, router, proxy implementation | `manifest.json`과 `Setup.s.sol`로 계약들을 배포·연결한 뒤 표준 증명 CLI 사용 |
+| 누락된 외부 의존성 | import는 있지만 해당 `.sol` 파일이 번들에 없음 | 분석 불가. 엔진이 인터넷에서 임의 버전을 받거나 코드를 추측하지 않으므로 exit 2 |
+
+예를 들어 `MyVault` 생성자가 `Token`과 `Oracle` 주소를 받고 두 계약의 실제 상태까지
+사용한다면 다음처럼 **모든 소스**를 같은 번들 아래에 둔다.
+
+```text
+private-targets/MyVault/
+├── manifest.json
+├── Invariants.sol
+├── Setup.s.sol                  # Token → Oracle → MyVault 순서로 배포·연결
+└── src/
+    ├── MyVault.sol
+    ├── Token.sol
+    ├── Oracle.sol
+    └── interfaces/
+        ├── IToken.sol
+        └── IOracle.sol
+```
+
+이 구조에서 `Setup.run()`은 보조 계약을 먼저 배포하고 필요한 초기 상태를 만든 다음,
+마지막에 검증할 `MyVault` 주소를 반환해야 한다. source-only `audit` 모드는 import를
+해결해 컴파일할 수는 있지만, 이런 배포 순서·주소 연결·초기 유동성까지 자동으로
+재현한다고 보장하지 않는다. 런타임 의존성이 있는 비공개 타깃은 반드시 Setup을
+포함한 표준 증명 모드로 최종 판정한다.
+
+반대로 `MyVault.sol`이 `Ownable.sol`을 상속할 뿐 별도 계약 주소나 외부 상태를
+필요로 하지 않는다면 컴파일 의존성만 있는 경우다. `Ownable.sol`과 그 import 트리를
+번들에 포함하면 audit 모드에서도 처리할 수 있다. 폴더 또는 zip 전체를 입력해야 하며,
+`MyVault.sol` 한 파일만 떼어 입력하면 import 대상을 찾을 수 없어 실패한다.
+
 복잡한 초기 배포를 위해 manifest에 `"setup": "Setup.s.sol"`이 있으면
 `private-targets/MyVault/Setup.s.sol`도 반드시 있어야 한다. 이 파일 안의 계약 이름은
 `Setup`이어야 하고 `run() returns (address)`가 배포된 타깃 주소를 반환해야 한다.
@@ -257,6 +296,11 @@ docker run --rm \
 `private-targets/source-only/MyProject/`, zip이면
 `private-targets/source-only/MyProject.zip`에 둔다. 프로젝트는 import 상대경로를
 보존한 채 폴더 전체를 복사한다.
+
+이 모드는 import·상속·라이브러리 같은 컴파일 의존성을 포함한 프로젝트 감사에
+사용할 수 있다. 토큰·오라클·풀처럼 여러 계약을 특정 순서와 인자로 배포해야 하는
+프로토콜은 여기서 나온 자동 효과검사만으로 최종 판정하지 말고, 위의
+`manifest.json + Setup.s.sol + Invariants.sol` 구조로 전환해 표준 증명을 실행한다.
 
 ```bash
 mkdir -p private-targets/source-only
