@@ -1,10 +1,12 @@
 __pycache__/
 *.pyc
 *.pyo
+.venv/
 .pytest_cache/
 .mypy_cache/
 /out/
 /demo-results/
+/private-results/
 /audit/
 /cache/
 /broadcast/

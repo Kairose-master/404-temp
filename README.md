@@ -60,8 +60,8 @@
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r agent/requirements.txt
-python3 -c "import solcx; solcx.install_solc('0.8.24')"
+python -m pip install -r agent/requirements.txt
+python -c "import solcx; solcx.install_solc('0.8.24'); solcx.set_solc_version('0.8.24'); print(solcx.get_solc_version())"
 ```
 
 그다음 공개 타깃 12개를 고정 시드와 공식 Forge 검증기로 실행한다.
@@ -77,7 +77,7 @@ for t in ReentrantVault OpenVault BadAccounting NaiveOracle DelegateVault \
          PredictableLottery OpenInitializer SafeVault BoundedOwner LibraryVault \
          CommitLottery GuardedInitializer
 do
-  python3 agent/agent.py \
+  python agent/agent.py \
     --contract "targets/$t/src/$t.sol" \
     --invariants "targets/$t/Invariants.sol" \
     --manifest "targets/$t/manifest.json" \
@@ -99,6 +99,61 @@ cat demo-results/OpenVault/attempts.log
 python3 -m json.tool demo-results/OpenVault/result.json
 cat demo-results/OpenVault/Exploit.sol
 ```
+
+`exit 2`와 `INCONCLUSIVE (verifier unavailable)`은 취약점 판정이 아니라 검증기
+준비 실패다. 위의 solc 확인 명령이 `0.8.24`를 출력하는지 먼저 확인한다.
+
+## 비공개 타깃 실행
+
+비공개 번들에 `Target.sol`·`Invariants.sol`·`manifest.json`이 모두 있으면 표준
+증명 CLI를 사용한다. `--out`이 결과 폴더이며, 아래 명령은 저장소의
+`private-results/MyVault/`에 세 파일을 만든다.
+
+```bash
+TRUST404_VERIFIER=evm python agent/agent.py \
+  --contract /absolute/path/MyVault/src/MyVault.sol \
+  --invariants /absolute/path/MyVault/Invariants.sol \
+  --manifest /absolute/path/MyVault/manifest.json \
+  --out private-results/MyVault --timeout 300 --seed 42 --max-attempts 24
+```
+
+| 생성 위치 | 내용 |
+|---|---|
+| `private-results/MyVault/Exploit.sol` | 증명된 PoC, 또는 미발견 시 마지막 후보 |
+| `private-results/MyVault/result.json` | 판정, 위반 불변식, 전략, 시도 수와 실행 trace |
+| `private-results/MyVault/attempts.log` | 후보 생성·검증·단계 격상 로그 |
+
+Docker에서는 입력과 출력 폴더를 각각 마운트한다. `/results/MyVault`에 쓴 파일은
+호스트의 `$PWD/private-results/MyVault/`에 남는다.
+
+```bash
+TARGET_DIR=/absolute/path/MyVault
+mkdir -p private-results
+docker run --rm \
+  -v "$TARGET_DIR:/target:ro" \
+  -v "$PWD/private-results:/results" \
+  track04 \
+  --contract /target/src/MyVault.sol \
+  --invariants /target/Invariants.sol \
+  --manifest /target/manifest.json \
+  --out /results/MyVault \
+  --timeout 300 --seed 42 --max-attempts 24
+```
+
+`-v "$PWD/private-results:/results"`를 빼면 출력이 컨테이너 내부에만 생겨
+`--rm`으로 컨테이너가 종료될 때 함께 사라진다.
+
+소스만 있고 불변식·매니페스트가 없으면 `audit` 모드를 사용한다. 이 모드는
+`result.json` 대신 `audit/private/report.json`, `report.md`, `report.sarif`와
+증명된 계약별 `exploits/<Contract>.sol`을 만든다.
+
+```bash
+python agent/audit.py /absolute/path/private-target \
+  --out audit/private --seed 42 --include-safe
+```
+
+비공개 번들의 폴더 구조, 매니페스트 예제, Docker 마운트와 두 실행 모드의 전체
+설명은 [`QUICKSTART.md`](./QUICKSTART.md)에 있다.
 
 CLI·검증기 두 경로(내장 EVM / forge)와 Docker 실행: [`agent/README.md`](./agent/README.md).
 
